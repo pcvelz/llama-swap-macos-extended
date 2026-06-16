@@ -1,11 +1,10 @@
 ![llama-swap header image](docs/assets/hero3.webp)
-![GitHub Downloads (all assets, all releases)](https://img.shields.io/github/downloads/mostlygeek/llama-swap/total)
-![GitHub Actions Workflow Status](https://img.shields.io/github/actions/workflow/status/mostlygeek/llama-swap/go-ci.yml)
-![GitHub Repo stars](https://img.shields.io/github/stars/mostlygeek/llama-swap)
 
-# llama-swap
+# llama-swap (macOS-extended fork)
 
-Run multiple generative AI models on your machine and hot-swap between them on demand. llama-swap works with any OpenAI and Anthropic API compatible server and is used by thousands of people to power their local AI workflows.
+> A macOS-focused fork of [mostlygeek/llama-swap](https://github.com/mostlygeek/llama-swap) that adds a native menu-bar helper. All credit for llama-swap itself belongs to the upstream project; this fork only layers the macOS menu bar app on top.
+
+Run multiple generative AI models on your machine and hot-swap between them on demand. llama-swap works with any OpenAI and Anthropic API compatible server.
 
 Built in Go for performance and simplicity, llama-swap has zero dependencies and is incredibly easy to set up. Get started in minutes - just one binary and one configuration file.
 
@@ -82,6 +81,22 @@ Manually load and unload models:
 Real time log streaming:
 
 <img width="1107" height="559" alt="image" src="https://github.com/user-attachments/assets/39669a10-cff2-409e-836a-5bad8bd0140c" />
+
+## macOS Menu Bar Helper
+
+This fork adds a native macOS menu-bar app showing live model state, GPU/memory bars, and a clickable model list. It's enabled by default — no flags to set.
+
+### Install
+
+```shell
+curl -fsSL https://github.com/pcvelz/llama-swap-macos-extended/releases/latest/download/install-macos.sh | bash
+```
+
+### Build from source (optional)
+
+```shell
+make mac
+```
 
 ## Installation
 
@@ -273,10 +288,3 @@ curl -Ns 'http://host/logs/stream?no-history'
 Any OpenAI compatible server would work. llama-swap was originally designed for llama-server and it is the best supported.
 
 For Python based inference servers like vllm or tabbyAPI it is recommended to run them via podman or docker. This provides clean environment isolation as well as responding correctly to `SIGTERM` signals for proper shutdown.
-
-## Star History
-
-> [!NOTE]
-> Thank you to everyone who has given this project a ⭐️!
-
-[![Star History Chart](https://api.star-history.com/svg?repos=mostlygeek/llama-swap&type=Date)](https://www.star-history.com/#mostlygeek/llama-swap&Date)

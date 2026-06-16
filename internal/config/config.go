@@ -158,6 +158,9 @@ type Config struct {
 	// present aliases to /v1/models OpenAI API listing
 	IncludeAliasesInList bool `yaml:"includeAliasesInList"`
 
+	// enable macOS menu-bar helper
+	MenuBar			bool `yaml:"menu_bar"`
+
 	// support API keys, see issue #433, #50, #251
 	RequiredAPIKeys []string `yaml:"apiKeys"`
 
@@ -245,6 +248,8 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 		MetricsMaxInMemory: 1000,
 		CaptureBuffer:      5,
 		GlobalTTL:          0,
+		// macOS menu-bar helper is on by default in this fork; set `menu_bar: false` to opt out.
+		MenuBar: true,
 	}
 	if err = yaml.Unmarshal([]byte(yamlStr), &config); err != nil {
 		return Config{}, err

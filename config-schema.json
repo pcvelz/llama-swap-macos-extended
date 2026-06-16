@@ -243,6 +243,11 @@
             "default": false,
             "description": "Inject loading status updates into the reasoning field. When true, a stream of loading messages will be sent to the client."
         },
+        "menu_bar": {
+            "type": "boolean",
+            "default": false,
+            "description": "Enable the macOS menu-bar helper."
+        },
         "includeAliasesInList": {
             "type": "boolean",
             "default": false,

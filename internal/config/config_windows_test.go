@@ -193,6 +193,7 @@ groups:
 			{"svr-path", "path/to/server"},
 		},
 		SendLoadingState: false,
+		MenuBar:          true,
 		Models: map[string]ModelConfig{
 			"model1": {
 				Cmd:                "path/to/cmd --arg1 one",

@@ -40,9 +40,15 @@ ui: ui/node_modules
 	touch internal/server/ui_dist/placeholder.txt
 
 # Build OSX binary
-mac: ui
+mac: mac-menu ui
 	@echo "Building Mac binary..."
 	GOOS=darwin GOARCH=arm64 go build -ldflags="-X main.commit=${GIT_HASH} -X main.version=local_${GIT_HASH} -X main.date=${BUILD_DATE}" -o $(BUILD_DIR)/$(APP_NAME)-darwin-arm64
+
+mac-menu:
+	@echo "Building macOS menu-bar helper..."
+	cd macos-menu && swift build -c release
+	mkdir -p $(BUILD_DIR)
+	cp macos-menu/.build/release/llama-swap-menu $(BUILD_DIR)/llama-swap-menu
 
 # Build Linux binary
 linux: linux-arm64 linux-amd64
@@ -98,5 +104,5 @@ test-ui:
 	cd ui-svelte && npm ci && npm run check && npm test
 
 # Phony targets
-.PHONY: all clean ui mac windows simple-responder simple-responder-windows test test-all test-dev test-ui wol-proxy
+.PHONY: all clean ui mac mac-menu windows simple-responder simple-responder-windows test test-all test-dev test-ui wol-proxy
 .PHONE: linux linux-arm64 linux-amd64
