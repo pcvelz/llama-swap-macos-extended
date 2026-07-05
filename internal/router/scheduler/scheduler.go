@@ -56,6 +56,11 @@ type Scheduler interface {
 	OnSwapDone(ev SwapDone)
 	// OnServeDone handles a tracked ServeHTTP finishing (in-flight decrement).
 	OnServeDone(ev ServeDoneEvent)
+	// OnTick is a periodic nudge (armed by the router only when a swap-grace is
+	// configured) that re-evaluates the queue, letting a grace-deferred swap
+	// proceed once its evictee has been idle long enough. No other event fires
+	// during pure idle, so without this the deferred request would wait forever.
+	OnTick()
 	// OnUnload reconciles scheduler state for an unload, stops the targeted
 	// processes via Effects, and drains the queue. It must block until the
 	// targeted processes have stopped.

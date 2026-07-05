@@ -10,6 +10,9 @@ function makeModel(overrides: Partial<Model> = {}): Model {
     description: "",
     unlisted: false,
     peerID: "",
+    ttl: 0,
+    lastUse: "",
+    pinned: false,
     ...overrides,
   };
 }

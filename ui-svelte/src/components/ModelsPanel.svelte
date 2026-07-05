@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { models, loadModel, unloadAllModels, unloadSingleModel } from "../stores/api";
+  import { models, loadModel, unloadAllModels, unloadSingleModel, pinModel, unpinModel } from "../stores/api";
   import { isNarrow } from "../stores/theme";
   import { persistentStore } from "../stores/persistent";
   import type { Model } from "../lib/types";
@@ -73,6 +73,64 @@
 
   function getModelDisplay(model: Model): string {
     return $showIdorNameStore === "id" ? model.id : (model.name || model.id);
+  }
+
+  // Zero-time sentinel used by the backend when a model has never been used.
+  const ZERO_TIME = "0001-01-01T00:00:00Z";
+
+  // Reactive clock — ticks every second for the idle countdown.
+  let now = $state(Date.now());
+  $effect(() => {
+    const id = setInterval(() => { now = Date.now(); }, 1000);
+    return () => clearInterval(id);
+  });
+
+  /** Format seconds as M:SS (e.g. 7:48). */
+  function formatCountdown(seconds: number): string {
+    const s = Math.max(0, Math.floor(seconds));
+    const m = Math.floor(s / 60);
+    const rem = s % 60;
+    return `${m}:${rem.toString().padStart(2, "0")}`;
+  }
+
+  /**
+   * Returns a human-readable TTL label for a running model.
+   * - pinned → "pinned"
+   * - ttl == 0 → "resident" (no idle eviction configured)
+   * - never used (zero-time lastUse) → "TTL N:SS"
+   * - otherwise → "evicts in M:SS" (or "evicting" when ≤0)
+   */
+  function getTTLLabel(model: Model): string {
+    if (model.pinned) return "pinned";
+    if (!model.ttl) return "resident";
+    if (!model.lastUse || model.lastUse === ZERO_TIME) {
+      return `TTL ${formatCountdown(model.ttl)}`;
+    }
+    const lastUseMs = new Date(model.lastUse).getTime();
+    const idleSec = (now - lastUseMs) / 1000;
+    const remaining = model.ttl - idleSec;
+    if (remaining <= 0) return "evicting";
+    return `evicts in ${formatCountdown(remaining)}`;
+  }
+
+  async function handlePinToggle(model: Model): Promise<void> {
+    try {
+      if (model.pinned) {
+        await unpinModel(model.id);
+      } else {
+        await pinModel(model.id);
+      }
+    } catch (e) {
+      console.error(e);
+    }
+  }
+
+  async function handleEvict(modelId: string): Promise<void> {
+    try {
+      await unloadSingleModel(modelId);
+    } catch (e) {
+      console.error(e);
+    }
   }
 </script>
 
@@ -172,6 +230,7 @@
       <thead class="sticky top-0 bg-card z-10">
         <tr class="text-left border-b border-gray-200 dark:border-white/10 bg-surface">
           <th>{$showIdorNameStore === "id" ? "Model ID" : "Name"}</th>
+          <th class="w-32">TTL</th>
           <th></th>
           <th>State</th>
         </tr>
@@ -190,13 +249,29 @@
                 <p class="text-xs text-txtsecondary">Aliases: {model.aliases.join(", ")}</p>
               {/if}
             </td>
-            <td class="w-12">
+            <!-- TTL / idle countdown cell (only shown for running models) -->
+            <td class="w-32 text-xs text-txtsecondary tabular-nums">
+              {#if model.state !== "stopped" && !model.peerID}
+                <span title="TTL: {model.ttl}s, lastUse: {model.lastUse}">{getTTLLabel(model)}</span>
+              {/if}
+            </td>
+            <td class="w-32">
               {#if model.state === "stopped" && pendingLoads[model.id]}
                 <button class="btn btn--sm" onclick={() => cancelLoad(model.id)}>Cancel</button>
               {:else if model.state === "stopped"}
                 <button class="btn btn--sm" onclick={() => handleLoadModel(model.id)}>Load</button>
               {:else}
-                <button class="btn btn--sm" onclick={() => unloadSingleModel(model.id)} disabled={model.state !== "ready"}>Unload</button>
+                <div class="flex gap-1">
+                  <!-- Pin toggle: only meaningful when TTL is configured -->
+                  {#if model.ttl > 0 && !model.peerID}
+                    <button
+                      class="btn btn--sm"
+                      title={model.pinned ? "Unpin (re-enable idle eviction)" : "Pin (prevent idle eviction)"}
+                      onclick={() => handlePinToggle(model)}
+                    >{model.pinned ? "Unpin" : "Pin"}</button>
+                  {/if}
+                  <button class="btn btn--sm" onclick={() => handleEvict(model.id)} disabled={model.state !== "ready"}>Evict</button>
+                </div>
               {/if}
             </td>
             <td class="w-20">

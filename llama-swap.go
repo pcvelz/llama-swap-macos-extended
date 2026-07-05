@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"syscall"
@@ -19,6 +20,7 @@ import (
 	"github.com/mostlygeek/llama-swap/internal/config"
 	"github.com/mostlygeek/llama-swap/internal/event"
 	"github.com/mostlygeek/llama-swap/internal/logmon"
+	"github.com/mostlygeek/llama-swap/internal/menubar"
 	"github.com/mostlygeek/llama-swap/internal/perf"
 	"github.com/mostlygeek/llama-swap/internal/process"
 	"github.com/mostlygeek/llama-swap/internal/server"
@@ -61,6 +63,7 @@ func main() {
 	flagKeyFile := flag.String("tls-key-file", "", "TLS key file")
 	flagVersion := flag.Bool("version", false, "show version and exit")
 	flagWatchConfig := flag.Bool("watch-config", false, "reload config on file change")
+	flagMenuBar := flag.Bool("menu-bar", false, "enable macOS menu-bar helper")
 	flag.Parse()
 
 	if *flagVersion {
@@ -93,6 +96,11 @@ func main() {
 	if err != nil {
 		slog.Error("failed to load config", "path", configPath, "error", err)
 		os.Exit(1)
+	}
+
+	// Flag overrides config when both are present.
+	if *flagMenuBar {
+		cfg.MenuBar = true
 	}
 
 	// Loggers are wired per cfg.LogToStdout: proxy/upstream feed muxLog, which
@@ -155,6 +163,14 @@ func main() {
 	// activeSrv is swapped atomically during hot reload.
 	var activeMu sync.RWMutex
 	activeSrv := initialSrv
+
+	var menuBarLauncher *menubar.Launcher
+	if cfg.MenuBar && runtime.GOOS == "darwin" {
+		menuBarLauncher = menubar.New(proxyLog)
+		if err := menuBarLauncher.Start(); err != nil {
+			proxyLog.Warnf("menu-bar helper failed to start: %v", err)
+		}
+	}
 
 	httpServer := &http.Server{
 		Addr: listenAddr,
@@ -321,6 +337,12 @@ func main() {
 
 				if perfMon != nil {
 					perfMon.Stop()
+				}
+
+				if menuBarLauncher != nil {
+					if err := menuBarLauncher.Stop(); err != nil {
+						proxyLog.Warnf("menu-bar helper shutdown error: %v", err)
+					}
 				}
 
 				close(exitChan)

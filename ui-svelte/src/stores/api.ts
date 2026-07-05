@@ -176,10 +176,43 @@ export async function unloadSingleModel(model: string): Promise<void> {
   }
 }
 
+export async function pinModel(model: string): Promise<void> {
+  try {
+    const response = await fetch(`/api/models/pin/${model}`, {
+      method: "POST",
+    });
+    if (!response.ok) {
+      throw new Error(`Failed to pin model: ${response.status}`);
+    }
+  } catch (error) {
+    console.error("Failed to pin model", model, error);
+    throw error;
+  }
+}
+
+export async function unpinModel(model: string): Promise<void> {
+  try {
+    const response = await fetch(`/api/models/unpin/${model}`, {
+      method: "POST",
+    });
+    if (!response.ok) {
+      throw new Error(`Failed to unpin model: ${response.status}`);
+    }
+  } catch (error) {
+    console.error("Failed to unpin model", model, error);
+    throw error;
+  }
+}
+
 export async function loadModel(model: string, signal?: AbortSignal): Promise<void> {
   try {
-    const response = await fetch(`/upstream/${model}/?_=${Date.now()}`, {
-      method: "GET",
+    // POST is required: GET /upstream/<model>/ was changed to return 503 when the
+    // model is not yet loaded (to prevent external health-pollers from accidentally
+    // triggering eager loads). POST passes through unconditionally, so the load
+    // fires even when the model is idle. A 415 back from llama-server's root is
+    // normal — it means the model loaded and served the empty-body POST.
+    const response = await fetch(`/upstream/${model}/`, {
+      method: "POST",
       signal,
     });
     if (!response.ok) {

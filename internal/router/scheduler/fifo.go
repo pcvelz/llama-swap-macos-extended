@@ -36,19 +36,35 @@ type FIFO struct {
 	active   map[string]*activeSwap
 	inFlight map[string]int
 	queued   []HandlerReq
+
+	// grace maps a model ID to its swap-grace duration: a request for a
+	// different model is held in the queue until this model has been idle
+	// (in-flight 0) for at least this long before it may be evicted. Absent or
+	// <= 0 means no grace for that model.
+	grace map[string]time.Duration
+	// idleSince records when each model last became idle — its in-flight dropped
+	// to 0, or it just became ready. Grace is measured from this. A busy model
+	// (in-flight > 0) is already deferred by the in-flight check before the grace
+	// check runs, so a stale idleSince on a busy model is harmless.
+	idleSince map[string]time.Time
+	// now is the clock; overridable in tests.
+	now func() time.Time
 }
 
 // NewFIFO builds a FIFO scheduler. It matches scheduler.Factory once a planner
 // is captured in a closure.
-func NewFIFO(name string, logger *logmon.Monitor, planner Swapper, cfg config.FifoConfig, eff Effects) *FIFO {
+func NewFIFO(name string, logger *logmon.Monitor, planner Swapper, cfg config.FifoConfig, grace map[string]time.Duration, eff Effects) *FIFO {
 	return &FIFO{
-		name:     name,
-		logger:   logger,
-		planner:  planner,
-		cfg:      cfg,
-		effects:  eff,
-		active:   make(map[string]*activeSwap),
-		inFlight: make(map[string]int),
+		name:      name,
+		logger:    logger,
+		planner:   planner,
+		cfg:       cfg,
+		effects:   eff,
+		active:    make(map[string]*activeSwap),
+		inFlight:  make(map[string]int),
+		grace:     grace,
+		idleSince: make(map[string]time.Time),
+		now:       time.Now,
 	}
 }
 
@@ -111,6 +127,17 @@ func (s *FIFO) OnRequest(req HandlerReq) {
 		return
 	}
 
+	// (5b) Would evict a model still inside its swap-grace window — keep it
+	// resident and queue the request. The grace lets a recently-hot model ride
+	// out brief request gaps (an agent pausing to run a tool) instead of being
+	// evicted the instant it drains. OnServeDone (new traffic) or OnTick (pure
+	// idle) retries; the swap proceeds once the grace elapses.
+	if s.withinGrace(evict) {
+		s.logger.Debugf("%s: queuing request for model %s (evictee still within swap-grace)", s.name, req.Model)
+		s.enqueue(req)
+		return
+	}
+
 	// (6) Start a new (possibly parallel) swap.
 	s.logger.Debugf("%s: starting swap for model %s, evicting %v", s.name, req.Model, evict)
 	s.startSwap(req, evict, running)
@@ -167,6 +194,13 @@ func (s *FIFO) OnSwapDone(ev SwapDone) {
 	}
 	delete(s.active, ev.ModelID)
 
+	// A freshly-ready model starts its idle clock now. If waiters are granted
+	// below it goes busy immediately and the grace check won't apply until it
+	// drains again; if there are none it sits idle and the grace runs from here.
+	if ev.Err == nil {
+		s.idleSince[ev.ModelID] = s.now()
+	}
+
 	for _, w := range sw.waiters {
 		if ev.Err != nil {
 			s.effects.GrantError(w, ev.Err)
@@ -185,8 +219,43 @@ func (s *FIFO) OnServeDone(ev ServeDoneEvent) {
 	s.inFlight[ev.ModelID]--
 	if s.inFlight[ev.ModelID] <= 0 {
 		delete(s.inFlight, ev.ModelID)
+		// Model just went idle — (re)start its swap-grace clock so a competing
+		// request waits the full grace from this moment before evicting it.
+		s.idleSince[ev.ModelID] = s.now()
 		s.drainQueue()
 	}
+}
+
+// OnTick re-evaluates the queue on a timer. It is the only thing that lets a
+// grace-deferred swap proceed once its evictee has gone idle and STAYS idle:
+// no serve or swap event fires during pure idle, so without this nudge the
+// deferred request would wait forever. The router arms it only when a swap-grace
+// is configured; it is a no-op when the queue is empty.
+func (s *FIFO) OnTick() {
+	s.drainQueue()
+}
+
+// withinGrace reports whether any model in evict is still inside its swap-grace
+// window: it is idle now (a busy evictee is already deferred by the in-flight
+// check that runs before this) but has been idle for less than its configured
+// grace. A model with no recorded idle time (ready but never served under this
+// scheduler) is treated as evictable. grace <= 0 means no grace for that model.
+func (s *FIFO) withinGrace(evict []string) bool {
+	now := s.now()
+	for _, m := range evict {
+		g := s.grace[m]
+		if g <= 0 {
+			continue
+		}
+		since, ok := s.idleSince[m]
+		if !ok {
+			continue
+		}
+		if now.Sub(since) < g {
+			return true
+		}
+	}
+	return false
 }
 
 // OnUnload reconciles router-owned state with the impending Stop, performs the
@@ -325,6 +394,10 @@ func (s *FIFO) drainQueue() {
 			continue
 		}
 		if conflictsWithInFlight(evict, s.inFlight) {
+			remaining = append(remaining, req)
+			continue
+		}
+		if s.withinGrace(evict) {
 			remaining = append(remaining, req)
 			continue
 		}

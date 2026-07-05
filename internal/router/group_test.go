@@ -29,7 +29,7 @@ func newTestGroup(t *testing.T, conf config.Config, processes map[string]process
 	}
 	base := newBaseRouter("group", conf, processes, logmon.NewWriter(io.Discard),
 		func(name string, logger *logmon.Monitor, eff scheduler.Effects) scheduler.Scheduler {
-			return scheduler.NewFIFO(name, logger, swapper, conf.Routing.Scheduler.Settings.Fifo, eff)
+			return scheduler.NewFIFO(name, logger, swapper, conf.Routing.Scheduler.Settings.Fifo, nil, eff)
 		})
 	base.testProcessed = make(chan struct{}, 64)
 	g := &Group{baseRouter: base}

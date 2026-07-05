@@ -138,7 +138,15 @@ func (f *fakeEffects) startsFor(modelID string) int {
 }
 
 func newFIFO(planner Swapper, eff Effects) *FIFO {
-	return NewFIFO("test", logmon.NewWriter(io.Discard), planner, config.FifoConfig{}, eff)
+	return NewFIFO("test", logmon.NewWriter(io.Discard), planner, config.FifoConfig{}, nil, eff)
+}
+
+// newFIFOGrace builds a FIFO with a controllable clock (*clk) and per-model
+// swap-grace, for deterministic grace tests.
+func newFIFOGrace(planner Swapper, eff Effects, grace map[string]time.Duration, clk *time.Time) *FIFO {
+	s := NewFIFO("test", logmon.NewWriter(io.Discard), planner, config.FifoConfig{}, grace, eff)
+	s.now = func() time.Time { return *clk }
+	return s
 }
 
 func req(model string) HandlerReq { return HandlerReq{Model: model} }
@@ -149,6 +157,47 @@ func reqCh(model string) HandlerReq {
 	return HandlerReq{
 		Model:   model,
 		Respond: make(chan HandlerResp, 1),
+	}
+}
+
+// TestFIFO_SwapGrace asserts a competing request does NOT evict a model still
+// inside its swap-grace window, and that the swap proceeds (via OnTick) once the
+// grace elapses with the model idle.
+func TestFIFO_SwapGrace(t *testing.T) {
+	eff := newFakeEffects()
+	eff.states["a"] = process.StateReady
+	eff.states["b"] = process.StateStopped
+	clk := time.Unix(1000, 0)
+	grace := map[string]time.Duration{"a": 60 * time.Second}
+	s := newFIFOGrace(&stubPlanner{evict: map[string][]string{"b": {"a"}}}, eff, grace, &clk)
+
+	// a serves and finishes -> its idle clock starts now.
+	s.OnRequest(req("a"))
+	s.OnServeDone(ServeDoneEvent{ModelID: "a"})
+
+	// b arrives 10s later: a is only 10s idle (< 60s) -> deferred, no swap.
+	clk = clk.Add(10 * time.Second)
+	s.OnRequest(reqCh("b"))
+	if got := eff.startsFor("b"); got != 0 {
+		t.Fatalf("b should be deferred within a's grace; got %d swap starts", got)
+	}
+
+	// A tick at 59s idle still defers.
+	clk = clk.Add(49 * time.Second)
+	s.OnTick()
+	if got := eff.startsFor("b"); got != 0 {
+		t.Fatalf("b should still be deferred at 59s idle; got %d swap starts", got)
+	}
+
+	// Past 60s idle, a tick starts the swap evicting a.
+	clk = clk.Add(2 * time.Second)
+	s.OnTick()
+	if got := eff.startsFor("b"); got != 1 {
+		t.Fatalf("b should swap once a's grace elapsed; got %d swap starts", got)
+	}
+	last := eff.starts[len(eff.starts)-1]
+	if !containsString(last.evict, "a") {
+		t.Fatalf("swap for b should evict a; got evict=%v", last.evict)
 	}
 }
 
@@ -521,7 +570,7 @@ func TestFIFO_PriorityQueueOrder(t *testing.T) {
 	// loading collides with z's in-flight swap and parks in the queue.
 	planner := &stubPlanner{evict: map[string][]string{"z": {"A", "B", "C", "D"}}}
 	cfg := config.FifoConfig{Priority: map[string]int{"A": 10, "B": 5, "C": 5, "D": 1}}
-	s := NewFIFO("test", logmon.NewWriter(io.Discard), planner, cfg, eff)
+	s := NewFIFO("test", logmon.NewWriter(io.Discard), planner, cfg, nil, eff)
 
 	s.OnRequest(req("z")) // StartSwap(z, [A,B,C,D])
 

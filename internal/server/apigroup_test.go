@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/mostlygeek/llama-swap/internal/config"
 )
 
 func TestServer_InflightMiddleware(t *testing.T) {
@@ -99,5 +101,67 @@ func TestServer_APIEvents_InitialPayload(t *testing.T) {
 		if !strings.Contains(body, want) {
 			t.Errorf("initial SSE payload missing %s; body=%q", want, body)
 		}
+	}
+}
+
+func TestServer_ModelStatus_TTLAndLastUse(t *testing.T) {
+	now := time.Now().Truncate(time.Second)
+	local := newStubRouter(nil, "")
+	local.lastUseMap = map[string]time.Time{"m1": now}
+	s := newTestServer(local, newStubRouter(nil, ""))
+	s.cfg = config.Config{Models: map[string]config.ModelConfig{
+		"m1": {UnloadAfter: 120},
+	}}
+	models := s.modelStatus()
+	if len(models) != 1 {
+		t.Fatalf("len=%d want 1", len(models))
+	}
+	m := models[0]
+	if m.TTL != 120 {
+		t.Errorf("TTL=%d want 120", m.TTL)
+	}
+	if !m.LastUse.Equal(now) {
+		t.Errorf("LastUse=%v want %v", m.LastUse, now)
+	}
+}
+
+func TestServer_PinUnpin(t *testing.T) {
+	local := newStubRouter([]string{"m1"}, "")
+	s := newTestServer(local, newStubRouter(nil, ""))
+	s.cfg = config.Config{Models: map[string]config.ModelConfig{"m1": {}}}
+
+	pin := httptest.NewRequest(http.MethodPost, "/api/models/pin/m1", nil)
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, pin)
+	if w.Code != http.StatusOK {
+		t.Fatalf("pin status=%d body=%q", w.Code, w.Body.String())
+	}
+	if !local.IsPinned("m1") {
+		t.Errorf("m1 not pinned after POST /api/models/pin/m1")
+	}
+	// modelStatus must reflect the pinned state.
+	if m := s.modelStatus(); len(m) != 1 || !m[0].Pinned {
+		t.Errorf("modelStatus pinned=%v want true", m)
+	}
+
+	unpin := httptest.NewRequest(http.MethodPost, "/api/models/unpin/m1", nil)
+	w = httptest.NewRecorder()
+	s.ServeHTTP(w, unpin)
+	if w.Code != http.StatusOK {
+		t.Fatalf("unpin status=%d body=%q", w.Code, w.Body.String())
+	}
+	if local.IsPinned("m1") {
+		t.Errorf("m1 still pinned after POST /api/models/unpin/m1")
+	}
+}
+
+func TestServer_Pin_UnknownModel404(t *testing.T) {
+	s := newTestServer(newStubRouter(nil, ""), newStubRouter(nil, ""))
+	s.cfg = config.Config{Models: map[string]config.ModelConfig{}}
+
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/api/models/pin/nope", nil))
+	if w.Code != http.StatusNotFound {
+		t.Errorf("pin unknown model status=%d want 404", w.Code)
 	}
 }

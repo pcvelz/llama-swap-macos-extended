@@ -118,17 +118,24 @@ type HookOnStartup struct {
 }
 
 type Config struct {
-	HealthCheckTimeout int                    `yaml:"healthCheckTimeout"`
-	LogRequests        bool                   `yaml:"logRequests"`
-	LogLevel           string                 `yaml:"logLevel"`
-	LogTimeFormat      string                 `yaml:"logTimeFormat"`
-	LogToStdout        string                 `yaml:"logToStdout"`
-	MetricsMaxInMemory int                    `yaml:"metricsMaxInMemory"`
-	CaptureBuffer      int                    `yaml:"captureBuffer"`
-	Performance        PerformanceConfig      `yaml:"performance"`
-	GlobalTTL          int                    `yaml:"globalTTL"`
-	Models             map[string]ModelConfig `yaml:"models"` /* key is model ID */
-	Profiles           map[string][]string    `yaml:"profiles"`
+	HealthCheckTimeout int               `yaml:"healthCheckTimeout"`
+	LogRequests        bool              `yaml:"logRequests"`
+	LogLevel           string            `yaml:"logLevel"`
+	LogTimeFormat      string            `yaml:"logTimeFormat"`
+	LogToStdout        string            `yaml:"logToStdout"`
+	MetricsMaxInMemory int               `yaml:"metricsMaxInMemory"`
+	CaptureBuffer      int               `yaml:"captureBuffer"`
+	Performance        PerformanceConfig `yaml:"performance"`
+	GlobalTTL          int               `yaml:"globalTTL"`
+
+	// SwapGraceSeconds is the global default for per-model swapGraceSeconds: a
+	// request for a non-resident model waits in the queue until the resident has
+	// been idle this long before it is evicted. 0 (default) = evict as soon as
+	// the resident drains (upstream behaviour).
+	SwapGraceSeconds int `yaml:"swapGraceSeconds"`
+
+	Models   map[string]ModelConfig `yaml:"models"` /* key is model ID */
+	Profiles map[string][]string    `yaml:"profiles"`
 
 	// routing is the canonical source for swap/scheduling configuration.
 	// New code must read Routing, never the backwards-compat fields below.
@@ -157,6 +164,9 @@ type Config struct {
 
 	// present aliases to /v1/models OpenAI API listing
 	IncludeAliasesInList bool `yaml:"includeAliasesInList"`
+
+	// enable macOS menu-bar helper
+	MenuBar bool `yaml:"menu_bar"`
 
 	// support API keys, see issue #433, #50, #251
 	RequiredAPIKeys []string `yaml:"apiKeys"`
@@ -245,6 +255,8 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 		MetricsMaxInMemory: 1000,
 		CaptureBuffer:      5,
 		GlobalTTL:          0,
+		// macOS menu-bar helper is on by default in this fork; set `menu_bar: false` to opt out.
+		MenuBar: true,
 	}
 	if err = yaml.Unmarshal([]byte(yamlStr), &config); err != nil {
 		return Config{}, err
@@ -268,6 +280,10 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 
 	if config.GlobalTTL < 0 {
 		return Config{}, fmt.Errorf("globalTTL must be >= 0")
+	}
+
+	if config.SwapGraceSeconds < 0 {
+		return Config{}, fmt.Errorf("swapGraceSeconds must be >= 0")
 	}
 
 	switch config.LogToStdout {
@@ -317,6 +333,14 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 
 		if modelConfig.UnloadAfter < 0 {
 			return Config{}, fmt.Errorf("model %s: invalid TTL value %d", modelId, modelConfig.UnloadAfter)
+		}
+
+		// resolve per-model swap grace: -1 inherits the global swapGraceSeconds
+		if modelConfig.SwapGraceSeconds == MODEL_CONFIG_DEFAULT_SWAP_GRACE {
+			modelConfig.SwapGraceSeconds = config.SwapGraceSeconds
+		}
+		if modelConfig.SwapGraceSeconds < 0 {
+			return Config{}, fmt.Errorf("model %s: invalid swapGraceSeconds value %d", modelId, modelConfig.SwapGraceSeconds)
 		}
 
 		// Validate model macros

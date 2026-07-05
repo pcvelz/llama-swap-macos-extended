@@ -27,6 +27,8 @@ type stubRouter struct {
 	running       map[string]process.ProcessState
 	unloadCalls   atomic.Int32
 	loggers       map[string]*logmon.Monitor
+	lastUseMap    map[string]time.Time
+	pinned        map[string]bool
 }
 
 func newStubRouter(models []string, response string) *stubRouter {
@@ -54,6 +56,24 @@ func (s *stubRouter) ProcessLogger(modelID string) (*logmon.Monitor, bool) {
 	}
 	return nil, false
 }
+func (s *stubRouter) ProcessLastUse(modelID string) (time.Time, bool) {
+	if s.lastUseMap != nil {
+		if t, ok := s.lastUseMap[modelID]; ok {
+			return t, true
+		}
+	}
+	return time.Time{}, false
+}
+func (s *stubRouter) Pin(modelID string) {
+	if s.pinned == nil {
+		s.pinned = map[string]bool{}
+	}
+	s.pinned[modelID] = true
+}
+func (s *stubRouter) Unpin(modelID string) {
+	delete(s.pinned, modelID)
+}
+func (s *stubRouter) IsPinned(modelID string) bool { return s.pinned[modelID] }
 
 // newTestServer wires a Server with stub routers and a built mux.
 func newTestServer(local router.LocalRouter, peer router.Router) *Server {

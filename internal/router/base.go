@@ -68,6 +68,15 @@ type baseRouter struct {
 	// events are intentionally NOT signalled here so test event counts
 	// remain stable.
 	testProcessed chan struct{}
+
+	pinnedMu sync.RWMutex
+	pinned   map[string]bool
+
+	// graceTick, when > 0, arms a periodic OnTick in the run loop so swap-grace
+	// deferrals are re-evaluated during pure idle (when no serve/swap event
+	// fires). 0 disables the ticker entirely — zero overhead when no model has a
+	// swap-grace configured.
+	graceTick time.Duration
 }
 
 func newBaseRouter(
@@ -95,6 +104,7 @@ func newBaseRouter(
 		swapDoneCh:  make(chan scheduler.SwapDone),
 		serveDoneCh: make(chan scheduler.ServeDoneEvent),
 		runDone:     make(chan struct{}),
+		pinned:      make(map[string]bool),
 	}
 	b.schedule = newSched(name, logger, b)
 	return b
@@ -108,6 +118,15 @@ func (b *baseRouter) notifyProcessed() {
 
 func (b *baseRouter) run() {
 	defer close(b.runDone)
+
+	// A nil channel blocks forever in select, so when no swap-grace is configured
+	// (graceTick == 0) the tick case never fires and adds zero overhead.
+	var tickC <-chan time.Time
+	if b.graceTick > 0 {
+		ticker := time.NewTicker(b.graceTick)
+		defer ticker.Stop()
+		tickC = ticker.C
+	}
 
 	for {
 		select {
@@ -134,6 +153,9 @@ func (b *baseRouter) run() {
 
 		case ev := <-b.serveDoneCh:
 			b.schedule.OnServeDone(ev)
+
+		case <-tickC:
+			b.schedule.OnTick()
 		}
 	}
 }
@@ -244,6 +266,9 @@ func (b *baseRouter) doSwap(modelID string, toStop []string) {
 		wg.Add(1)
 		go func(p process.Process, id string) {
 			defer wg.Done()
+			// Swap evictions were previously log-silent at INFO, making
+			// residency changes invisible (2026-07-05 forensics).
+			b.logger.Infof("%s: swap eviction: unloading <%s> to make room for <%s>", b.name, id, modelID)
 			if err := p.Stop(timeout); err != nil {
 				b.logger.Warnf("%s: stopping %s failed: %v", b.name, id, err)
 			}
@@ -342,6 +367,47 @@ func (b *baseRouter) ProcessLogger(modelID string) (*logmon.Monitor, bool) {
 	return nil, false
 }
 
+func (b *baseRouter) ProcessLastUse(modelID string) (time.Time, bool) {
+	p, ok := b.processes[modelID]
+	if !ok {
+		return time.Time{}, false
+	}
+	return p.LastUse(), true
+}
+
+func (b *baseRouter) Pin(modelID string) {
+	b.pinnedMu.Lock()
+	defer b.pinnedMu.Unlock()
+	b.pinned[modelID] = true
+}
+
+func (b *baseRouter) Unpin(modelID string) {
+	b.pinnedMu.Lock()
+	defer b.pinnedMu.Unlock()
+	delete(b.pinned, modelID)
+}
+
+func (b *baseRouter) IsPinned(modelID string) bool {
+	b.pinnedMu.RLock()
+	defer b.pinnedMu.RUnlock()
+	return b.pinned[modelID]
+}
+
+// wirePinCallbacks wires the allowIdleEvict callback on every ProcessCommand
+// so the TTL goroutine consults the pinned map before evicting.
+func (b *baseRouter) wirePinCallbacks() {
+	for id, p := range b.processes {
+		id := id
+		if pc, ok := p.(*process.ProcessCommand); ok {
+			pc.SetAllowIdleEvict(func() bool {
+				b.pinnedMu.RLock()
+				defer b.pinnedMu.RUnlock()
+				return !b.pinned[id]
+			})
+		}
+	}
+}
+
 // RunningModels returns the current state of every process that is not stopped
 // or shut down. The processes map keys are fixed at construction and State()
 // is a snapshot, so this is safe to call without the run loop.
@@ -414,6 +480,16 @@ func (b *baseRouter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	if err != nil {
 		shared.SendError(w, req, err)
 		return
+	}
+
+	// Anthropic-path keepalive: /v1/messages streams that stay byte-less while
+	// parked behind a swap, loading, or mid-prefill get killed by client-side
+	// zero-byte timeouts (~300s). Wrap the writer so silent waits emit legal
+	// SSE ping events; fast requests pass through untouched (see pinging.go).
+	if data.Streaming && data.SendLoadingState && isAnthropicStreamPath(req.URL.Path) {
+		pw := newPingWriter(b.logger, data.ModelID, w)
+		defer pw.stop()
+		w = pw
 	}
 
 	hr := scheduler.HandlerReq{

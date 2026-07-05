@@ -232,6 +232,8 @@ func (s *Server) routes() {
 	mux.Handle("GET /api/performance", apiChain.ThenFunc(s.handleAPIPerformance))
 	mux.Handle("GET /api/version", apiChain.ThenFunc(s.handleAPIVersion))
 	mux.Handle("GET /api/captures/{id}", apiChain.ThenFunc(s.handleAPICapture))
+	mux.Handle("POST /api/models/pin/{model}", apiChain.ThenFunc(s.handleAPIPin))
+	mux.Handle("POST /api/models/unpin/{model}", apiChain.ThenFunc(s.handleAPIUnpin))
 
 	s.mux = mux
 	s.handler = chain.New(CreateRequestLogMiddleware(s.proxylog), CreateCORSMiddleware()).Then(mux)

@@ -2,6 +2,7 @@ package router
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/mostlygeek/llama-swap/internal/config"
 	"github.com/mostlygeek/llama-swap/internal/logmon"
@@ -24,13 +25,27 @@ func NewMatrix(conf config.Config, proxylog, upstreamlog *logmon.Monitor) (*Matr
 		logger: proxylog,
 	}
 
+	// Per-model swap-grace (resolved seconds -> duration); arms the run-loop
+	// ticker only when at least one model has a grace. See NewGroup.
+	grace := make(map[string]time.Duration)
+	hasGrace := false
+	for mid, mc := range conf.Models {
+		if mc.SwapGraceSeconds > 0 {
+			grace[mid] = time.Duration(mc.SwapGraceSeconds) * time.Second
+			hasGrace = true
+		}
+	}
+
 	// Build a process for every model in the config. Any model can run alone
 	// even if it is not part of a set; this mirrors proxy.NewMatrix.
 	processes := make(map[string]process.Process, len(conf.Models))
 	base := newBaseRouter("matrix", conf, processes, proxylog,
 		func(name string, logger *logmon.Monitor, eff scheduler.Effects) scheduler.Scheduler {
-			return scheduler.NewFIFO(name, logger, swapper, conf.Routing.Scheduler.Settings.Fifo, eff)
+			return scheduler.NewFIFO(name, logger, swapper, conf.Routing.Scheduler.Settings.Fifo, grace, eff)
 		})
+	if hasGrace {
+		base.graceTick = time.Second
+	}
 
 	for mid, modelCfg := range conf.Models {
 		procLog := logmon.NewWriter(upstreamlog)
@@ -42,6 +57,8 @@ func NewMatrix(conf config.Config, proxylog, upstreamlog *logmon.Monitor) (*Matr
 		}
 		processes[mid] = p
 	}
+
+	base.wirePinCallbacks()
 
 	r := &Matrix{baseRouter: base}
 	go base.run()

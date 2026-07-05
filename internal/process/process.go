@@ -39,6 +39,10 @@ type Process interface {
 	// and may change at any time after the call returns.
 	State() ProcessState
 
+	// LastUse returns the time of the last completed ServeHTTP call.
+	// Returns zero time if ServeHTTP has never been called.
+	LastUse() time.Time
+
 	// ServeHTTP forwards requests to the underlying process
 	// Calling it when the process is not ready will result in a
 	// 503 response with a body indicating it is a llama-swap-error

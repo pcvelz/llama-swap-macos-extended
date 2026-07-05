@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/mostlygeek/llama-swap/internal/config"
+	"github.com/mostlygeek/llama-swap/internal/process"
 )
 
 func TestServer_HandleListModels(t *testing.T) {
@@ -129,6 +130,74 @@ func TestServer_HandleUpstream(t *testing.T) {
 		s.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/upstream/nope/v1", nil))
 		if w.Code != http.StatusNotFound {
 			t.Errorf("status = %d, want 404", w.Code)
+		}
+	})
+}
+
+// TestServer_HandleUpstream_RootLoadGuard pins the eager-reload guard added to
+// handleUpstream: a GET/HEAD to the model root path (/upstream/<model>/) must NOT
+// trigger a model load. It returns 503 unless the model is already StateReady, so
+// an external health-poller can no longer accidentally reload an idle model. POST
+// (a real inference request) always passes through and may queue a load.
+func TestServer_HandleUpstream_RootLoadGuard(t *testing.T) {
+	// newGuardServer builds a server whose local router Handles "m1", returns
+	// "upstream-body" on pass-through, and reports the supplied running-state map.
+	newGuardServer := func(running map[string]process.ProcessState) *Server {
+		local := newStubRouter([]string{"m1"}, "upstream-body")
+		local.running = running
+		s := newTestServer(local, newStubRouter(nil, ""))
+		s.cfg = config.Config{Models: map[string]config.ModelConfig{"m1": {}}}
+		return s
+	}
+
+	t.Run("GET root 503 when model not ready", func(t *testing.T) {
+		// running is nil => m1 is not resident/ready.
+		s := newGuardServer(nil)
+		w := httptest.NewRecorder()
+		s.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/upstream/m1/", nil))
+		if w.Code != http.StatusServiceUnavailable {
+			t.Errorf("status = %d, want 503 (load must not be triggered by GET)", w.Code)
+		}
+	})
+
+	t.Run("HEAD root 503 when model not ready", func(t *testing.T) {
+		// A starting (not-yet-ready) model must also be guarded.
+		s := newGuardServer(map[string]process.ProcessState{"m1": process.StateStarting})
+		w := httptest.NewRecorder()
+		s.ServeHTTP(w, httptest.NewRequest(http.MethodHead, "/upstream/m1/", nil))
+		if w.Code != http.StatusServiceUnavailable {
+			t.Errorf("status = %d, want 503 (load must not be triggered by HEAD)", w.Code)
+		}
+	})
+
+	t.Run("GET root passes through when model is ready", func(t *testing.T) {
+		s := newGuardServer(map[string]process.ProcessState{"m1": process.StateReady})
+		w := httptest.NewRecorder()
+		s.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/upstream/m1/", nil))
+		if w.Code != http.StatusOK || w.Body.String() != "upstream-body" {
+			t.Errorf("status=%d body=%q, want 200/upstream-body (ready model must pass through)", w.Code, w.Body.String())
+		}
+	})
+
+	t.Run("POST root always passes through regardless of readiness", func(t *testing.T) {
+		// running is nil => m1 not ready, yet POST must still pass through so the
+		// real inference path can queue a load.
+		s := newGuardServer(nil)
+		w := httptest.NewRecorder()
+		s.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/upstream/m1/", nil))
+		if w.Code != http.StatusOK || w.Body.String() != "upstream-body" {
+			t.Errorf("status=%d body=%q, want 200/upstream-body (POST must pass through)", w.Code, w.Body.String())
+		}
+	})
+
+	t.Run("GET sub-path is not guarded (only the root load-trigger path is)", func(t *testing.T) {
+		// A GET to a real sub-path (e.g. /v1/models) is not the load-trigger root;
+		// it passes through even when not ready, matching pre-guard behavior.
+		s := newGuardServer(nil)
+		w := httptest.NewRecorder()
+		s.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/upstream/m1/v1/models", nil))
+		if w.Code != http.StatusOK || w.Body.String() != "upstream-body" {
+			t.Errorf("status=%d body=%q, want 200/upstream-body (sub-path must pass through)", w.Code, w.Body.String())
 		}
 	})
 }

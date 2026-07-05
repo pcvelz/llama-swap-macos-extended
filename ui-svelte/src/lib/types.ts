@@ -21,6 +21,9 @@ export interface Model {
   peerID: string;
   aliases?: string[];
   capabilities?: ModelCapabilities;
+  ttl: number;
+  lastUse: string;
+  pinned: boolean;
 }
 
 export interface TokenMetrics {

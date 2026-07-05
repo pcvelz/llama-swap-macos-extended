@@ -9,6 +9,7 @@ import (
 
 	"github.com/mostlygeek/llama-swap/internal/config"
 	"github.com/mostlygeek/llama-swap/internal/event"
+	"github.com/mostlygeek/llama-swap/internal/process"
 	"github.com/mostlygeek/llama-swap/internal/shared"
 )
 
@@ -27,6 +28,7 @@ type modelRecord struct {
 	Capabilities        map[string]any `json:"capabilities,omitempty"`
 	SupportedParameters []string       `json:"supported_parameters,omitempty"`
 	ContextLength       int            `json:"context_length,omitempty"`
+	MaxContextLength    int            `json:"max_context_length,omitempty"`
 	Meta                map[string]any `json:"meta,omitempty"`
 }
 
@@ -38,6 +40,7 @@ var cappedMetadataKeys = map[string]struct{}{
 	"capabilities":         {},
 	"supported_parameters": {},
 	"context_length":       {},
+	"max_context_length":   {},
 }
 
 // renderCapabilities converts a model's capabilities config into additional
@@ -147,6 +150,7 @@ func (s *Server) handleListModels(w http.ResponseWriter, r *http.Request) {
 			Description: strings.TrimSpace(description),
 		}
 		rec.Architecture, rec.Capabilities, rec.SupportedParameters, rec.ContextLength = renderCapabilities(caps)
+		rec.MaxContextLength = rec.ContextLength
 		if !caps.Empty() {
 			metadata = filterCappedMetadata(metadata)
 		}
@@ -342,6 +346,26 @@ func (s *Server) handleUpstream(w http.ResponseWriter, r *http.Request) {
 
 	switch {
 	case s.local.Handles(modelID):
+		// Guard: GET and HEAD to /upstream/<model>/ (root path) must NOT trigger a
+		// model load. They only return useful content once the model is already
+		// running — the 415 response from llama-server's root is load-cycle noise,
+		// not a real inference path. Allowing GET to trigger loads lets any external
+		// health-poller (Python-urllib, curl, browser prefetch) accidentally eager-
+		// reload an idle model that should stay stopped until a real POST arrives.
+		//
+		// POST/PUT/DELETE always pass through — they carry real inference payloads
+		// and must queue a load if the model is stopped.
+		//
+		// The web UI's "Load" button and the macOS menu helper are expected to call
+		// POST /upstream/<model>/ (updated alongside this guard).
+		if (r.Method == http.MethodGet || r.Method == http.MethodHead) && remainingPath == "/" {
+			states := s.local.RunningModels()
+			if st, ok := states[modelID]; !ok || st != process.StateReady {
+				shared.SendResponse(w, r, http.StatusServiceUnavailable,
+					"model not loaded — use POST /upstream/<model>/ to trigger a load")
+				return
+			}
+		}
 		s.local.ServeHTTP(w, r)
 	case s.peer.Handles(modelID):
 		s.peer.ServeHTTP(w, r)

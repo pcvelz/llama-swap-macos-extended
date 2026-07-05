@@ -644,3 +644,79 @@ func TestProcessCommand_ConcurrentRunStop(t *testing.T) {
 		}
 	}
 }
+
+// TestProcessCommand_PinnedModelNotIdleEvicted verifies that the TTL goroutine
+// skips idle eviction while the allowIdleEvict callback (the "pin" toggle)
+// returns false, then evicts normally once the pin is released.
+func TestProcessCommand_PinnedModelNotIdleEvicted(t *testing.T) {
+	skipIfNoSimpleResponder(t)
+
+	mock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(mock.Close)
+
+	cmd, _ := simpleResponderCmd(t, "-silent")
+
+	cfg := config.ModelConfig{
+		Cmd:                cmd,
+		Proxy:              mock.URL,
+		CheckEndpoint:      "/health",
+		HealthCheckTimeout: 10,
+		UnloadAfter:        1, // 1-second TTL
+	}
+	if runtime.GOOS == "windows" {
+		cfg.CmdStop = "taskkill /f /t /pid ${PID}"
+	}
+
+	p := newProcessCommand(t, cfg)
+
+	// Pin: the TTL goroutine must NOT evict while this returns false.
+	p.SetAllowIdleEvict(func() bool { return false })
+
+	runErr := runAsync(t, p)
+	defer func() {
+		if p.State() == StateReady {
+			p.Stop(testStopTimeout)
+		}
+	}()
+
+	if got := p.State(); got != StateReady {
+		t.Fatalf("expected StateReady, got %s", got)
+	}
+
+	// Prime the last-use timestamp so the idle window starts elapsing.
+	req := httptest.NewRequest("GET", "/", nil)
+	rr := httptest.NewRecorder()
+	p.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Errorf("expected 200 after request, got %d", rr.Code)
+	}
+
+	// Well past the 1s TTL: a pinned model must still be ready.
+	time.Sleep(2500 * time.Millisecond)
+	if got := p.State(); got != StateReady {
+		t.Fatalf("pinned model state=%s, want %s (TTL goroutine must skip eviction)", got, StateReady)
+	}
+
+	// Release the pin: the next TTL tick (model already idle past TTL) evicts.
+	p.SetAllowIdleEvict(func() bool { return true })
+
+	deadline := time.Now().Add(5 * time.Second)
+	for p.State() != StateStopped && time.Now().Before(deadline) {
+		time.Sleep(testPollInterval)
+	}
+	if got := p.State(); got != StateStopped {
+		t.Fatalf("unpinned model state=%s, want %s after TTL", got, StateStopped)
+	}
+
+	// Run() should have returned nil (clean stop from TTL).
+	select {
+	case err := <-runErr:
+		if err != nil {
+			t.Errorf("Run() after TTL stop: expected nil, got %v", err)
+		}
+	case <-time.After(testReturnTimeout):
+		t.Fatal("Run() did not return after TTL-induced stop")
+	}
+}

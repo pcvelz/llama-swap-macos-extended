@@ -7,7 +7,8 @@ import (
 )
 
 const (
-	MODEL_CONFIG_DEFAULT_TTL = -1
+	MODEL_CONFIG_DEFAULT_TTL        = -1
+	MODEL_CONFIG_DEFAULT_SWAP_GRACE = -1
 )
 
 var validModalities = map[string]struct{}{
@@ -70,8 +71,17 @@ type ModelConfig struct {
 	Env           []string `yaml:"env"`
 	CheckEndpoint string   `yaml:"checkEndpoint"`
 	UnloadAfter   int      `yaml:"ttl"`
-	Unlisted      bool     `yaml:"unlisted"`
-	UseModelName  string   `yaml:"useModelName"`
+
+	// SwapGraceSeconds holds a request for a DIFFERENT model in the queue until
+	// this model has had no in-flight requests for this many seconds before it
+	// may be evicted to free the slot. It stops a momentary request gap (e.g. an
+	// agent pausing to run a tool, then resuming) from evicting a still-hot model
+	// the instant it drains. -1 (default) inherits the global swapGraceSeconds;
+	// 0 disables the grace (evict as soon as the model drains — upstream behaviour).
+	SwapGraceSeconds int `yaml:"swapGraceSeconds"`
+
+	Unlisted     bool   `yaml:"unlisted"`
+	UseModelName string `yaml:"useModelName"`
 
 	// #179 for /v1/models
 	Name        string `yaml:"name"`
@@ -113,7 +123,8 @@ func (m *ModelConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
 		Aliases:          []string{},
 		Env:              []string{},
 		CheckEndpoint:    "/health",
-		UnloadAfter:      MODEL_CONFIG_DEFAULT_TTL, // use GlobalTTL
+		UnloadAfter:      MODEL_CONFIG_DEFAULT_TTL,        // use GlobalTTL
+		SwapGraceSeconds: MODEL_CONFIG_DEFAULT_SWAP_GRACE, // use global swapGraceSeconds
 		Unlisted:         false,
 		UseModelName:     "",
 		ConcurrencyLimit: 0,

@@ -85,6 +85,12 @@ type ProcessCommand struct {
 
 	lastUse  atomic.Int64 // unix nano timestamp of last ServeHTTP completion
 	inflight atomic.Int64 // current in-flight ServeHTTP calls
+
+	// allowIdleEvict, when set, is called by the TTL goroutine before
+	// idle-evicting; returning false suppresses eviction this tick (model is
+	// pinned). Stored atomically because the TTL goroutine reads it while
+	// SetAllowIdleEvict may write it from another goroutine.
+	allowIdleEvict atomic.Pointer[func() bool]
 }
 
 var _ Process = (*ProcessCommand)(nil)
@@ -274,6 +280,9 @@ func (p *ProcessCommand) run() {
 							for range ticker.C {
 								if p.State() != StateReady {
 									return
+								}
+								if fn := p.allowIdleEvict.Load(); fn != nil && !(*fn)() {
+									continue
 								}
 								if p.inflight.Load() != 0 {
 									continue
@@ -667,6 +676,20 @@ func (p *ProcessCommand) State() ProcessState {
 		return s
 	}
 	return StateStopped
+}
+
+func (p *ProcessCommand) LastUse() time.Time {
+	ns := p.lastUse.Load()
+	if ns == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, ns)
+}
+
+// SetAllowIdleEvict installs a callback consulted by the TTL goroutine before
+// evicting an idle model. fn returning false suppresses eviction (pinned).
+func (p *ProcessCommand) SetAllowIdleEvict(fn func() bool) {
+	p.allowIdleEvict.Store(&fn)
 }
 
 func (p *ProcessCommand) ServeHTTP(w http.ResponseWriter, r *http.Request) {

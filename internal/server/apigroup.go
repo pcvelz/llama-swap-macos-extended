@@ -25,6 +25,9 @@ type apiModel struct {
 	PeerID       string         `json:"peerID"`
 	Aliases      []string       `json:"aliases,omitempty"`
 	Capabilities map[string]any `json:"capabilities,omitempty"`
+	TTL          int            `json:"ttl"`
+	LastUse      time.Time      `json:"lastUse"`
+	Pinned       bool           `json:"pinned,omitempty"`
 }
 
 // modelStatus returns every configured model joined with its current process
@@ -46,6 +49,7 @@ func (s *Server) modelStatus() []apiModel {
 			state = string(st)
 		}
 		_, capsMap, _, _ := renderCapabilities(mc.Capabilities)
+		lastUse, _ := s.local.ProcessLastUse(id)
 		models = append(models, apiModel{
 			Id:           id,
 			Name:         mc.Name,
@@ -54,6 +58,9 @@ func (s *Server) modelStatus() []apiModel {
 			Unlisted:     mc.Unlisted,
 			Aliases:      mc.Aliases,
 			Capabilities: capsMap,
+			TTL:          mc.UnloadAfter,
+			LastUse:      lastUse,
+			Pinned:       s.local.IsPinned(id),
 		})
 	}
 
@@ -172,6 +179,40 @@ func (s *Server) handleAPICapture(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.Write(jsonBytes)
+}
+
+// handleAPIPin marks a model as pinned (not idle-evicted by TTL goroutine).
+func (s *Server) handleAPIPin(w http.ResponseWriter, r *http.Request) {
+	requested := r.PathValue("model")
+	realName, found := s.cfg.RealModelName(requested)
+	if !found {
+		shared.SendResponse(w, r, http.StatusNotFound, "model not found")
+		return
+	}
+	if !s.local.Handles(realName) {
+		shared.SendResponse(w, r, http.StatusNotFound, "no local server found for requested model")
+		return
+	}
+	s.local.Pin(realName)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"msg": "pinned"})
+}
+
+// handleAPIUnpin removes a model's pin, re-enabling idle eviction.
+func (s *Server) handleAPIUnpin(w http.ResponseWriter, r *http.Request) {
+	requested := r.PathValue("model")
+	realName, found := s.cfg.RealModelName(requested)
+	if !found {
+		shared.SendResponse(w, r, http.StatusNotFound, "model not found")
+		return
+	}
+	if !s.local.Handles(realName) {
+		shared.SendResponse(w, r, http.StatusNotFound, "no local server found for requested model")
+		return
+	}
+	s.local.Unpin(realName)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"msg": "unpinned"})
 }
 
 type messageType string

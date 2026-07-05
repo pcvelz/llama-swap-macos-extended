@@ -1715,3 +1715,40 @@ routing:
 	require.NoError(t, err)
 	assert.Equal(t, 5, cfg.Routing.Scheduler.Settings.Fifo.Priority["gemma"])
 }
+
+func TestConfig_MenuBar(t *testing.T) {
+	t.Run("menu_bar true parses", func(t *testing.T) {
+		content := `
+menu_bar: true
+models:
+  model1:
+    cmd: server --port ${PORT}
+`
+		config, err := LoadConfigFromReader(strings.NewReader(content))
+		require.NoError(t, err)
+		assert.True(t, config.MenuBar)
+	})
+
+	t.Run("menu_bar defaults to true (fork default)", func(t *testing.T) {
+		content := `
+models:
+  model1:
+    cmd: server --port ${PORT}
+`
+		config, err := LoadConfigFromReader(strings.NewReader(content))
+		require.NoError(t, err)
+		assert.True(t, config.MenuBar)
+	})
+
+	t.Run("menu_bar false opts out", func(t *testing.T) {
+		content := `
+menu_bar: false
+models:
+  model1:
+    cmd: server --port ${PORT}
+`
+		config, err := LoadConfigFromReader(strings.NewReader(content))
+		require.NoError(t, err)
+		assert.False(t, config.MenuBar)
+	})
+}

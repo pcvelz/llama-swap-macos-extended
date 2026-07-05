@@ -49,4 +49,16 @@ type LocalRouter interface {
 	// modelID must be a real (non-alias) config key. Returns false when the
 	// model is not known to this router.
 	ProcessLogger(modelID string) (*logmon.Monitor, bool)
+
+	// ProcessLastUse returns the last-use time for the named model's process.
+	ProcessLastUse(modelID string) (time.Time, bool)
+
+	// Pin marks a model as pinned so the TTL goroutine will not idle-evict it.
+	Pin(modelID string)
+
+	// Unpin removes a model's pin, re-enabling idle eviction.
+	Unpin(modelID string)
+
+	// IsPinned reports whether the model is currently pinned.
+	IsPinned(modelID string) bool
 }
