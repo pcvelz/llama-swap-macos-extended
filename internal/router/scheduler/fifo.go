@@ -47,6 +47,17 @@ type FIFO struct {
 	// (in-flight > 0) is already deferred by the in-flight check before the grace
 	// check runs, so a stale idleSince on a busy model is harmless.
 	idleSince map[string]time.Time
+	// graceWait records, per REQUESTED model, when its oldest queued request
+	// was FIRST deferred by a swap-grace. It powers the starvation valve in
+	// withinGrace: grace is an idle-STREAK requirement, so a continuous
+	// consumer of the resident model (cadence < grace) resets idleSince
+	// forever and a parked cross-model request would starve indefinitely
+	// (witnessed 2026-07-15: a ~20s-cadence client pinned a 600s-grace model;
+	// the parked request waited 13+ min until manually flushed). Once the
+	// deferred request has itself waited >= the evictee's grace, the evictee
+	// has had its full protection window and the swap proceeds at the next
+	// drain gap. Cleared when the model's swap starts or its queue empties.
+	graceWait map[string]time.Time
 	// now is the clock; overridable in tests.
 	now func() time.Time
 }
@@ -64,6 +75,7 @@ func NewFIFO(name string, logger *logmon.Monitor, planner Swapper, cfg config.Fi
 		inFlight:  make(map[string]int),
 		grace:     grace,
 		idleSince: make(map[string]time.Time),
+		graceWait: make(map[string]time.Time),
 		now:       time.Now,
 	}
 }
@@ -132,7 +144,8 @@ func (s *FIFO) OnRequest(req HandlerReq) {
 	// out brief request gaps (an agent pausing to run a tool) instead of being
 	// evicted the instant it drains. OnServeDone (new traffic) or OnTick (pure
 	// idle) retries; the swap proceeds once the grace elapses.
-	if s.withinGrace(evict) {
+	if s.withinGrace(req.Model, evict) {
+		s.noteGraceDeferral(req.Model)
 		s.logger.Debugf("%s: queuing request for model %s (evictee still within swap-grace)", s.name, req.Model)
 		s.enqueue(req)
 		return
@@ -178,6 +191,20 @@ func (s *FIFO) OnCancel(req HandlerReq) {
 	}
 
 	if removed {
+		// If that was the LAST queued request for this model, drop its
+		// starvation-valve reference: a stale graceWait would let a future,
+		// unrelated request for the same model bypass the evictee's grace
+		// instantly (the valve must measure THAT request's own wait).
+		stillQueued := false
+		for _, q := range s.queued {
+			if q.Model == req.Model {
+				stillQueued = true
+				break
+			}
+		}
+		if !stillQueued {
+			delete(s.graceWait, req.Model)
+		}
 		s.logger.Debugf("%s: cancelled request for model %s pruned from scheduler", s.name, req.Model)
 		broadcastQueuePositions(s.queued)
 	}
@@ -240,7 +267,16 @@ func (s *FIFO) OnTick() {
 // check that runs before this) but has been idle for less than its configured
 // grace. A model with no recorded idle time (ready but never served under this
 // scheduler) is treated as evictable. grace <= 0 means no grace for that model.
-func (s *FIFO) withinGrace(evict []string) bool {
+//
+// Starvation valve: the idle-streak requirement alone lets a continuous
+// consumer of the evictee (request cadence < grace) defer reqModel FOREVER —
+// idleSince resets on every completion. So a deferral is honoured only until
+// reqModel's oldest queued request has itself waited the evictee's full grace
+// (measured from its first deferral, tracked in graceWait): at that point the
+// evictee has had every bit of protection the grace promises, and the swap
+// proceeds at the next drain gap. reqModel must be the REQUESTED model whose
+// deferral is being decided; callers record graceWait on a true return.
+func (s *FIFO) withinGrace(reqModel string, evict []string) bool {
 	now := s.now()
 	for _, m := range evict {
 		g := s.grace[m]
@@ -252,10 +288,21 @@ func (s *FIFO) withinGrace(evict []string) bool {
 			continue
 		}
 		if now.Sub(since) < g {
+			if w, ok := s.graceWait[reqModel]; ok && now.Sub(w) >= g {
+				continue // valve open: requester already waited m's full grace
+			}
 			return true
 		}
 	}
 	return false
+}
+
+// noteGraceDeferral records the FIRST time a request for reqModel was deferred
+// by a swap-grace, so the starvation valve has a fixed reference point.
+func (s *FIFO) noteGraceDeferral(reqModel string) {
+	if _, ok := s.graceWait[reqModel]; !ok {
+		s.graceWait[reqModel] = s.now()
+	}
 }
 
 // OnUnload reconciles router-owned state with the impending Stop, performs the
@@ -333,6 +380,9 @@ func (s *FIFO) grantHandler(req HandlerReq, modelID string) {
 // the set EvictionFor saw, forwarded to OnSwapStart so the planner logs against
 // the same picture it decided on.
 func (s *FIFO) startSwap(initial HandlerReq, evict, running []string) {
+	// The wait is over — drop the starvation-valve reference so a FUTURE
+	// request for this model starts a fresh grace wait of its own.
+	delete(s.graceWait, initial.Model)
 	s.active[initial.Model] = &activeSwap{
 		modelID: initial.Model,
 		evict:   evict,
@@ -397,7 +447,8 @@ func (s *FIFO) drainQueue() {
 			remaining = append(remaining, req)
 			continue
 		}
-		if s.withinGrace(evict) {
+		if s.withinGrace(req.Model, evict) {
+			s.noteGraceDeferral(req.Model)
 			remaining = append(remaining, req)
 			continue
 		}

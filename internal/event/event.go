@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // Event represents an event contract
@@ -183,6 +184,14 @@ func groupOf[T Event](eventType uint32, subs any) *group[T] {
 type consumer[T Event] struct {
 	queue []T  // Current work queue
 	stop  bool // Stop signal
+	// stuck marks a consumer that stayed at a FULL queue through an entire
+	// bounded flow-control wait: its handler is presumed blocked (e.g. an SSE
+	// subscriber writing to a dead TCP peer). Broadcast stops waiting on stuck
+	// consumers and drop-oldests into their queue instead, so one dead peer
+	// can never halt event publishing process-wide (2026-07-15 production
+	// wedge: swap + TTL eviction frozen behind a full /api/events consumer).
+	// Cleared by Listen the moment the consumer drains again.
+	stuck bool
 }
 
 // Listen listens to the event queue and processes events
@@ -205,6 +214,7 @@ func (s *consumer[T]) Listen(c *sync.Cond, fn func(T)) {
 		temp := s.queue
 		s.queue = pending[:0]
 		pending = temp
+		s.stuck = false // it drained — eligible for lossless flow control again
 		c.L.Unlock()
 
 		// Outside of the critical section, process the work
@@ -224,7 +234,28 @@ type group[T Event] struct {
 	cond     *sync.Cond
 	subs     []*consumer[T]
 	maxQueue int // Maximum queue size per consumer
-	maxLen   int // Current maximum queue length across all consumers
+}
+
+// stuckWait bounds how long ONE Broadcast may stall in flow control waiting
+// for a full consumer to drain. Long enough that a merely-slow consumer gets
+// real backpressure (lossless delivery, the original design), short enough
+// that a DEAD consumer (blocked handler, e.g. SSE write to a dead peer) can
+// only ever stall publishing once — after the wait it is marked stuck and all
+// later Broadcasts drop-oldest into its queue without waiting. WHY not 0: the
+// pre-existing lossless contract for live consumers (TestBackpressure) must
+// survive; WHY not unbounded: unbounded is the 2026-07-15 production wedge
+// (swap/TTL machinery frozen 43+ minutes behind one full consumer).
+const stuckWait = time.Second
+
+// fullActive reports whether any NON-stuck consumer is at a full queue —
+// only those are worth waiting on: a stuck one has no pending drain to wait for.
+func (s *group[T]) fullActive() bool {
+	for _, sub := range s.subs {
+		if !sub.stuck && len(sub.queue) >= s.maxQueue {
+			return true
+		}
+	}
+	return false
 }
 
 // Broadcast sends an event to all consumers
@@ -232,36 +263,43 @@ func (s *group[T]) Broadcast(ev T) {
 	s.cond.L.Lock()
 	defer s.cond.L.Unlock()
 
-	// Calculate current maximum queue length
-	s.maxLen = 0
-	for _, sub := range s.subs {
-		if len(sub.queue) > s.maxLen {
-			s.maxLen = len(sub.queue)
+	// Bounded backpressure: wait for full-but-draining consumers, but never
+	// indefinitely. sync.Cond has no timed wait, so a one-shot timer issues
+	// the wakeup that a stuck consumer would otherwise never send.
+	if s.fullActive() {
+		start := time.Now()
+		timer := time.AfterFunc(stuckWait, func() {
+			s.cond.L.Lock()
+			s.cond.Broadcast()
+			s.cond.L.Unlock()
+		})
+		for s.fullActive() && time.Since(start) < stuckWait {
+			s.cond.Wait()
 		}
-	}
+		timer.Stop()
 
-	// Backpressure: wait if queues are full
-	for s.maxLen >= s.maxQueue {
-		s.cond.Wait()
-
-		// Recalculate after wakeup
-		s.maxLen = 0
+		// Anything still full after a whole stuckWait is presumed dead: mark
+		// it so no future Broadcast waits on it (Listen clears the mark the
+		// moment it drains).
 		for _, sub := range s.subs {
-			if len(sub.queue) > s.maxLen {
-				s.maxLen = len(sub.queue)
+			if len(sub.queue) >= s.maxQueue {
+				sub.stuck = true
 			}
 		}
 	}
 
-	// Add event to all queues and track new maximum
-	newMax := 0
+	// Enqueue: lossless append for consumers with room; drop-oldest for a
+	// full (stuck) consumer — its queue is bounded and its newest events win,
+	// which is the right trade for state/metric streams read by a peer that
+	// may never come back.
 	for _, sub := range s.subs {
-		sub.queue = append(sub.queue, ev)
-		if len(sub.queue) > newMax {
-			newMax = len(sub.queue)
+		if len(sub.queue) >= s.maxQueue {
+			copy(sub.queue, sub.queue[1:])
+			sub.queue[len(sub.queue)-1] = ev
+		} else {
+			sub.queue = append(sub.queue, ev)
 		}
 	}
-	s.maxLen = newMax
 	s.cond.Broadcast() // Wake consumers
 }
 
