@@ -46,10 +46,17 @@ func CreateFilterMiddleware(cfg config.Config) chain.Middleware {
 				return
 			}
 
-			body, err := io.ReadAll(r.Body)
-			if err != nil {
-				shared.SendResponse(w, r, http.StatusBadRequest, "could not read request body")
-				return
+			// FetchContext already buffered the body once; reuse it instead of
+			// reading r.Body again here. Fall back to a direct read only if
+			// nothing was buffered upstream (e.g. an empty body).
+			body := data.Body
+			if body == nil {
+				var err error
+				body, err = io.ReadAll(r.Body)
+				if err != nil {
+					shared.SendResponse(w, r, http.StatusBadRequest, "could not read request body")
+					return
+				}
 			}
 
 			body, err = applyFilters(body, data.Model, useModelName, filters)
@@ -62,6 +69,12 @@ func CreateFilterMiddleware(cfg config.Config) chain.Middleware {
 			r.Header.Del("Transfer-Encoding")
 			r.Header.Set("Content-Length", strconv.Itoa(len(body)))
 			r.ContentLength = int64(len(body))
+
+			// Persist the filtered body on the shared context so downstream
+			// middleware (metrics captures) observes the mutated bytes instead
+			// of re-reading r.Body itself.
+			data.Body = body
+			*r = *r.WithContext(shared.SetContext(r.Context(), data))
 
 			next.ServeHTTP(w, r)
 		})

@@ -1,8 +1,6 @@
 package server
 
 import (
-	"bytes"
-	"io"
 	"net/http"
 
 	"github.com/mostlygeek/llama-swap/internal/chain"
@@ -29,22 +27,35 @@ func CreateMetricsMiddleware(mm *metricsMonitor, cfg config.Config) chain.Middle
 				return
 			}
 
-			// Buffer the request body/headers for capture before dispatch
-			// consumes them.
+			// Capture fields for this route, and (if captures are enabled) a
+			// pre-compressed request capture handed off before dispatch.
+			//
+			// The request body is already buffered on the shared context by
+			// FetchContext/filters.go; no separate io.ReadAll is needed here.
+			// What used to be a raw reqBody []byte pinned for the entire
+			// streamed-response duration (which can be hours while a request
+			// sits parked in llama-swap's queue) is instead compressed
+			// immediately into the same zstd+CBOR capture format used for
+			// final storage. Only the much smaller compressed blob survives
+			// until record() below merges it with the response capture.
 			cf := captureFieldsFor(r.URL.Path)
-			var reqBody []byte
-			var reqHeaders map[string]string
-			if mm.enableCaptures {
-				if cf&captureReqBody != 0 && r.Body != nil {
-					if buffered, err := io.ReadAll(r.Body); err == nil {
-						reqBody = buffered
-						r.Body.Close()
-						r.Body = io.NopCloser(bytes.NewReader(reqBody))
-					}
+			var reqCapture []byte
+			if mm.enableCaptures && cf&(captureReqBody|captureReqHeaders) != 0 {
+				partial := ReqRespCapture{ReqPath: r.URL.Path}
+				if cf&captureReqBody != 0 {
+					partial.ReqBody = data.Body
 				}
 				if cf&captureReqHeaders != 0 {
-					reqHeaders = headerMap(r.Header)
-					redactHeaders(reqHeaders)
+					headers := headerMap(r.Header)
+					redactHeaders(headers)
+					partial.ReqHeaders = headers
+				}
+				if len(partial.ReqBody) > 0 || len(partial.ReqHeaders) > 0 {
+					if compressed, _, err := compressCapture(&partial); err == nil {
+						reqCapture = compressed
+					} else {
+						mm.logger.Warnf("failed to pre-compress request capture: %v, path=%s", err, r.URL.Path)
+					}
 				}
 			}
 
@@ -56,7 +67,7 @@ func CreateMetricsMiddleware(mm *metricsMonitor, cfg config.Config) chain.Middle
 
 			recorder := newBodyCopier(w)
 			next.ServeHTTP(recorder, r)
-			mm.record(data.ModelID, r, recorder, cf, reqBody, reqHeaders)
+			mm.record(data.ModelID, r, recorder, cf, reqCapture)
 		})
 	}
 }

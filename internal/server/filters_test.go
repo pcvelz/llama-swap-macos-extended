@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/mostlygeek/llama-swap/internal/config"
+	"github.com/mostlygeek/llama-swap/internal/shared"
 	"github.com/tidwall/gjson"
 )
 
@@ -54,6 +55,51 @@ func TestServer_ApplyFilters(t *testing.T) {
 			t.Errorf("top_p = %v, want 0.1", got)
 		}
 	})
+}
+
+// TestServer_FilterMiddleware_SharedBodyBuffer verifies filters.go consumes
+// the request body FetchContext already buffered (rather than re-reading
+// r.Body itself), that the filtered result reaches the downstream handler
+// with identical io semantics to before, and that the shared context Body is
+// updated to the filtered bytes so later middleware (metrics captures) sees
+// the mutated body instead of the original.
+func TestServer_FilterMiddleware_SharedBodyBuffer(t *testing.T) {
+	cfg := config.Config{Models: map[string]config.ModelConfig{
+		"alias": {
+			UseModelName: "real-model",
+			Filters: config.ModelFilters{Filters: config.Filters{
+				SetParams: map[string]any{"top_p": 0.9},
+			}},
+		},
+	}}
+
+	reqJSON := `{"model":"alias","temp":1}`
+	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(reqJSON))
+	r.Header.Set("Content-Type", "application/json")
+
+	var gotBody []byte
+	var gotCtxBody []byte
+	final := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotBody, _ = io.ReadAll(r.Body)
+		if data, ok := shared.ReadContext(r.Context()); ok {
+			gotCtxBody = data.Body
+		}
+	})
+
+	CreateFilterMiddleware(cfg)(final).ServeHTTP(httptest.NewRecorder(), r)
+
+	if got := gjson.GetBytes(gotBody, "model").String(); got != "real-model" {
+		t.Errorf("downstream model = %q, want real-model", got)
+	}
+	if got := gjson.GetBytes(gotBody, "top_p").Float(); got != 0.9 {
+		t.Errorf("downstream top_p = %v, want 0.9", got)
+	}
+	if gotCtxBody == nil {
+		t.Fatal("expected shared context Body to be set after filtering")
+	}
+	if !bytes.Equal(gotBody, gotCtxBody) {
+		t.Errorf("shared context Body = %q, does not match filtered r.Body %q", gotCtxBody, gotBody)
+	}
 }
 
 func TestServer_RewriteMultipartModel(t *testing.T) {

@@ -26,6 +26,15 @@ type ReqContextData struct {
 	ModelID          string
 	Streaming        bool
 	SendLoadingState bool
+
+	// Body is the raw request body buffered once by extractContext (nil for
+	// GET requests, which carry no body). Downstream middleware (filters,
+	// metrics) reuse this instead of re-reading r.Body, so the body is only
+	// buffered into memory once per request rather than once per middleware.
+	// A middleware that mutates the body (e.g. filters.go rewriting JSON
+	// params) must call SetContext with an updated copy so later middleware
+	// observes the mutated bytes.
+	Body []byte
 }
 
 var (
@@ -147,6 +156,7 @@ func extractContext(r *http.Request) (ReqContextData, error) {
 			Model:     gjson.GetBytes(bodyBytes, "model").String(),
 			Streaming: gjson.GetBytes(bodyBytes, "stream").Bool(),
 			ApiKey:    apiKey,
+			Body:      bodyBytes,
 		}, nil
 	}
 
@@ -168,6 +178,7 @@ func extractContext(r *http.Request) (ReqContextData, error) {
 		Model:     r.FormValue("model"),
 		Streaming: r.FormValue("stream") == "true",
 		ApiKey:    apiKey,
+		Body:      bodyBytes,
 	}, nil
 }
 

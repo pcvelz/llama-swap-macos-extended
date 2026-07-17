@@ -124,8 +124,10 @@ func (mp *metricsMonitor) getMetricsJSON() ([]byte, error) {
 // record parses a completed response body and stores/emits an activity entry.
 // When captures are enabled, a zstd+CBOR capture is stored for successful
 // requests, with cf controlling which request/response parts are retained.
-// reqBody and reqHeaders are the request data buffered before dispatch.
-func (mp *metricsMonitor) record(modelID string, r *http.Request, recorder *responseBodyCopier, cf captureFields, reqBody []byte, reqHeaders map[string]string) {
+// reqCapture is a zstd+CBOR-compressed ReqRespCapture (request fields only,
+// see CreateMetricsMiddleware) produced before dispatch; record decompresses
+// it and merges in the response fields before the final store.
+func (mp *metricsMonitor) record(modelID string, r *http.Request, recorder *responseBodyCopier, cf captureFields, reqCapture []byte) {
 	tm := ActivityLogEntry{
 		Timestamp:       time.Now(),
 		Model:           modelID,
@@ -197,12 +199,16 @@ func (mp *metricsMonitor) record(modelID string, r *http.Request, recorder *resp
 	tm.ID = mp.queueMetrics(tm)
 	if mp.enableCaptures {
 		capture := ReqRespCapture{
-			ID:         tm.ID,
-			ReqPath:    r.URL.Path,
-			ReqHeaders: reqHeaders,
+			ID:      tm.ID,
+			ReqPath: r.URL.Path,
 		}
-		if cf&captureReqBody != 0 {
-			capture.ReqBody = reqBody
+		if len(reqCapture) > 0 {
+			if partial, err := decompressCapture(reqCapture); err == nil {
+				capture.ReqHeaders = partial.ReqHeaders
+				capture.ReqBody = partial.ReqBody
+			} else {
+				mp.logger.Warnf("failed to decompress request capture: %v, path=%s", err, r.URL.Path)
+			}
 		}
 		if cf&captureRespHeaders != 0 {
 			capture.RespHeaders = headerMap(recorder.Header())
@@ -403,11 +409,142 @@ func filterAcceptEncoding(acceptEncoding string) string {
 	return strings.Join(filtered, ", ")
 }
 
+// responseTeeCapBytes bounds how much of a streamed SSE response
+// responseBodyCopier keeps buffered for metrics parsing. Without a bound, a
+// long-lived SSE stream (a request can sit parked in llama-swap's queue and
+// then stream for a very long time) grows this buffer without limit, an
+// OOM-scale footprint under concurrent long streams. processStreamingResponse
+// only needs the LAST usage/timings-bearing SSE event (it keeps overwriting
+// as it scans forward), so keeping just the most recent responseTeeCapBytes
+// bytes preserves metrics correctness for that path; only the (unbounded)
+// capture-storage fidelity for the response body on streams that exceed the
+// cap is traded away - the stored capture body is truncated to the same tail
+// window used for parsing.
+//
+// This cap applies ONLY to uncompressed text/event-stream responses (see
+// selectBuffer below). mp.record's non-streaming branch does a single
+// gjson.ParseBytes over the WHOLE body from offset 0 - capping that buffer
+// would hand it a truncated mid-document fragment (invalid JSON) and silently
+// zero out token metrics for any non-streaming response over the cap. Plain
+// JSON responses are also bounded by normal sizes anyway; the memory problem
+// this cap solves is specifically long-lived SSE streams. Compressed SSE
+// (Content-Encoding set) is likewise left uncapped: decompressBody needs a
+// complete gzip/deflate stream, so a truncated tail would corrupt it too.
+const responseTeeCapBytes = 16 * 1024 * 1024 // 16MB
+
+// cappedTailBuffer is an io.Writer that retains only the most recently written
+// responseTeeCapBytes bytes, discarding older bytes from the front once the
+// cap is reached. Most SSE responses are KB-to-few-MB, well under the cap, so
+// the backing array is grown lazily via append (Go's normal geometric
+// growth) rather than eagerly allocated at the full cap size - eagerly
+// allocating 16MB per stream would itself be the large-transient-allocation
+// pattern this cap exists to avoid, multiplied by every concurrent stream
+// (golang/go#47656). Only once cumulative writes reach the cap does the
+// buffer switch to fixed-size ring semantics, so a write after that point
+// costs O(len(p)), not O(cap).
+type cappedTailBuffer struct {
+	buf     []byte // grows via append while !wrapped; fixed len == cap once wrapped
+	cap     int
+	pos     int  // next write position within buf (ring mode only; see Write)
+	wrapped bool // true once buf has reached cap bytes at least once
+}
+
+func newCappedTailBuffer(capBytes int) *cappedTailBuffer {
+	return &cappedTailBuffer{cap: capBytes}
+}
+
+func (c *cappedTailBuffer) Write(p []byte) (int, error) {
+	total := len(p)
+	if total == 0 || c.cap <= 0 {
+		return total, nil
+	}
+
+	if !c.wrapped {
+		room := c.cap - len(c.buf)
+		if len(p) <= room {
+			// Still below the cap: grow the backing array like a normal
+			// append-based buffer, no ring bookkeeping needed yet.
+			c.buf = append(c.buf, p...)
+			c.pos = len(c.buf)
+			if c.pos == c.cap {
+				c.wrapped = true
+				c.pos = 0
+			}
+			return total, nil
+		}
+		// This write crosses the cap: fill the remaining growing capacity
+		// (buf becomes exactly cap bytes long, matching ring-mode's fixed
+		// size invariant), then fall through to ring-mode for the rest of p.
+		c.buf = append(c.buf, p[:room]...)
+		p = p[room:]
+		c.wrapped = true
+		c.pos = 0
+	}
+
+	// Ring mode: c.buf is a fixed-size (cap-length) circular buffer.
+	n := len(p)
+	if n == 0 {
+		return total, nil
+	}
+	if n >= c.cap {
+		copy(c.buf, p[n-c.cap:])
+		c.pos = 0
+		return total, nil
+	}
+	end := c.pos + n
+	if end <= c.cap {
+		copy(c.buf[c.pos:end], p)
+		c.pos = end % c.cap
+	} else {
+		first := c.cap - c.pos
+		copy(c.buf[c.pos:], p[:first])
+		copy(c.buf, p[first:])
+		c.pos = n - first
+	}
+	return total, nil
+}
+
+// Bytes returns the retained bytes in chronological order (oldest first). If
+// the cap was reached, this is the tail window; otherwise it is everything
+// written so far.
+func (c *cappedTailBuffer) Bytes() []byte {
+	if c.buf == nil {
+		return nil
+	}
+	if !c.wrapped {
+		return c.buf[:c.pos]
+	}
+	out := make([]byte, c.cap)
+	copy(out, c.buf[c.pos:])
+	copy(out[c.cap-c.pos:], c.buf[:c.pos])
+	return out
+}
+
+// Len returns the number of bytes retained (capped at c.cap).
+func (c *cappedTailBuffer) Len() int {
+	if !c.wrapped {
+		return c.pos
+	}
+	return c.cap
+}
+
+// teeBuffer is the interface responseBodyCopier.body satisfies, whichever
+// concrete buffer selectBuffer picks: an unbounded *bytes.Buffer for
+// non-streaming/compressed responses, or a bounded *cappedTailBuffer for
+// uncompressed SSE streams.
+type teeBuffer interface {
+	io.Writer
+	Bytes() []byte
+	Len() int
+}
+
 // responseBodyCopier tees the upstream response to the client while buffering
 // it for metrics parsing. Status defaults to 200 until WriteHeader is called.
+// The buffer implementation (bounded vs unbounded) is chosen lazily in
+// selectBuffer, once response headers are available - see responseTeeCapBytes.
 type responseBodyCopier struct {
 	http.ResponseWriter
-	body        *bytes.Buffer
+	body        teeBuffer
 	tee         io.Writer
 	status      int
 	wroteHeader bool
@@ -415,14 +552,34 @@ type responseBodyCopier struct {
 }
 
 func newBodyCopier(w http.ResponseWriter) *responseBodyCopier {
-	buf := &bytes.Buffer{}
 	return &responseBodyCopier{
 		ResponseWriter: w,
-		body:           buf,
-		tee:            io.MultiWriter(w, buf),
-		status:         http.StatusOK,
-		start:          time.Now(),
+		// Default to an unbounded buffer so recorder.body is always safe to
+		// call Bytes()/Len() on, even for a handler that never writes a body
+		// (WriteHeader/selectBuffer never runs). selectBuffer may still swap
+		// this out for a capped tail buffer once headers are known - safe
+		// because that only happens before any bytes are written to it.
+		body:   &bytes.Buffer{},
+		status: http.StatusOK,
+		start:  time.Now(),
 	}
+}
+
+// selectBuffer picks the buffer implementation once response headers are
+// final (called from WriteHeader, before it forwards to the underlying
+// writer). Only uncompressed text/event-stream responses get the bounded
+// tail buffer; everything else (including compressed SSE, which
+// decompressBody needs whole) gets an unbounded buffer, matching pre-cap
+// behavior for those cases.
+func (w *responseBodyCopier) selectBuffer() {
+	h := w.Header()
+	streaming := strings.Contains(h.Get("Content-Type"), "text/event-stream") && h.Get("Content-Encoding") == ""
+	if streaming {
+		w.body = newCappedTailBuffer(responseTeeCapBytes)
+	} else {
+		w.body = &bytes.Buffer{}
+	}
+	w.tee = io.MultiWriter(w.ResponseWriter, w.body)
 }
 
 func (w *responseBodyCopier) Write(b []byte) (int, error) {
@@ -444,6 +601,7 @@ func (w *responseBodyCopier) WriteHeader(statusCode int) {
 	}
 	w.wroteHeader = true
 	w.status = statusCode
+	w.selectBuffer()
 	w.ResponseWriter.WriteHeader(statusCode)
 }
 
