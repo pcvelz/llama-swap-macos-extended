@@ -408,6 +408,25 @@ func (p *ProcessCommand) doStart(startCtx context.Context, healthCheckTimeout ti
 			if rec := recover(); rec != nil {
 				if rec == http.ErrAbortHandler {
 					p.proxyLogger.Infof("<%s> recovered from upstream disconnection during streaming", p.id)
+					// WHY: a cleanly-closed HTTP 200 with a truncated SSE body
+					// looks like a completed-but-empty stream to Anthropic
+					// clients (claude-cli blind-retries instead of erroring).
+					// Only SSE responses get a terminal error event; non-SSE
+					// responses keep the log-only behavior since the client
+					// has no streaming contract to satisfy.
+					if strings.Contains(strings.ToLower(w.Header().Get("Content-Type")), "text/event-stream") {
+						// WHY: the upstream may have died mid-event, so prefix
+						// with a blank line to force an SSE event boundary
+						// before our error event. Best-effort: the client may
+						// itself be gone — ignore write errors.
+						_, _ = fmt.Fprintf(w,
+							"\n\nevent: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"llama-swap: upstream disconnected mid-stream\"}}\n\n")
+						// WHY: push the terminal event out now — the handler is
+						// about to return and the connection will close.
+						if f, ok := w.(http.Flusher); ok {
+							f.Flush()
+						}
+					}
 				} else {
 					p.proxyLogger.Warnf("<%s> recovered from panic: %v", p.id, rec)
 				}
