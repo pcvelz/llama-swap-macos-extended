@@ -50,19 +50,28 @@ mac-menu:
 	mkdir -p $(BUILD_DIR)
 	cp macos-menu/.build/release/llama-swap-menu $(BUILD_DIR)/llama-swap-menu
 
+# Cross-platform system-tray helper (Windows/Linux; macOS uses macos-menu).
+# CGO_ENABLED=0 works because fyne.io/systray is pure Go on these platforms.
+tray:
+	@echo "Building system-tray helper..."
+	mkdir -p $(BUILD_DIR)
+	GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -o $(BUILD_DIR)/llama-swap-tray-windows-amd64.exe ./cmd/llama-swap-tray
+	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o $(BUILD_DIR)/llama-swap-tray-linux-amd64 ./cmd/llama-swap-tray
+	GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o $(BUILD_DIR)/llama-swap-tray-linux-arm64 ./cmd/llama-swap-tray
+
 # Build Linux binary
 linux: linux-arm64 linux-amd64
 
-linux-amd64: ui
+linux-amd64: ui tray
 	@echo "Building Linux AMD64 binary..."
 	GOOS=linux GOARCH=amd64 go build -ldflags="-X main.commit=${GIT_HASH} -X main.version=local_${GIT_HASH} -X main.date=${BUILD_DATE}" -o $(BUILD_DIR)/$(APP_NAME)-linux-amd64
 
-linux-arm64: ui
+linux-arm64: ui tray
 	@echo "Building Linux ARM64 binary..."
 	GOOS=linux GOARCH=arm64 go build -ldflags="-X main.commit=${GIT_HASH} -X main.version=local_${GIT_HASH} -X main.date=${BUILD_DATE}" -o $(BUILD_DIR)/$(APP_NAME)-linux-arm64
 
 # Build Windows binary
-windows: ui
+windows: ui tray
 	@echo "Building Windows binary..."
 	GOOS=windows GOARCH=amd64 go build -ldflags="-X main.commit=${GIT_HASH} -X main.version=local_${GIT_HASH} -X main.date=${BUILD_DATE}" -o $(BUILD_DIR)/$(APP_NAME)-windows-amd64.exe
 
@@ -103,6 +112,11 @@ wol-proxy: $(BUILD_DIR)
 test-ui:
 	cd ui-svelte && npm ci && npm run check && npm test
 
+# macOS menu-bar helper unit tests. The live backend test is skipped unless
+# LLAMA_MENU_LIVE=1 is set, since it swaps models on a running llama-swap.
+test-mac-menu:
+	cd macos-menu && swift test
+
 # Phony targets
-.PHONY: all clean ui mac mac-menu windows simple-responder simple-responder-windows test test-all test-dev test-ui wol-proxy
+.PHONY: all clean ui mac mac-menu tray windows simple-responder simple-responder-windows test test-all test-dev test-ui test-mac-menu wol-proxy
 .PHONE: linux linux-arm64 linux-amd64

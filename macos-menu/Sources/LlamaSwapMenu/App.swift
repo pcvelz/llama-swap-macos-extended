@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import LlamaSwapMenuCore
 
 /// Forces the process to run as an "accessory" (menu-bar agent) application.
 ///
@@ -22,11 +23,8 @@ struct LlamaSwapMenuApp: App {
     @StateObject private var client = BackendClient()
 
     private var activeDisplayName: String {
-        guard let active = client.menuState.activeModelID,
-              let model = client.menuState.models.first(where: { $0.id == active }) else {
-            return client.menuState.activeModelID ?? ""
-        }
-        return model.aliases?.first ?? model.name
+        guard let active = client.menuState.activeModelID else { return "" }
+        return client.menuState.models.first { $0.id == active }?.displayLabel ?? active
     }
 
     var body: some Scene {
@@ -35,8 +33,7 @@ struct LlamaSwapMenuApp: App {
         } label: {
             Image(nsImage: IconRenderer.image(
                 modelName: activeDisplayName,
-                util: client.menuState.gpuUtil,
-                mem: client.menuState.gpuMem
+                values: client.menuState.barValues
             ))
         }
     }

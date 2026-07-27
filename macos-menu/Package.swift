@@ -9,9 +9,20 @@ let package = Package(
     ],
     dependencies: [],
     targets: [
+        // Core library so the tests drive the same code the menu runs.
+        .target(
+            name: "LlamaSwapMenuCore",
+            path: "Sources/LlamaSwapMenuCore"
+        ),
         .executableTarget(
             name: "LlamaSwapMenu",
+            dependencies: ["LlamaSwapMenuCore"],
             path: "Sources/LlamaSwapMenu"
+        ),
+        .testTarget(
+            name: "LlamaSwapMenuTests",
+            dependencies: ["LlamaSwapMenuCore"],
+            path: "Tests/LlamaSwapMenuTests"
         )
     ]
 )
