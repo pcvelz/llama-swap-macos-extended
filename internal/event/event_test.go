@@ -229,11 +229,17 @@ func TestConcurrentHandlerRegistration(t *testing.T) {
 		atomic.StoreInt64(&handlerCount, 0)
 		Publish(d, MyEvent1{})
 
-		// Small delay to ensure all handlers have executed
-		time.Sleep(10 * time.Millisecond)
-
-		assert.Equal(t, int64(numGoroutines), atomic.LoadInt64(&handlerCount),
-			"Not all handlers were registered due to race condition")
+		// Handlers run asynchronously on their consumer goroutines, so this
+		// must WAIT for the count rather than sleep a fixed slice and hope.
+		// A flat 10ms passed on an idle machine and failed under load (26/100
+		// observed on a dev box busy with an unrelated GPU job), which reads as
+		// a registration bug when it is really the deadline being too tight.
+		// Poll instead: same assertion, tolerant of a loaded scheduler.
+		assert.Eventually(t, func() bool {
+			return atomic.LoadInt64(&handlerCount) == int64(numGoroutines)
+		}, 5*time.Second, 5*time.Millisecond,
+			"Not all handlers were registered due to race condition (got %d of %d)",
+			atomic.LoadInt64(&handlerCount), numGoroutines)
 	})
 
 	// Test concurrent subscriptions to different event types
@@ -264,10 +270,19 @@ func TestConcurrentHandlerRegistration(t *testing.T) {
 			Publish(d, MyEvent3{ID: int(eventType)})
 		}
 
-		// Small delay to ensure all handlers have executed
-		time.Sleep(10 * time.Millisecond)
+		// Same reasoning as SameEventType above: wait for delivery instead of
+		// sleeping a fixed slice, so a loaded scheduler cannot masquerade as a
+		// dropped event.
+		assert.Eventually(t, func() bool {
+			for _, counter := range receivedEvents {
+				if atomic.LoadInt64(counter) != 1 {
+					return false
+				}
+			}
+			return true
+		}, 5*time.Second, 5*time.Millisecond, "not every event type received its event")
 
-		// Verify all event types received their events
+		// Re-assert per type so a failure names the offending event type.
 		for eventType, counter := range receivedEvents {
 			assert.Equal(t, int64(1), atomic.LoadInt64(counter),
 				"Event type %d did not receive its event", eventType)

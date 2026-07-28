@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+#
+# pre-commit — run the CI-equivalent preflight before a commit is created.
+#
+# Installed by scripts/install-githooks.sh, which sets core.hooksPath to this
+# directory. Living in a TRACKED directory (rather than .git/hooks) means the
+# hook is version-controlled and reviewable; .git/hooks is not.
+#
+# WHY: on 2026-07-27 both CI lanes went red on a commit that had been verified
+# locally — because local ran `go test` and CI runs `go test -race`. Local green
+# meant nothing. scripts/preflight.sh runs the same commands CI does; this hook
+# makes that automatic instead of remembered.
+#
+# The preflight scopes itself to the changed paths, so a docs-only commit costs
+# nothing and a Go change runs the full race suite (minutes).
+#
+# Escape hatches exist (LLAMA_SWAP_PREFLIGHT=skip|quick, git commit --no-verify)
+# because a gate that cannot be bypassed under time pressure gets uninstalled
+# instead. They are for a MAINTAINER who knows why a specific commit is safe.
+# Automation must not reach for them: a red preflight is an instruction to fix
+# the failure, not a hurdle to route around.
+set -uo pipefail
+
+REPO="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
+PREFLIGHT="$REPO/scripts/preflight.sh"
+
+case "${LLAMA_SWAP_PREFLIGHT:-}" in
+    skip)
+        echo "pre-commit: preflight SKIPPED (LLAMA_SWAP_PREFLIGHT=skip) — CI has not been predicted."
+        exit 0
+        ;;
+esac
+
+if [[ ! -x "$PREFLIGHT" ]]; then
+    # Fail open: a missing preflight must never make the repo uncommittable.
+    echo "pre-commit: $PREFLIGHT missing or not executable — skipping." >&2
+    exit 0
+fi
+
+args=()
+[[ "${LLAMA_SWAP_PREFLIGHT:-}" == "quick" ]] && args+=(--quick)
+
+if "$PREFLIGHT" "${args[@]+"${args[@]}"}"; then
+    exit 0
+fi
+
+cat >&2 <<'MSG'
+
+pre-commit: preflight FAILED — commit aborted.
+
+These are the same commands GitHub Actions runs, so this would go red on push.
+Fix the failures above.
+
+Skipping is a MAINTAINER decision (LLAMA_SWAP_PREFLIGHT=quick|skip). An agent or
+script must never take it — the gate asking for work means do the work.
+MSG
+exit 1

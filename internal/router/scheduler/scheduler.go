@@ -105,6 +105,13 @@ type HandlerReq struct {
 	Ctx        context.Context
 	Respond    chan HandlerResp
 	PositionCh chan int
+	// EstimatedTokens is a conservative estimate of this request's context
+	// size, used only by KV-aware admission (config.FifoConfig.KVPoolTokens).
+	// baseRouter.ServeHTTP populates it from the buffered request body; see
+	// shared.EstimateTokens for the estimation rule. 0 for requests with no
+	// body (e.g. GET) or when the target model has no KV budget configured —
+	// either way it is inert unless KVPoolTokens > 0 for the model.
+	EstimatedTokens int
 }
 
 // HandlerResp is the routing decision returned to a HandlerReq's caller: either
@@ -120,7 +127,17 @@ type SwapDone struct {
 	Err     error
 }
 
-// ServeDoneEvent is reported when a tracked ServeHTTP handler returns.
+// ServeDoneEvent is reported when a tracked ServeHTTP handler returns. This
+// fires on EVERY exit path from p.ServeHTTP — success, client abort, or
+// upstream error — because trackedServe's release is a deferred send, not a
+// success-only callback. That makes OnServeDone the single release point for
+// KV-aware admission's EstimatedTokens accounting too: whatever tokens were
+// reserved at grant time are always released here, regardless of how the
+// request ended.
 type ServeDoneEvent struct {
 	ModelID string
+	// EstimatedTokens is the same estimate the originating HandlerReq carried
+	// at grant time, echoed back so the scheduler can release exactly what it
+	// reserved. 0 when KV admission wasn't in play for this request.
+	EstimatedTokens int
 }

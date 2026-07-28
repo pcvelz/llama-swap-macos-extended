@@ -37,6 +37,12 @@ type FIFO struct {
 	inFlight map[string]int
 	queued   []HandlerReq
 
+	// kvInFlight tracks, per model, the sum of EstimatedTokens across every
+	// currently-granted request — the KV-aware admission counterpart to
+	// inFlight (which only counts requests, not their size). Only consulted
+	// for models with a positive cfg.KVPoolTokens entry; see kvAdmit.
+	kvInFlight map[string]int
+
 	// grace maps a model ID to its swap-grace duration: a request for a
 	// different model is held in the queue until this model has been idle
 	// (in-flight 0) for at least this long before it may be evicted. Absent or
@@ -66,17 +72,18 @@ type FIFO struct {
 // is captured in a closure.
 func NewFIFO(name string, logger *logmon.Monitor, planner Swapper, cfg config.FifoConfig, grace map[string]time.Duration, eff Effects) *FIFO {
 	return &FIFO{
-		name:      name,
-		logger:    logger,
-		planner:   planner,
-		cfg:       cfg,
-		effects:   eff,
-		active:    make(map[string]*activeSwap),
-		inFlight:  make(map[string]int),
-		grace:     grace,
-		idleSince: make(map[string]time.Time),
-		graceWait: make(map[string]time.Time),
-		now:       time.Now,
+		name:       name,
+		logger:     logger,
+		planner:    planner,
+		cfg:        cfg,
+		effects:    eff,
+		active:     make(map[string]*activeSwap),
+		inFlight:   make(map[string]int),
+		kvInFlight: make(map[string]int),
+		grace:      grace,
+		idleSince:  make(map[string]time.Time),
+		graceWait:  make(map[string]time.Time),
+		now:        time.Now,
 	}
 }
 
@@ -120,6 +127,11 @@ func (s *FIFO) OnRequest(req HandlerReq) {
 
 	// (3) Fast path: ready, nothing to evict, and nobody is evicting us.
 	if state == process.StateReady && len(evict) == 0 && !collidesWith(req.Model, evict, s.active) {
+		if !s.kvAdmit(req.Model, req.EstimatedTokens) {
+			s.logKVParked(req.Model, req.EstimatedTokens)
+			s.enqueue(req)
+			return
+		}
 		s.logger.Debugf("%s: fast-path serving model %s (already ready)", s.name, req.Model)
 		s.grantHandler(req, req.Model)
 		return
@@ -239,16 +251,25 @@ func (s *FIFO) OnSwapDone(ev SwapDone) {
 	s.drainQueue()
 }
 
-// OnServeDone decrements the per-model in-flight count and, when that drops to
-// zero, retries the queue: requests whose swap was deferred because they would
-// have evicted this (now-idle) process can now proceed.
+// OnServeDone decrements the per-model in-flight count and releases this
+// request's KV-admission reservation (if any). It retries the queue whenever
+// either freed something a parked request might now fit in: the in-flight
+// count dropping to zero (as before — a swap may now be possible), OR a KV
+// reservation being released (a parallel-slot request may now fit the pool
+// even while a sibling request for the same model is still in flight).
 func (s *FIFO) OnServeDone(ev ServeDoneEvent) {
 	s.inFlight[ev.ModelID]--
-	if s.inFlight[ev.ModelID] <= 0 {
+	wentIdle := s.inFlight[ev.ModelID] <= 0
+	if wentIdle {
 		delete(s.inFlight, ev.ModelID)
 		// Model just went idle — (re)start its swap-grace clock so a competing
 		// request waits the full grace from this moment before evicting it.
 		s.idleSince[ev.ModelID] = s.now()
+	}
+
+	kvReleased := s.releaseKV(ev.ModelID, ev.EstimatedTokens)
+
+	if wentIdle || kvReleased {
 		s.drainQueue()
 	}
 }
@@ -370,10 +391,64 @@ func (s *FIFO) OnShutdown(err error) {
 // grantHandler hands the caller a tracked handler for modelID and, only if the
 // caller was still there to receive it, bumps the in-flight count. Incrementing
 // when the grant failed would strand the counter and block future evictions.
+// The same "only on true return" rule applies to the KV reservation: a caller
+// that already walked away will never produce a matching OnServeDone, so
+// reserving its estimate would strand that budget forever too.
 func (s *FIFO) grantHandler(req HandlerReq, modelID string) {
 	if s.effects.GrantServe(req, modelID) {
 		s.inFlight[modelID]++
+		if req.EstimatedTokens > 0 {
+			s.kvInFlight[modelID] += req.EstimatedTokens
+		}
 	}
+}
+
+// kvAdmit reports whether a request estimated at `estimate` tokens for model
+// may be forwarded immediately under KV-aware admission
+// (config.FifoConfig.KVPoolTokens). Fail-open by design:
+//   - no (or non-positive) budget configured for the model -> always admit
+//     (today's behavior, admission control off).
+//   - nothing currently in flight for the model -> always admit, even if
+//     estimate alone exceeds the whole pool. A request must never be
+//     rejected outright for being "too big" — only ever parked behind
+//     others; when it's the only one, there's nothing for it to collide
+//     with, so let it through and let llama.cpp be the final arbiter.
+//   - otherwise -> admit only if the combined estimate still fits the pool.
+func (s *FIFO) kvAdmit(model string, estimate int) bool {
+	pool := s.cfg.KVPoolTokens[model]
+	if pool <= 0 {
+		return true
+	}
+	inflight := s.kvInFlight[model]
+	if inflight <= 0 {
+		return true
+	}
+	return inflight+estimate <= pool
+}
+
+// releaseKV returns estimate tokens to model's KV budget and reports whether
+// it actually released anything (used by OnServeDone to decide whether a
+// parked request might now fit). A no-op for requests KV admission was never
+// tracking (estimate <= 0, or nothing currently reserved for the model — e.g.
+// admission is disabled for it).
+func (s *FIFO) releaseKV(model string, estimate int) bool {
+	if estimate <= 0 || s.kvInFlight[model] <= 0 {
+		return false
+	}
+	s.kvInFlight[model] -= estimate
+	if s.kvInFlight[model] < 0 {
+		s.kvInFlight[model] = 0
+	}
+	s.logger.Infof("kv-admission: released %s est=%d inflight=%d pool=%d",
+		model, estimate, s.kvInFlight[model], s.cfg.KVPoolTokens[model])
+	return true
+}
+
+// logKVParked logs the one required observability line for a request parked
+// by KV-aware admission.
+func (s *FIFO) logKVParked(model string, estimate int) {
+	s.logger.Infof("kv-admission: parked %s est=%d inflight=%d pool=%d",
+		model, estimate, s.kvInFlight[model], s.cfg.KVPoolTokens[model])
 }
 
 // startSwap records the swap as active and launches it via Effects. running is
@@ -435,6 +510,11 @@ func (s *FIFO) drainQueue() {
 		running := s.runningSet(req.Model)
 		evict := s.planner.EvictionFor(req.Model, running)
 		if state == process.StateReady && len(evict) == 0 && !collidesWith(req.Model, evict, s.active) {
+			if !s.kvAdmit(req.Model, req.EstimatedTokens) {
+				s.logKVParked(req.Model, req.EstimatedTokens)
+				remaining = append(remaining, req)
+				continue
+			}
 			s.logger.Debugf("%s: queued request for model %s now served fast-path", s.name, req.Model)
 			s.grantHandler(req, req.Model)
 			continue

@@ -680,3 +680,150 @@ func TestFIFO_OnCancel_NotPresent(t *testing.T) {
 		t.Errorf("queue should be empty, len=%d", len(s.queued))
 	}
 }
+
+// --- KV-aware admission (kvPoolTokens) ---
+//
+// These cover the fix for a shared-unified-KV model (e.g. cq35 with
+// --parallel 2 --kv-unified) being oversubscribed by two concurrent
+// large-context requests. The scheduler already fast-path-serves a ready
+// model with nothing to evict; kvPoolTokens adds one more gate to that fast
+// path: admit only if the model's estimated in-flight tokens plus this
+// request's estimate fit the configured budget, else park it in the normal
+// queue (same enqueue() used by every other deferral in this file).
+
+// reqTokens builds a HandlerReq carrying an estimated token count, the way
+// baseRouter.ServeHTTP populates it from the buffered request body.
+func reqTokens(model string, tokens int) HandlerReq {
+	return HandlerReq{Model: model, EstimatedTokens: tokens}
+}
+
+func newFIFOKV(eff Effects, pool map[string]int) *FIFO {
+	cfg := config.FifoConfig{KVPoolTokens: pool}
+	return NewFIFO("test", logmon.NewWriter(io.Discard), &stubPlanner{}, cfg, nil, eff)
+}
+
+// TestFIFO_KVAdmission_SecondOversizedRequestParksUntilFirstCompletes covers
+// case (a): a second request that would push the pool over budget parks
+// instead of forwarding, then forwards once the first request's estimate is
+// released via OnServeDone.
+func TestFIFO_KVAdmission_SecondOversizedRequestParksUntilFirstCompletes(t *testing.T) {
+	eff := newFakeEffects()
+	eff.states["cq35"] = process.StateReady
+	s := newFIFOKV(eff, map[string]int{"cq35": 100})
+
+	s.OnRequest(reqTokens("cq35", 60)) // nothing in flight -> admitted
+	if got := eff.served("cq35"); got != 1 {
+		t.Fatalf("first request should be admitted immediately, served=%d", got)
+	}
+
+	s.OnRequest(reqTokens("cq35", 60)) // 60+60=120 > 100 -> must park
+	if got := eff.served("cq35"); got != 1 {
+		t.Fatalf("second oversized request must park, served=%d want 1", got)
+	}
+	if len(s.queued) != 1 {
+		t.Fatalf("parked request should sit in the normal queue, len=%d", len(s.queued))
+	}
+
+	s.OnServeDone(ServeDoneEvent{ModelID: "cq35", EstimatedTokens: 60})
+	if got := eff.served("cq35"); got != 2 {
+		t.Fatalf("parked request should forward once budget frees, served=%d want 2", got)
+	}
+	if len(s.queued) != 0 {
+		t.Fatalf("queue should have drained, len=%d", len(s.queued))
+	}
+}
+
+// TestFIFO_KVAdmission_BothSmallRequestsAdmittedConcurrently covers case (b):
+// two requests that together fit the pool are both admitted without parking.
+func TestFIFO_KVAdmission_BothSmallRequestsAdmittedConcurrently(t *testing.T) {
+	eff := newFakeEffects()
+	eff.states["cq35"] = process.StateReady
+	s := newFIFOKV(eff, map[string]int{"cq35": 100})
+
+	s.OnRequest(reqTokens("cq35", 30))
+	s.OnRequest(reqTokens("cq35", 30))
+
+	if got := eff.served("cq35"); got != 2 {
+		t.Fatalf("both small requests should be admitted concurrently, served=%d want 2", got)
+	}
+	if len(s.queued) != 0 {
+		t.Fatalf("nothing should have parked, len=%d", len(s.queued))
+	}
+}
+
+// TestFIFO_KVAdmission_DisabledForwardsRegardlessOfSize covers case (c): with
+// no kvPoolTokens configured for the model, admission is unconditional —
+// exactly today's behavior — no matter how large the estimates are.
+func TestFIFO_KVAdmission_DisabledForwardsRegardlessOfSize(t *testing.T) {
+	eff := newFakeEffects()
+	eff.states["cq35"] = process.StateReady
+	s := newFIFO(&stubPlanner{}, eff) // config.FifoConfig{} -> no KVPoolTokens entry
+
+	s.OnRequest(reqTokens("cq35", 1_000_000))
+	s.OnRequest(reqTokens("cq35", 1_000_000))
+
+	if got := eff.served("cq35"); got != 2 {
+		t.Fatalf("KV admission disabled must forward both immediately, served=%d want 2", got)
+	}
+}
+
+// TestFIFO_KVAdmission_ReleaseOnAbortFreesBudget covers case (d): the FIFO
+// scheduler cannot distinguish a normal completion from a client abort or an
+// upstream error — trackedServe's deferred send fires on every exit path from
+// p.ServeHTTP, so OnServeDone is the single release point for all of them.
+// This asserts that a release from ANY termination reason (represented here
+// the same way an abort/error would arrive: OnServeDone with the granted
+// request's estimate) unblocks a parked waiter.
+func TestFIFO_KVAdmission_ReleaseOnAbortFreesBudget(t *testing.T) {
+	eff := newFakeEffects()
+	eff.states["cq35"] = process.StateReady
+	s := newFIFOKV(eff, map[string]int{"cq35": 100})
+
+	s.OnRequest(reqTokens("cq35", 90)) // admitted, inflight est=90
+	s.OnRequest(reqTokens("cq35", 90)) // 90+90>100 -> parked
+
+	// First request's client aborts (or the upstream errors) mid-stream;
+	// p.ServeHTTP still returns, so trackedServe still reports ServeDoneEvent.
+	s.OnServeDone(ServeDoneEvent{ModelID: "cq35", EstimatedTokens: 90})
+
+	if got := eff.served("cq35"); got != 2 {
+		t.Fatalf("abort must release budget and admit the parked request, served=%d want 2", got)
+	}
+}
+
+// TestFIFO_KVAdmission_GrantServeFalseDoesNotReserveBudget asserts that a
+// caller who already walked away (GrantServe returns false, mirroring
+// TestFIFO_GrantServeFalseDoesNotLeakInFlight) never reserves KV budget in the
+// first place — there is no matching OnServeDone coming for it, so reserving
+// would strand the budget forever.
+func TestFIFO_KVAdmission_GrantServeFalseDoesNotReserveBudget(t *testing.T) {
+	eff := newFakeEffects()
+	eff.states["cq35"] = process.StateReady
+	eff.serveResult["cq35"] = false
+	s := newFIFOKV(eff, map[string]int{"cq35": 100})
+
+	s.OnRequest(reqTokens("cq35", 90)) // walks away before receiving the grant
+
+	eff.serveResult["cq35"] = true
+	s.OnRequest(reqTokens("cq35", 90)) // must not see stale reserved budget
+	if got := eff.served("cq35"); got != 1 {
+		t.Fatalf("served=%d want 1 (only the second, actually-received request)", got)
+	}
+}
+
+// TestFIFO_KVAdmission_OversizedSingleRequestAdmittedAlone covers case (e): a
+// single request whose own estimate exceeds the whole pool is admitted alone
+// rather than rejected outright — there is nothing in flight to collide with.
+func TestFIFO_KVAdmission_OversizedSingleRequestAdmittedAlone(t *testing.T) {
+	eff := newFakeEffects()
+	eff.states["cq35"] = process.StateReady
+	s := newFIFOKV(eff, map[string]int{"cq35": 100})
+
+	s.OnRequest(reqTokens("cq35", 500)) // bigger than the whole pool, alone
+	if got := eff.served("cq35"); got != 1 {
+		t.Fatalf("oversized lone request must be admitted, served=%d want 1", got)
+	}
+	if len(s.queued) != 0 {
+		t.Fatalf("nothing should have parked, len=%d", len(s.queued))
+	}
+}
