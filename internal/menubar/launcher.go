@@ -11,7 +11,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/mostlygeek/llama-swap/internal/logmon"
@@ -143,7 +142,7 @@ func reapOrphanedSidecars(log *logmon.Monitor) {
 func waitForExit(pid int, timeout time.Duration) bool {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		if err := syscall.Kill(pid, 0); err != nil {
+		if !pidAlive(pid) {
 			return true
 		}
 		time.Sleep(50 * time.Millisecond)
