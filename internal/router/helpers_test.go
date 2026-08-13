@@ -50,6 +50,14 @@ type fakeProcess struct {
 	// serveStarted is closed on the first ServeHTTP entry, letting tests
 	// wait deterministically for the handler to begin executing.
 	serveStarted chan struct{}
+	// serveFunc, when non-nil, is consulted first on every ServeHTTP call. It
+	// receives the 1-indexed call number so tests can script different
+	// per-attempt behavior (e.g. block-then-abort on one attempt, succeed
+	// immediately on another) against ONE shared fakeProcess, mirroring how a
+	// real child model process serves every attempt of a transparent replay
+	// (see base.go ServeHTTP). Returning true means "handled it myself";
+	// false falls through to the default block-then-200 behavior below.
+	serveFunc func(w http.ResponseWriter, r *http.Request, callNum int) bool
 	// stopBlock, when non-nil, makes Stop receive from it (after signalling
 	// stopStarted) before completing. Tests use this to prove that several
 	// Stop calls can be in flight simultaneously.
@@ -177,8 +185,8 @@ func (f *fakeProcess) Logger() *logmon.Monitor { return logmon.NewWriter(io.Disc
 
 func (f *fakeProcess) LastUse() time.Time { return time.Time{} }
 
-func (f *fakeProcess) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
-	f.serveCalls.Add(1)
+func (f *fakeProcess) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	callNum := int(f.serveCalls.Add(1))
 	f.inFlightServe.Add(1)
 	defer f.inFlightServe.Add(-1)
 	f.mu.Lock()
@@ -188,8 +196,23 @@ func (f *fakeProcess) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
 		close(f.serveStarted)
 	}
 	f.mu.Unlock()
+
+	if f.serveFunc != nil && f.serveFunc(w, r, callNum) {
+		return
+	}
+
 	if f.serveBlock != nil {
-		<-f.serveBlock
+		select {
+		case <-f.serveBlock:
+		case <-r.Context().Done():
+			// Mirror a real reverse proxy: context cancellation (server-side
+			// preemption) aborts the upstream call and the proxy commits its
+			// OWN failure status — the layer under test
+			// (preemptResponseWriter) must intercept THIS write, not
+			// something the fake invents out of nothing.
+			w.WriteHeader(http.StatusBadGateway)
+			return
+		}
 	}
 	w.WriteHeader(http.StatusOK)
 	fmt.Fprintf(w, "ok:%s", f.id)

@@ -206,7 +206,7 @@ groups:
 			},
 		},
 		SendLoadingState: false,
-		MenuBar:          true,
+		MenuBar:          DefaultMenuBarConfig(),
 		Models: map[string]ModelConfig{
 			"model1": {
 				Cmd:                "path/to/cmd --arg1 one",

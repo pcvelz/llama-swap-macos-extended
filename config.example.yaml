@@ -67,6 +67,15 @@ performance:
   # - minimum duration 5s
   every: 15s
 
+# menu_bar: menu-bar (macOS) / system-tray (Windows, Linux) helper
+# - optional, default: enabled with bars [gpu, vram]
+# - shows the currently loaded model and two live load bars next to the clock
+# - bool form: `menu_bar: false` disables the helper
+# - bars: which metrics to render, top to bottom (1 or 2 of: gpu, vram, cpu, ram)
+menu_bar:
+  enabled: true
+  bars: [gpu, vram]
+
 # startPort: sets the starting port number for the automatic ${PORT} macro.
 # - optional, default: 5800
 # - the ${PORT} macro can be used in model.cmd and model.proxy settings
@@ -133,6 +142,16 @@ apiKeys:
   # use environment variable macros to keep secrets out of the config
   - "${env.API_KEY_1}"
   - "${env.API_KEY_2}"
+
+# residentAliases: model-id patterns (shell globs) resolved at request time to
+# whichever model is CURRENTLY resident (state ready), instead of a fixed model block
+# - optional, default: []
+# - unlike a static alias this never triggers a load or swap: with nothing
+#   resident the request 404s exactly as before
+# - patterns may not collide with a real model id or a static alias
+# residentAliases:
+#   - "claude-haiku-*"
+#   - "default"
 
 # models: a dictionary of model configurations
 # - required
@@ -559,6 +578,23 @@ routing:
           B: 5
           C: 5
           D: 1
+
+        # kvPoolTokens: a dictionary of model ID -> KV-aware admission budget
+        # (estimated tokens; see EstimateTokens - buffered request body
+        # bytes / 4)
+        # - optional, default: empty dictionary (admission control disabled)
+        # - only meaningful for a model served with a single shared/unified
+        #   KV pool across multiple parallel slots, e.g. llama.cpp
+        #   --parallel 2 --kv-unified --ctx-size 262144: two concurrent
+        #   large-context requests can together exceed the pool and abort
+        #   BOTH
+        # - a request that would push the model's estimated in-flight
+        #   tokens over this budget is parked in the queue instead of
+        #   forwarded, until enough of the pool frees up
+        # - a single request bigger than the whole budget is still admitted
+        #   ALONE (never rejected outright) when nothing else is in flight
+        kvPoolTokens:
+          A: 262144
 
 # peers: a dictionary of remote peers and models they provide
 # - optional, default empty dictionary

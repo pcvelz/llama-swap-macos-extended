@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/url"
 	"os"
+	"path"
 	"regexp"
 	"runtime"
 	"sort"
@@ -165,14 +166,50 @@ type Config struct {
 	// present aliases to /v1/models OpenAI API listing
 	IncludeAliasesInList bool `yaml:"includeAliasesInList"`
 
-	// enable macOS menu-bar helper
-	MenuBar bool `yaml:"menu_bar"`
+	// ResidentAliases lists model-id patterns (shell globs, e.g.
+	// "claude-haiku-*", or literals like "default") that resolve at request
+	// time to whichever local model is CURRENTLY resident (state ready),
+	// instead of to a fixed model block. Unlike a static alias this never
+	// triggers a load or swap: with nothing resident the request 404s exactly
+	// as before. Patterns may not collide with a real model id or static
+	// alias — a shadowed resident alias would be dead config.
+	ResidentAliases []string `yaml:"residentAliases"`
+
+	// menu-bar (macOS) / system-tray (Windows, Linux) helper; accepts a bool
+	// (legacy) or a mapping with `enabled` and `bars`, see MenuBarConfig.
+	MenuBar MenuBarConfig `yaml:"menu_bar"`
 
 	// support API keys, see issue #433, #50, #251
 	RequiredAPIKeys []string `yaml:"apiKeys"`
 
 	// support remote peers, see issue #433, #296
 	Peers PeerDictionaryConfig `yaml:"peers"`
+
+	// Tiers declares extra HTTP entry points into the one shared FIFO queue,
+	// each pre-tagging every request that arrives through it with a rank
+	// before it joins the queue. The main `-listen` port is always the
+	// implicit default tier (rank 0) and is never declared here - an absent
+	// or empty Tiers map is byte-identical, single-listener behavior. See
+	// docs/intent/llama-swap-tiers.md (llama-cm) for the full design.
+	Tiers map[string]TierConfig `yaml:"tiers"`
+}
+
+// TierConfig is one extra entry point declared under the top-level `tiers:`
+// block. See Config.Tiers.
+type TierConfig struct {
+	// Listen is this tier's own listen address (required, e.g. "127.0.0.1:8002").
+	Listen string `yaml:"listen"`
+	// Rank orders the shared queue: higher ranks are serviced first, and a
+	// queued request is never granted while a strictly higher-rank request is
+	// still queued. The implicit default tier is rank 0; any nonzero rank is
+	// allowed here, including negative (background) ranks.
+	Rank int `yaml:"rank"`
+	// Preempts, when true, lets an arrival on this tier boot ANY running
+	// lower-rank request, including non-preemptible ones.
+	Preempts bool `yaml:"preempts"`
+	// Preemptible, when true, lets a running request on this tier be booted
+	// by any higher-rank arrival, even one without Preempts set.
+	Preemptible bool `yaml:"preemptible"`
 }
 
 // RoutingConfig is the canonical, normalized routing/scheduling configuration.
@@ -192,6 +229,17 @@ type SchedulerSettings struct {
 
 type FifoConfig struct {
 	Priority map[string]int `yaml:"priority"` // model ID -> priority, default 0
+	// KVPoolTokens is a per-model KV-aware admission budget, in ESTIMATED
+	// tokens (see shared.EstimateTokens — buffered request body bytes / 4).
+	// It exists for models served with a single shared/unified KV pool across
+	// multiple parallel slots (e.g. llama.cpp --parallel 2 --kv-unified): two
+	// concurrent large-context requests can together exceed the pool and abort
+	// BOTH. When a model's budget here is > 0, the FIFO scheduler never
+	// forwards a request that would push the model's in-flight estimated
+	// tokens over this ceiling — it parks the request in the normal queue
+	// until enough of the pool frees up. 0 or absent (the default) disables
+	// admission control for that model entirely (today's behavior, fail-open).
+	KVPoolTokens map[string]int `yaml:"kvPoolTokens"`
 }
 
 type RouterConfig struct {
@@ -212,6 +260,18 @@ func (c *Config) RealModelName(search string) (string, bool) {
 	} else {
 		return "", false
 	}
+}
+
+// MatchesResidentAlias reports whether the requested model id matches one of
+// the configured resident-alias patterns. Pattern errors are impossible here:
+// patterns are validated at config load.
+func (c *Config) MatchesResidentAlias(requested string) bool {
+	for _, pattern := range c.ResidentAliases {
+		if ok, _ := path.Match(pattern, requested); ok {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *Config) FindConfig(modelName string) (ModelConfig, string, bool) {
@@ -255,8 +315,8 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 		MetricsMaxInMemory: 1000,
 		CaptureBuffer:      5,
 		GlobalTTL:          0,
-		// macOS menu-bar helper is on by default in this fork; set `menu_bar: false` to opt out.
-		MenuBar: true,
+		// menu-bar/tray helper is on by default in this fork; set `menu_bar: false` to opt out.
+		MenuBar: DefaultMenuBarConfig(),
 	}
 	if err = yaml.Unmarshal([]byte(yamlStr), &config); err != nil {
 		return Config{}, err
@@ -286,6 +346,30 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 		return Config{}, fmt.Errorf("swapGraceSeconds must be >= 0")
 	}
 
+	if err = config.MenuBar.Validate(); err != nil {
+		return Config{}, fmt.Errorf("menu_bar: %w", err)
+	}
+
+	if len(config.Tiers) > 0 {
+		tierNames := make([]string, 0, len(config.Tiers))
+		for name := range config.Tiers {
+			tierNames = append(tierNames, name)
+		}
+		sort.Strings(tierNames)
+
+		seenListen := make(map[string]string, len(config.Tiers))
+		for _, name := range tierNames {
+			tc := config.Tiers[name]
+			if strings.TrimSpace(tc.Listen) == "" {
+				return Config{}, fmt.Errorf("tiers.%s: listen is required", name)
+			}
+			if other, dup := seenListen[tc.Listen]; dup {
+				return Config{}, fmt.Errorf("tiers.%s: listen address %q already used by tier %q", name, tc.Listen, other)
+			}
+			seenListen[tc.Listen] = name
+		}
+	}
+
 	switch config.LogToStdout {
 	case LogToStdoutProxy, LogToStdoutUpstream, LogToStdoutBoth, LogToStdoutNone:
 	default:
@@ -300,6 +384,19 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 				return Config{}, fmt.Errorf("duplicate alias %s found in model: %s", alias, modelName)
 			}
 			config.aliases[alias] = modelName
+		}
+	}
+
+	// Validate resident-alias patterns: they must compile, and a literal
+	// pattern (no glob metacharacters) must not be shadowed by a real model
+	// id or static alias — the flat map wins at request time, so a shadowed
+	// resident alias could never fire.
+	for _, pattern := range config.ResidentAliases {
+		if _, err := path.Match(pattern, "probe"); err != nil {
+			return Config{}, fmt.Errorf("residentAliases: bad pattern %q: %w", pattern, err)
+		}
+		if _, found := config.RealModelName(pattern); found {
+			return Config{}, fmt.Errorf("residentAliases: pattern %q collides with an existing model id or alias", pattern)
 		}
 	}
 

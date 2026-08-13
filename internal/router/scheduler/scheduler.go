@@ -12,6 +12,7 @@ package scheduler
 import (
 	"context"
 	"net/http"
+	"sync/atomic"
 	"time"
 
 	"github.com/mostlygeek/llama-swap/internal/logmon"
@@ -112,6 +113,39 @@ type HandlerReq struct {
 	// body (e.g. GET) or when the target model has no KV budget configured —
 	// either way it is inert unless KVPoolTokens > 0 for the model.
 	EstimatedTokens int
+
+	// Tier is the entry-point tier this request arrived through (see
+	// shared.Tier). shared.DefaultTier for every request on the main
+	// listener / when no `tiers:` block is configured — see
+	// docs/intent/llama-swap-tiers.md (llama-cm) for the full design.
+	Tier shared.Tier
+
+	// Preempted, when non-nil, is set to true by Preempt just before it
+	// cancels this request's serving context. Only populated on requests
+	// baseRouter has granted (nil while merely queued); trackedServe reads it
+	// to tell a genuine preemption apart from an ordinary client disconnect or
+	// shutdown when deciding whether to inject the 503 + headers response.
+	Preempted *atomic.Bool
+
+	// Preempt, when non-nil, server-side-cancels this GRANTED request so its
+	// caller sees a 503 + `X-LlamaSwap-Preempted: 1` + `Retry-After` (best
+	// effort — see trackedServe) and can retry, re-entering the queue through
+	// its own tier port. Only the FIFO scheduler's preemption branch in
+	// OnRequest/drainQueue calls this, and only on requests it is currently
+	// tracking as granted. nil while merely queued (there is nothing running
+	// yet to preempt).
+	Preempt func()
+
+	// ReplayWanted, when non-nil, marks this attempt eligible for a
+	// transparent server-side replay if it is preempted before producing any
+	// response body byte (docs/intent/llama-swap-tiers.md "Known v1
+	// limitations" -> v2): internal/router/preempt.go's
+	// preemptResponseWriter sets it to true instead of writing the v1
+	// cancel+503, and internal/router/base.go ServeHTTP re-submits a fresh
+	// attempt when it sees that. nil means "this attempt falls back to the
+	// v1 503 if preempted" — the default, byte-identical to pre-replay
+	// behavior.
+	ReplayWanted *atomic.Bool
 }
 
 // HandlerResp is the routing decision returned to a HandlerReq's caller: either

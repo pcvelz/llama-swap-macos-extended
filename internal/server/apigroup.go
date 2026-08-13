@@ -28,6 +28,10 @@ type apiModel struct {
 	TTL          int            `json:"ttl"`
 	LastUse      time.Time      `json:"lastUse"`
 	Pinned       bool           `json:"pinned,omitempty"`
+	// PinExpiresAt is the active lease deadline for a leased pin, RFC3339.
+	// Omitted for an unpinned model AND for a permanent pin (zero deadline)
+	// so existing clients that only look at Pinned see no behavior change.
+	PinExpiresAt string `json:"pinExpiresAt,omitempty"`
 }
 
 // modelStatus returns every configured model joined with its current process
@@ -50,6 +54,11 @@ func (s *Server) modelStatus() []apiModel {
 		}
 		_, capsMap, _, _ := renderCapabilities(mc.Capabilities)
 		lastUse, _ := s.local.ProcessLastUse(id)
+		pinDeadline, pinned := s.local.PinExpiry(id)
+		pinExpiresAt := ""
+		if pinned && !pinDeadline.IsZero() {
+			pinExpiresAt = pinDeadline.UTC().Format(time.RFC3339)
+		}
 		models = append(models, apiModel{
 			Id:           id,
 			Name:         mc.Name,
@@ -60,7 +69,8 @@ func (s *Server) modelStatus() []apiModel {
 			Capabilities: capsMap,
 			TTL:          mc.UnloadAfter,
 			LastUse:      lastUse,
-			Pinned:       s.local.IsPinned(id),
+			Pinned:       pinned,
+			PinExpiresAt: pinExpiresAt,
 		})
 	}
 
@@ -182,6 +192,13 @@ func (s *Server) handleAPICapture(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleAPIPin marks a model as pinned (not idle-evicted by TTL goroutine).
+// An optional ?ttl=<seconds> query param makes the pin a lease: it expires
+// server-side after ttl seconds instead of staying pinned permanently.
+// ttl absent or "0" is fully backward compatible (permanent pin). Re-pinning
+// an already-leased model refreshes its deadline - this is the path a
+// client re-sends periodically to keep its session's model resident without
+// risking a permanent pin that would starve every other tier of that
+// residency slot if the client forgets to unpin.
 func (s *Server) handleAPIPin(w http.ResponseWriter, r *http.Request) {
 	requested := r.PathValue("model")
 	realName, found := s.cfg.RealModelName(requested)
@@ -193,9 +210,24 @@ func (s *Server) handleAPIPin(w http.ResponseWriter, r *http.Request) {
 		shared.SendResponse(w, r, http.StatusNotFound, "no local server found for requested model")
 		return
 	}
-	s.local.Pin(realName)
+
+	var ttl time.Duration
+	if ttlStr := r.URL.Query().Get("ttl"); ttlStr != "" {
+		ttlSeconds, err := strconv.Atoi(ttlStr)
+		if err != nil || ttlSeconds < 0 {
+			shared.SendResponse(w, r, http.StatusBadRequest, "invalid ttl, must be a non-negative integer number of seconds")
+			return
+		}
+		ttl = time.Duration(ttlSeconds) * time.Second
+	}
+
+	deadline := s.local.PinWithTTL(realName, ttl)
+	resp := map[string]string{"msg": "pinned"}
+	if !deadline.IsZero() {
+		resp["expiresAt"] = deadline.UTC().Format(time.RFC3339)
+	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"msg": "pinned"})
+	json.NewEncoder(w).Encode(resp)
 }
 
 // handleAPIUnpin removes a model's pin, re-enabling idle eviction.
@@ -275,8 +307,15 @@ func (s *Server) handleAPIEvents(w http.ResponseWriter, r *http.Request) {
 			send(messageEnvelope{Type: msgTypeMetrics, Data: string(j)})
 		}
 	}
-	sendInFlight := func(total int) {
-		if j, err := json.Marshal(map[string]int{"total": total}); err == nil {
+	// byTier is included only when it carries more than one tier (see
+	// inflightCounter.tierSnapshot/byTierOrNil) so a config with no `tiers:`
+	// block emits the same {"total":N} payload as before tiers existed.
+	sendInFlight := func(total int, byTier map[string]int) {
+		payload := map[string]any{"total": total}
+		if len(byTier) > 1 {
+			payload["byTier"] = byTier
+		}
+		if j, err := json.Marshal(payload); err == nil {
 			send(messageEnvelope{Type: msgTypeInFlight, Data: string(j)})
 		}
 	}
@@ -286,14 +325,14 @@ func (s *Server) handleAPIEvents(w http.ResponseWriter, r *http.Request) {
 	defer s.proxylog.OnLogData(func(data []byte) { sendLogData("proxy", data) })()
 	defer s.upstreamlog.OnLogData(func(data []byte) { sendLogData("upstream", data) })()
 	defer event.On(func(e ActivityLogEvent) { sendMetrics([]ActivityLogEntry{e.Metrics}) })()
-	defer event.On(func(e shared.InFlightRequestsEvent) { sendInFlight(e.Total) })()
+	defer event.On(func(e shared.InFlightRequestsEvent) { sendInFlight(e.Total, e.ByTier) })()
 
 	// initial payload
 	sendLogData("proxy", s.proxylog.GetHistory())
 	sendLogData("upstream", s.upstreamlog.GetHistory())
 	sendModels()
 	sendMetrics(s.metrics.getMetrics())
-	sendInFlight(int(s.inflight.Current()))
+	sendInFlight(int(s.inflight.Current()), s.inflight.tierSnapshot())
 
 	for {
 		select {

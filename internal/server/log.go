@@ -226,8 +226,13 @@ func CreateRequestLogMiddleware(proxylog *logmon.Monitor) chain.Middleware {
 			rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 			next.ServeHTTP(rec, r)
 
-			proxylog.Infof("Request %s \"%s %s %s\" %d %d \"%s\" %v",
-				ip, method, path, proto, rec.status, rec.size, ua, time.Since(start))
+			// TierFromContext falls back to shared.DefaultTier ("default") for
+			// any request that never passed through tier-wrapping, so this
+			// field is always populated, never blank.
+			tier := shared.TierFromContext(r.Context()).Name
+
+			proxylog.Infof("Request %s \"%s %s %s\" %d %d \"%s\" %v tier=%s",
+				ip, method, path, proto, rec.status, rec.size, ua, time.Since(start), tier)
 		})
 	}
 }

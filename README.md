@@ -27,6 +27,69 @@ menu_bar:
 
 GPU stats come from llama-swap's built-in performance monitor (macOS: native; Linux: LACT, nvidia-smi, rocm-smi or sysfs; Windows: nvidia-smi).
 
+## Tiered entry points
+
+By default every request lands on the same `-listen` port and is served
+first-in-first-out. When several kinds of consumers share one llama-swap
+backend — say, a paid API-backed session that must never sit behind a
+long-running local job's prompt-cache invalidate window — you can give each
+consumer class its own **entry point** into the queue.
+
+**A tier is not a separate queue.** The queue stays one uniform whole (a
+single FIFO scheduler). A tier is an *extra HTTP listener* (its own port)
+that tags every request arriving through it with a rank before it joins the
+shared queue. Hierarchy is pre-determined architecturally by which port a
+consumer is pointed at — the main `-listen` port is always the implicit
+**default tier** (rank 0) and needs no configuration; you only declare the
+extra ports:
+
+```yaml
+tiers:
+  priority:
+    listen: "127.0.0.1:8002"
+    rank: 10
+    preempts: true       # boots ANY running lower-rank request
+  background:
+    listen: "127.0.0.1:8003"
+    rank: -10
+    preemptible: true    # may be booted by ANY higher-rank arrival
+```
+
+Per-tier keys: `listen` (required, own address), `rank` (required int; the
+default tier is rank 0 — negative ranks are fine for a "run only when
+everything else is idle" background tier), `preempts` (bool, default false),
+`preemptible` (bool, default false).
+
+**No `tiers:` block = single-listener behavior, byte-for-byte identical to
+before this feature existed.** There is no rubber-stamp default-tier
+boilerplate to write.
+
+Semantics:
+
+1. **Queue order** — rank DESC, then the existing per-model
+   `routing.scheduler.settings.fifo.priority`, then arrival order.
+2. **Rank barrier** — a queued request is never granted while a strictly
+   higher-rank request is still queued, so a background tier only runs once
+   the priority + default queues are empty.
+3. **Preemption rule** — an arrival A that cannot be granted because of
+   in-flight work boots a running request B iff
+   `rank(B) < rank(A) AND (B.preemptible OR A.preempts)`. Preemption never
+   crosses equal ranks, and never touches a non-preemptible victim unless the
+   arrival itself has `preempts: true`.
+4. **"Booted back into the queue" (v1 mechanics)** — server-side cancel of
+   the victim's proxied upstream request, then a `503` with
+   `X-LlamaSwap-Preempted: 1` + `Retry-After: 1` (best effort: if the victim
+   had already started streaming bytes, the stream is simply aborted). A
+   well-behaved client just retries, re-entering the queue through its own
+   tier's port.
+5. The extra listeners are started once at boot from the loaded config and
+   are **not** reconciled by `-watch-config` / SIGHUP reload — adding,
+   removing, or moving a tier port requires a restart.
+
+A full example, including a Claude Code CLI stub for pointing a session at
+the priority (or background) tier instead of the default port, lives in
+[`examples/tiers.example.yaml`](examples/tiers.example.yaml).
+
 ## Contributing: run the preflight before you commit
 
 `scripts/preflight.sh` runs locally what GitHub Actions runs remotely. Install it as a pre-commit hook once per clone:

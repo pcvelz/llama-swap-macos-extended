@@ -1,8 +1,10 @@
 package router
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"sync"
 	"sync/atomic"
@@ -14,6 +16,28 @@ import (
 	"github.com/mostlygeek/llama-swap/internal/router/scheduler"
 	"github.com/mostlygeek/llama-swap/internal/shared"
 )
+
+// maxReplays caps how many times a single client request may be
+// transparently re-enqueued after a zero-byte preemption (see ServeHTTP)
+// before falling back to the v1 cancel+503
+// (docs/intent/llama-swap-tiers.md "Known v1 limitations" -> v2). A hard
+// ceiling independent of maxReplayHeld: a pathological rapid-fire preemption
+// loop (each attempt preempted within milliseconds of being granted) would
+// otherwise hold the connection — and this model's concurrency-semaphore
+// permit, which is only released when ServeHTTP finally returns — for
+// effectively unbounded wall-clock time without ever approaching the
+// held-time budget below.
+const maxReplays = 5
+
+// maxReplayHeld caps the total wall-clock time (measured once, across every
+// attempt — not restarted per attempt) a request may be held for transparent
+// replay before falling back to the v1 503. Deliberately under the
+// interactive client's own ~300s zero-byte abort ceiling (llama-cm
+// llama/llama-swap.yaml, "THE 300s TIME-TO-FIRST-BYTE CEILING" note) so a
+// request that eventually gives up still has time left to receive and act on
+// the v1 503 before the client's OWN timeout fires first and aborts the
+// connection out from under us.
+const maxReplayHeld = 270 * time.Second
 
 type shutdownReq struct {
 	timeout time.Duration
@@ -69,8 +93,15 @@ type baseRouter struct {
 	// remain stable.
 	testProcessed chan struct{}
 
+	// pinned maps a pinned model ID to its lease deadline. A zero time.Time
+	// means a permanent pin (the pre-lease behavior, still used when a pin
+	// request carries no ttl). A non-zero deadline is a lease: IsPinned
+	// treats a deadline that has passed as NOT pinned even before this
+	// entry is swept out of the map, so enforcement never depends on sweep
+	// timing (crash-safety: a client that dies without unpinning must never
+	// wedge the box).
 	pinnedMu sync.RWMutex
-	pinned   map[string]bool
+	pinned   map[string]time.Time
 
 	// graceTick, when > 0, arms a periodic OnTick in the run loop so swap-grace
 	// deferrals are re-evaluated during pure idle (when no serve/swap event
@@ -104,7 +135,7 @@ func newBaseRouter(
 		swapDoneCh:  make(chan scheduler.SwapDone),
 		serveDoneCh: make(chan scheduler.ServeDoneEvent),
 		runDone:     make(chan struct{}),
-		pinned:      make(map[string]bool),
+		pinned:      make(map[string]time.Time),
 	}
 	b.schedule = newSched(name, logger, b)
 	return b
@@ -213,7 +244,7 @@ func (b *baseRouter) GrantError(req scheduler.HandlerReq, err error) {
 // the router would never again be willing to evict this model.
 func (b *baseRouter) GrantServe(req scheduler.HandlerReq, modelID string) bool {
 	p := b.processes[modelID]
-	return b.grant(req, scheduler.HandlerResp{HandleFunc: b.trackedServe(modelID, p)})
+	return b.grant(req, scheduler.HandlerResp{HandleFunc: b.trackedServe(modelID, p, req.EstimatedTokens, req.Preempted, req.ReplayWanted)})
 }
 
 // StopProcesses implements scheduler.Effects, stopping the named processes in
@@ -241,23 +272,37 @@ func (b *baseRouter) StopProcesses(timeout time.Duration, ids []string) {
 // send on serveDoneCh after the handler returns. That send is what tells
 // the run loop "this model now has one fewer request in flight — go look
 // at the queue again, you may be able to start a swap you previously had
-// to defer."
+// to defer." estimatedTokens echoes back the KV-admission reservation (see
+// scheduler.FIFO.grantHandler / releaseKV) this request holds, if any, so the
+// scheduler can release exactly what it reserved — on every exit path from
+// p.ServeHTTP, since this send is unconditional in the deferred func, not
+// gated on success.
 //
 // The select on shutdownCtx.Done() is a release valve: if the router is
 // already shutting down, nobody is reading serveDoneCh, so we drop the
 // notification rather than blocking the HTTP goroutine forever.
-func (b *baseRouter) trackedServe(modelID string, p process.Process) http.HandlerFunc {
+// preempted, when non-nil, is the same flag scheduler.HandlerReq.Preempt sets
+// just before it cancels this request's serving context (see fifo.go
+// tryPreempt). trackedServe wraps w so that cancel surfaces as a 503 +
+// X-LlamaSwap-Preempted header — best effort, see preempt.go — instead of
+// whatever the upstream reverse proxy would otherwise write. replayWanted,
+// when non-nil, is the same flag scheduler.HandlerReq.ReplayWanted carries —
+// see preemptResponseWriter's type doc for the v2 replay behavior it enables.
+func (b *baseRouter) trackedServe(modelID string, p process.Process, estimatedTokens int, preempted *atomic.Bool, replayWanted *atomic.Bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		defer func() {
 			select {
-			case b.serveDoneCh <- scheduler.ServeDoneEvent{ModelID: modelID}:
+			case b.serveDoneCh <- scheduler.ServeDoneEvent{ModelID: modelID, EstimatedTokens: estimatedTokens}:
 			case <-b.shutdownCtx.Done():
 			}
 		}()
-		p.ServeHTTP(w, r)
+		p.ServeHTTP(newPreemptResponseWriter(w, preempted, replayWanted), r)
 	}
 }
 
+// Eviction is a LAST resort, never routine: unloading a resident model forces a
+// full re-prefill downstream (llama-cm docs/intent/llama-swap-backend.md § Slot
+// stability). Only reach here after drain + swapGraceSeconds have run out.
 func (b *baseRouter) doSwap(modelID string, toStop []string) {
 	timeout := b.healthCheckTimeout()
 
@@ -375,10 +420,26 @@ func (b *baseRouter) ProcessLastUse(modelID string) (time.Time, bool) {
 	return p.LastUse(), true
 }
 
+// Pin marks modelID as permanently pinned (no expiry) - the pre-lease
+// behavior. Equivalent to PinWithTTL(modelID, 0).
 func (b *baseRouter) Pin(modelID string) {
+	b.PinWithTTL(modelID, 0)
+}
+
+// PinWithTTL pins modelID and returns the deadline that was stored (the
+// zero time.Time for a permanent pin, when ttl <= 0). Re-pinning an
+// already-pinned model refreshes its deadline - this is the lease-refresh
+// path a client re-sends periodically to keep its session's model
+// resident, and it must stay cheap/race-safe since it can fire often.
+func (b *baseRouter) PinWithTTL(modelID string, ttl time.Duration) time.Time {
 	b.pinnedMu.Lock()
 	defer b.pinnedMu.Unlock()
-	b.pinned[modelID] = true
+	var deadline time.Time
+	if ttl > 0 {
+		deadline = time.Now().Add(ttl)
+	}
+	b.pinned[modelID] = deadline
+	return deadline
 }
 
 func (b *baseRouter) Unpin(modelID string) {
@@ -387,22 +448,59 @@ func (b *baseRouter) Unpin(modelID string) {
 	delete(b.pinned, modelID)
 }
 
+// IsPinned reports whether modelID is currently pinned. A leased pin whose
+// deadline has passed is reported as unpinned even if it has not yet been
+// swept from the map - callers must never depend on sweep cadence for
+// correctness - and this call opportunistically performs that sweep so an
+// abandoned lease does not linger in the map indefinitely.
 func (b *baseRouter) IsPinned(modelID string) bool {
 	b.pinnedMu.RLock()
+	deadline, ok := b.pinned[modelID]
+	b.pinnedMu.RUnlock()
+	if !ok {
+		return false
+	}
+	if deadline.IsZero() || time.Now().Before(deadline) {
+		return true
+	}
+
+	// Lease expired: sweep it under the write lock so a client that died
+	// without unpinning cannot wedge the box - after this, normal idle-TTL
+	// rules apply to the model like any other unpinned process.
+	b.pinnedMu.Lock()
+	defer b.pinnedMu.Unlock()
+	// Re-check under the write lock: Pin/PinWithTTL may have refreshed the
+	// lease between the RUnlock above and this Lock.
+	if d, ok := b.pinned[modelID]; ok && !d.IsZero() && !time.Now().Before(d) {
+		delete(b.pinned, modelID)
+	}
+	return false
+}
+
+// PinExpiry reports the pin state and lease deadline for modelID: pinned is
+// false when the model is not pinned or its lease has expired (in which case
+// the entry is swept, same as IsPinned); deadline is the zero time.Time for
+// a permanent pin.
+func (b *baseRouter) PinExpiry(modelID string) (deadline time.Time, pinned bool) {
+	if !b.IsPinned(modelID) {
+		return time.Time{}, false
+	}
+	b.pinnedMu.RLock()
 	defer b.pinnedMu.RUnlock()
-	return b.pinned[modelID]
+	return b.pinned[modelID], true
 }
 
 // wirePinCallbacks wires the allowIdleEvict callback on every ProcessCommand
-// so the TTL goroutine consults the pinned map before evicting.
+// so the TTL goroutine consults the pinned map (via IsPinned, which also
+// sweeps expired leases) before evicting. This is the only per-second
+// consultation point for most models, which is why IsPinned itself performs
+// the sweep rather than requiring a separate goroutine.
 func (b *baseRouter) wirePinCallbacks() {
 	for id, p := range b.processes {
 		id := id
 		if pc, ok := p.(*process.ProcessCommand); ok {
 			pc.SetAllowIdleEvict(func() bool {
-				b.pinnedMu.RLock()
-				defer b.pinnedMu.RUnlock()
-				return !b.pinned[id]
+				return !b.IsPinned(id)
 			})
 		}
 	}
@@ -492,87 +590,229 @@ func (b *baseRouter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		w = pw
 	}
 
-	hr := scheduler.HandlerReq{
-		Model: data.ModelID,
-		Ctx:   req.Context(),
-		// Unbuffered: a successful send on Respond proves the waiter is
-		// alive and consuming. grant() relies on this to avoid handing a
-		// handleFunc to a cancelled waiter and leaking the inFlight count.
-		Respond:    make(chan scheduler.HandlerResp),
-		PositionCh: make(chan int, 1),
-	}
+	// arrivalCtx anchors every attempt below (see the per-attempt context
+	// derivation for why attempt 1 alone may reuse a shared.PreemptHandle
+	// context directly, while replay attempts never do). origBody is the
+	// body shared.FetchContext already buffered once at arrival — reused
+	// verbatim on every replay attempt so a retry sends the client's EXACT
+	// original bytes, never a second read of an already-drained r.Body.
+	arrivalCtx := req.Context()
+	origBody := data.Body
 
-	select {
-	case b.handlerCh <- hr:
-	case <-req.Context().Done():
-		return
-	case <-b.shutdownCtx.Done():
-		shared.SendError(w, req, fmt.Errorf("%s is shutting down", b.name))
-		return
-	}
+	// replayStart/replayCount implement the transparent-replay cap
+	// (docs/intent/llama-swap-tiers.md "Known v1 limitations" -> v2, the
+	// documented later enhancement over the v1 cancel+503): a preemption
+	// victim that has written zero response bytes is, within budget,
+	// silently re-submitted instead of being handed a 503. See
+	// maxReplays/maxReplayHeld above for the two independent caps.
+	replayStart := time.Now()
+	replayCount := 0
 
-	isModelReady := false
-	if p, ok := b.processes[data.ModelID]; ok {
-		isModelReady = p.State() == process.StateReady
-	}
-	shouldShowLoading := data.Streaming && data.SendLoadingState && isLoadingPath(req.URL.Path) && !isModelReady
+	for {
+		attempt := replayCount + 1
 
-	var lw *loadingWriter
-	cancelLoad := func() {}
-	if shouldShowLoading {
-		var swapCtx context.Context
-		swapCtx, cancelLoad = context.WithCancel(req.Context())
-		lw = newLoadingWriter(b.logger, data.ModelID, w, req)
-		go lw.start(swapCtx)
-		go func() {
-			for {
-				select {
-				case pos := <-hr.PositionCh:
-					lw.setUpdate(fmt.Sprintf("Queue position: #%d", pos))
-				case <-swapCtx.Done():
-					return
-				}
+		// A cancellable derivative of the request's own context: once
+		// granted, this becomes the context p.ServeHTTP actually serves
+		// under (req is rebound to it below), so the FIFO scheduler's
+		// preemption branch can server-side-abort a running request by
+		// calling reqCancel through hr.Preempt. Deriving from arrivalCtx
+		// means an ordinary client disconnect still cancels it too —
+		// preemption is layered on top of that existing mechanism, not a
+		// replacement for it.
+		//
+		// Attempt 1 reuses the shared.PreemptHandle from
+		// CreateRequestContextMiddleware exactly as before this change (the
+		// "Known soft spot" fix): a same-model preemption at the semaphore
+		// stage (internal/server/concurrency.go) and this scheduler-stage
+		// preemption then cancel through the exact same Flag+Cancel pair.
+		// That handle's own context is one-shot — once Cancel fires it
+		// reports Done() forever — so it cannot seed a REPLAY attempt.
+		// Attempts 2+ instead derive a fresh context from handle.Parent (the
+		// context that existed before the handle wrapped it, still alive
+		// after Cancel fires — see shared.PreemptHandle.Parent) when a
+		// handle was used, or from arrivalCtx directly otherwise (that
+		// branch never cancels arrivalCtx itself, only its own child, so
+		// arrivalCtx stays live for every attempt already).
+		//
+		// Known tradeoff: a same-model semaphore-triggered preemption that
+		// arrives while we're on a replay attempt (2+) no longer interrupts
+		// it — the semaphore's registered handle is the ORIGINAL one, spent
+		// after its first Cancel. Only a FIFO-scheduler preemption is
+		// observed on replay attempts, since hr.Preempt is rebuilt fresh
+		// every attempt below. Bounded either way by the replay cap.
+		var reqCtx context.Context
+		var reqCancel context.CancelFunc
+		var preempted *atomic.Bool
+		if attempt == 1 {
+			if handle, ok := shared.PreemptHandleFromContext(arrivalCtx); ok {
+				reqCtx = arrivalCtx
+				reqCancel = handle.Cancel
+				preempted = handle.Flag
+			} else {
+				reqCtx, reqCancel = context.WithCancel(arrivalCtx)
+				preempted = new(atomic.Bool)
 			}
-		}()
-	}
-
-	// finishLoading stops the loading stream and fences its goroutine off from
-	// the ResponseWriter before the real handler (or ServeHTTP's return)
-	// reclaims it. release() must run even when waitForCompletion times out:
-	// otherwise a still-streaming goroutine flushes a finalized response and
-	// panics on the recycled *bufio.Writer.
-	finishLoading := func() {
-		cancelLoad()
-		if lw != nil {
-			lw.waitForCompletion(1 * time.Second)
-			lw.release()
+		} else if handle, ok := shared.PreemptHandleFromContext(arrivalCtx); ok && handle.Parent != nil {
+			reqCtx, reqCancel = context.WithCancel(handle.Parent)
+			preempted = new(atomic.Bool)
+		} else {
+			reqCtx, reqCancel = context.WithCancel(arrivalCtx)
+			preempted = new(atomic.Bool)
 		}
-	}
+		defer reqCancel()
 
-	var resp scheduler.HandlerResp
-	select {
-	case resp = <-hr.Respond:
-		finishLoading()
-	case <-req.Context().Done():
-		finishLoading()
-		// Notify the scheduler so it can prune this request from its queue
-		// and swap waiters. Without this, a queued request whose client left
-		// would sit in the scheduler until drainQueue eventually starts a
-		// wasted model load for it.
+		attemptReq := req.WithContext(reqCtx)
+		if attempt > 1 {
+			// Replay: hand the upstream the client's original bytes again —
+			// see origBody above.
+			attemptReq.Body = io.NopCloser(bytes.NewReader(origBody))
+		}
+
+		// replayEligible: this attempt may transparently retry instead of
+		// 503ing the client if it is preempted before producing any body
+		// byte. Scope: only tiers marked Preemptible (today, just
+		// "background" — docs/intent/llama-swap-tiers.md) — a
+		// non-preemptible request is never a preemption victim in the first
+		// place, so this check is inert for it either way; making it
+		// explicit keeps that inertness obvious rather than implicit.
+		// Bounded by maxReplays/maxReplayHeld so a pathological hot-loop of
+		// same-model contention still falls back to the v1 503 well under
+		// the client's own ~300s abort ceiling. Memory tradeoff: origBody
+		// (already buffered once by shared.FetchContext for every JSON POST,
+		// replay-eligible or not) is retained for this attempt's lifetime —
+		// interactive request bodies can run multi-MB, so this scales with
+		// (concurrent preemptible requests) x (body size), not with replay
+		// count, and is bounded by the same concurrency limits that already
+		// bound in-flight request memory today.
+		var replayWanted *atomic.Bool
+		replayEligible := data.Tier.Preemptible && replayCount < maxReplays && time.Since(replayStart) < maxReplayHeld
+		if replayEligible {
+			replayWanted = new(atomic.Bool)
+		}
+
+		hr := scheduler.HandlerReq{
+			Model: data.ModelID,
+			Ctx:   reqCtx,
+			// Unbuffered: a successful send on Respond proves the waiter is
+			// alive and consuming. grant() relies on this to avoid handing a
+			// handleFunc to a cancelled waiter and leaking the inFlight count.
+			Respond:    make(chan scheduler.HandlerResp),
+			PositionCh: make(chan int, 1),
+			// Inert unless the target model has a KVPoolTokens budget configured
+			// (see scheduler.FIFO.kvAdmit) — see shared.EstimateTokens for the
+			// estimation rule.
+			EstimatedTokens: shared.EstimateTokens(origBody),
+			// Tier is DefaultTier for every request on the main listener / when no
+			// `tiers:` block is configured (see shared.Tier).
+			Tier:         data.Tier,
+			Preempted:    preempted,
+			ReplayWanted: replayWanted,
+			Preempt: func() {
+				preempted.Store(true)
+				reqCancel()
+			},
+		}
+
 		select {
-		case b.cancelCh <- hr:
+		case b.handlerCh <- hr:
+		case <-attemptReq.Context().Done():
+			return
 		case <-b.shutdownCtx.Done():
+			shared.SendError(w, attemptReq, fmt.Errorf("%s is shutting down", b.name))
+			return
+		}
+
+		isModelReady := false
+		if p, ok := b.processes[data.ModelID]; ok {
+			isModelReady = p.State() == process.StateReady
+		}
+		// shouldShowLoading is attempt-1-only: loadingWriter commits its own
+		// SSE 200 status line the moment it starts (see loading.go), so
+		// re-running it on a replay attempt would try to write a second
+		// status line on a writer that already committed one. The OpenAI
+		// loading path (isLoadingPath) is disjoint from the Anthropic
+		// pingWriter path replay actually targets in production, so this is
+		// a no-op restriction for the tiers use case and simply keeps the
+		// loading indicator best-effort (as it already is) rather than
+		// risking a panic on retry.
+		shouldShowLoading := attempt == 1 && data.Streaming && data.SendLoadingState && isLoadingPath(attemptReq.URL.Path) && !isModelReady
+
+		var lw *loadingWriter
+		cancelLoad := func() {}
+		if shouldShowLoading {
+			var swapCtx context.Context
+			swapCtx, cancelLoad = context.WithCancel(attemptReq.Context())
+			lw = newLoadingWriter(b.logger, data.ModelID, w, attemptReq)
+			go lw.start(swapCtx)
+			go func() {
+				for {
+					select {
+					case pos := <-hr.PositionCh:
+						lw.setUpdate(fmt.Sprintf("Queue position: #%d", pos))
+					case <-swapCtx.Done():
+						return
+					}
+				}
+			}()
+		}
+
+		// finishLoading stops the loading stream and fences its goroutine off from
+		// the ResponseWriter before the real handler (or ServeHTTP's return)
+		// reclaims it. release() must run even when waitForCompletion times out:
+		// otherwise a still-streaming goroutine flushes a finalized response and
+		// panics on the recycled *bufio.Writer.
+		finishLoading := func() {
+			cancelLoad()
+			if lw != nil {
+				lw.waitForCompletion(1 * time.Second)
+				lw.release()
+			}
+		}
+
+		var resp scheduler.HandlerResp
+		select {
+		case resp = <-hr.Respond:
+			finishLoading()
+		case <-attemptReq.Context().Done():
+			finishLoading()
+			// Notify the scheduler so it can prune this request from its queue
+			// and swap waiters. Without this, a queued request whose client left
+			// would sit in the scheduler until drainQueue eventually starts a
+			// wasted model load for it.
+			select {
+			case b.cancelCh <- hr:
+			case <-b.shutdownCtx.Done():
+			}
+			return
+		case <-b.shutdownCtx.Done():
+			finishLoading()
+			shared.SendError(w, attemptReq, fmt.Errorf("%s is shutting down", b.name))
+			return
+		}
+
+		if resp.Err != nil {
+			shared.SendError(w, attemptReq, resp.Err)
+			return
+		}
+		resp.HandleFunc(w, attemptReq)
+
+		if replayWanted != nil && replayWanted.Load() {
+			replayCount++
+			b.logger.Infof("preempt-replay: tier=%s model=%s attempt=%d held=%.0fs",
+				data.Tier.Name, data.ModelID, replayCount, time.Since(replayStart).Seconds())
+			continue
+		}
+		if replayCount > 0 {
+			outcome := "served"
+			if preempted.Load() {
+				// This final attempt WAS preempted too, but landed outside
+				// replay eligibility (cap or deadline tripped) and fell back
+				// to the v1 503 inside preemptResponseWriter.
+				outcome = "given-up"
+			}
+			b.logger.Infof("preempt-replay: tier=%s model=%s %s attempt=%d held=%.0fs",
+				data.Tier.Name, data.ModelID, outcome, attempt, time.Since(replayStart).Seconds())
 		}
 		return
-	case <-b.shutdownCtx.Done():
-		finishLoading()
-		shared.SendError(w, req, fmt.Errorf("%s is shutting down", b.name))
-		return
 	}
-
-	if resp.Err != nil {
-		shared.SendError(w, req, resp.Err)
-		return
-	}
-	resp.HandleFunc(w, req)
 }

@@ -17,7 +17,11 @@ public final class BackendClient: ObservableObject {
     /// A value without an http(s) scheme would still parse as a URL (host
     /// becomes the scheme) and silently break every request, so anything
     /// malformed falls back to the default.
-    private static func defaultBaseURL() -> URL {
+    ///
+    /// Public because `InstanceGuard` keys its single-instance lock on the same
+    /// value: resolving the backend twice by different rules would let two
+    /// helpers polling one backend take two different locks.
+    public static func defaultBaseURL() -> URL {
         let env = ProcessInfo.processInfo.environment["LLAMA_SWAP_MENU_BASE_URL"] ?? ""
         if env.hasPrefix("http://") || env.hasPrefix("https://"), let url = URL(string: env) {
             return url
@@ -176,7 +180,7 @@ public final class BackendClient: ObservableObject {
         case "inflight":
             if let inner = envelope.data.data(using: .utf8),
                let stats = try? JSONDecoder().decode(InFlightStats.self, from: inner) {
-                menuState.waiting = stats.total
+                menuState.applyInflight(total: stats.total, byTier: stats.byTier ?? [:])
             }
         default:
             break

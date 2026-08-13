@@ -1,8 +1,10 @@
 package server
 
 import (
+	"context"
 	"net/http"
 	"strings"
+	"sync/atomic"
 
 	"github.com/mostlygeek/llama-swap/internal/chain"
 	"github.com/mostlygeek/llama-swap/internal/config"
@@ -43,6 +45,16 @@ func CreateAuthMiddleware(cfg config.Config) chain.Middleware {
 // CreateRequestContextMiddleware returns middleware that extracts model and
 // auth info from the request into the context. Requests where no model can be
 // identified are rejected with a 404.
+//
+// It also tags the request with a fresh shared.PreemptHandle wrapping a
+// cancellable child of the request's context - as early as possible, before
+// CreateConcurrencyMiddleware's per-model semaphore can ever block on it.
+// Every layer downstream that can hold a request up (the semaphore, the FIFO
+// scheduler) reuses this SAME handle instead of minting its own, so a
+// preemption at any layer cancels through the one Flag+Cancel pair
+// (docs/intent/llama-swap-tiers.md "Known soft spot"; see
+// internal/router/base.go ServeHTTP, which reads this handle back out of the
+// context).
 func CreateRequestContextMiddleware(cfg config.Config) chain.Middleware {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -52,6 +64,15 @@ func CreateRequestContextMiddleware(cfg config.Config) chain.Middleware {
 				return
 			}
 			_ = data
+
+			parent := r.Context()
+			ctx, cancel := context.WithCancel(parent)
+			// Parent (the pre-wrap context) stays alive after Cancel fires -
+			// see shared.PreemptHandle.Parent for why a transparent replay
+			// attempt needs it.
+			handle := &shared.PreemptHandle{Flag: new(atomic.Bool), Cancel: cancel, Parent: parent}
+			*r = *r.WithContext(shared.WithPreemptHandle(ctx, handle))
+
 			next.ServeHTTP(w, r)
 		})
 	}

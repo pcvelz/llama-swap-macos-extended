@@ -1,0 +1,75 @@
+name: Tray + Menu CI
+
+# Builds the cross-platform system-tray helper on every platform it ships for,
+# including a native Windows compile+test job (the fork is developed on macOS,
+# so CI is the Windows/Linux build verification).
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - "cmd/llama-swap-tray/**"
+      - "internal/tray/**"
+      - "internal/menubar/**"
+      - "macos-menu/**"
+      - "go.mod"
+      - "go.sum"
+      - ".github/workflows/tray-ci.yml"
+  pull_request:
+    branches: ["main"]
+    paths:
+      - "cmd/llama-swap-tray/**"
+      - "internal/tray/**"
+      - "internal/menubar/**"
+      - "macos-menu/**"
+      - "go.mod"
+      - "go.sum"
+      - ".github/workflows/tray-ci.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tray-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # 6.0.2
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # 6.4.0
+        with:
+          go-version-file: go.mod
+      - name: Test tray + menubar packages
+        run: go test -count=1 ./internal/tray/... ./internal/menubar/... ./internal/config/...
+      - name: Build tray (linux amd64 + arm64, windows amd64)
+        run: |
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o build/llama-swap-tray-linux-amd64 ./cmd/llama-swap-tray
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -o build/llama-swap-tray-linux-arm64 ./cmd/llama-swap-tray
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -o build/llama-swap-tray-windows-amd64.exe ./cmd/llama-swap-tray
+      - name: Upload tray binaries
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # 4.6.2
+        with:
+          name: llama-swap-tray
+          path: build/llama-swap-tray-*
+
+  tray-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # 6.0.2
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # 6.4.0
+        with:
+          go-version-file: go.mod
+      - name: Test tray package natively on Windows
+        run: go test -count=1 ./internal/tray/... ./internal/menubar/...
+      - name: Build tray natively on Windows
+        run: go build -o build/llama-swap-tray.exe ./cmd/llama-swap-tray
+
+  menu-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # 6.0.2
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # 6.4.0
+        with:
+          go-version-file: go.mod
+      - name: Build Swift menu-bar helper
+        run: cd macos-menu && swift build -c release
+      - name: Build tray on macOS (cgo)
+        run: go build -o build/llama-swap-tray ./cmd/llama-swap-tray

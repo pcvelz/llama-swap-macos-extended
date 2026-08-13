@@ -14,10 +14,30 @@ import LlamaSwapMenuCore
 final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApplication.shared.setActivationPolicy(.accessory)
+
+        // Needs the run loop, so it starts here rather than in main().
+        ParentWatchdog.start {
+            NSApplication.shared.terminate(nil)
+        }
     }
 }
 
+/// Entry point.
+///
+/// The single-instance check runs here, before `LlamaSwapMenuApp.main()` starts
+/// the SwiftUI scene, so a helper that loses the backend to an incumbent exits
+/// without ever creating a status item — the user never sees a duplicate icon
+/// flash in the menu bar.
 @main
+enum HelperMain {
+    static func main() {
+        guard InstanceGuard.acquire(baseURL: BackendClient.defaultBaseURL().absoluteString) else {
+            exit(0)
+        }
+        LlamaSwapMenuApp.main()
+    }
+}
+
 struct LlamaSwapMenuApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @StateObject private var client = BackendClient()

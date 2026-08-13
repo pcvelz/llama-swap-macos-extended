@@ -52,6 +52,252 @@ func TestServer_HandleListModels(t *testing.T) {
 	}
 }
 
+func TestServer_HandleListModels_AnthropicEnvelope(t *testing.T) {
+	s := newTestServer(newStubRouter(nil, ""), newStubRouter(nil, ""))
+	s.cfg = config.Config{
+		Models: map[string]config.ModelConfig{
+			"qwen": {
+				Name:        "Qwen 35B",
+				Description: "local qwen",
+				Metadata: map[string]any{
+					"anthropic_display_name": "Local Qwen",
+					"anthropic_default":      true,
+					"anthropic_efforts":      []any{"low", "high"},
+				},
+				Capabilities: config.ModelCapConfig{In: []string{"text"}},
+			},
+		},
+	}
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	req.Header.Set("anthropic-version", "2023-06-01")
+	s.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d", w.Code)
+	}
+
+	var resp struct {
+		Data []struct {
+			ID              string   `json:"id"`
+			Type            string   `json:"type"`
+			DisplayName     string   `json:"display_name"`
+			CreatedAt       string   `json:"created_at"`
+			Description     string   `json:"description"`
+			Default         *bool    `json:"default"`
+			Efforts         []string `json:"efforts"`
+			InputModalities []string `json:"input_modalities"`
+		} `json:"data"`
+		HasMore bool   `json:"has_more"`
+		FirstID string `json:"first_id"`
+		LastID  string `json:"last_id"`
+		Object  string `json:"object"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Object == "list" {
+		t.Error("anthropic-version request must NOT get the OpenAI envelope")
+	}
+	if resp.HasMore {
+		t.Error("has_more should be false")
+	}
+	if resp.FirstID != "qwen" || resp.LastID != "qwen" {
+		t.Errorf("first_id/last_id = %q/%q, want qwen/qwen", resp.FirstID, resp.LastID)
+	}
+	if len(resp.Data) != 1 {
+		t.Fatalf("expected 1 entry, got %d", len(resp.Data))
+	}
+	e := resp.Data[0]
+	if e.Type != "model" {
+		t.Errorf("type = %q, want model", e.Type)
+	}
+	if e.DisplayName != "Local Qwen" {
+		t.Errorf("display_name = %q, want overridden %q", e.DisplayName, "Local Qwen")
+	}
+	if e.Default == nil || !*e.Default {
+		t.Errorf("default = %v, want true", e.Default)
+	}
+	if len(e.Efforts) != 2 || e.Efforts[0] != "low" || e.Efforts[1] != "high" {
+		t.Errorf("efforts = %v, want [low high]", e.Efforts)
+	}
+	if len(e.InputModalities) != 1 || e.InputModalities[0] != "text" {
+		t.Errorf("input_modalities = %v, want [text]", e.InputModalities)
+	}
+	if e.Description != "local qwen" {
+		t.Errorf("description = %q", e.Description)
+	}
+	if e.CreatedAt == "" {
+		t.Error("created_at must be a non-empty RFC3339 string")
+	}
+
+	// Same request WITHOUT the header still gets the OpenAI envelope.
+	w2 := httptest.NewRecorder()
+	s.ServeHTTP(w2, httptest.NewRequest(http.MethodGet, "/v1/models", nil))
+	var openai struct {
+		Object string `json:"object"`
+	}
+	if err := json.Unmarshal(w2.Body.Bytes(), &openai); err != nil {
+		t.Fatalf("decode openai: %v", err)
+	}
+	if openai.Object != "list" {
+		t.Errorf("object = %q, want OpenAI envelope %q", openai.Object, "list")
+	}
+}
+
+// TestServer_HandleListModels_UserAgentNegotiation covers the 2026-07-22 live
+// bug: Claude Code's gateway discovery call sends NO anthropic-version header,
+// so negotiation must also trigger on its User-Agent ("claude-code/..."),
+// while OpenAI consumers (curl, llama.cpp clients) keep the OpenAI envelope.
+// TestServer_HandleListModels_AnthropicClaudeAliases covers the 2026-07-22
+// picker gap: Claude Code's /model picker only surfaces discovered IDs starting
+// with "claude", so the Anthropic envelope must also emit one row per
+// claude-prefixed ALIAS (inheriting the parent model's metadata) while
+// non-claude shell aliases (cq35) stay out. The raw model row stays, and the
+// OpenAI listing path is untouched.
+func TestServer_HandleListModels_AnthropicClaudeAliases(t *testing.T) {
+	s := newTestServer(newStubRouter(nil, ""), newStubRouter(nil, ""))
+	s.cfg = config.Config{
+		Models: map[string]config.ModelConfig{
+			"Qwen3.6-35B": {
+				Name:        "Qwen 35B",
+				Description: "local qwen",
+				Aliases:     []string{"cq35", "claude-cq35"},
+				Metadata: map[string]any{
+					"anthropic_display_name": "Local Qwen",
+					"anthropic_default":      true,
+					"anthropic_efforts":      []any{"low", "high"},
+				},
+				Capabilities: config.ModelCapConfig{In: []string{"text"}},
+			},
+		},
+	}
+
+	type entry struct {
+		ID              string   `json:"id"`
+		DisplayName     string   `json:"display_name"`
+		CreatedAt       string   `json:"created_at"`
+		Description     string   `json:"description"`
+		Default         *bool    `json:"default"`
+		Efforts         []string `json:"efforts"`
+		InputModalities []string `json:"input_modalities"`
+	}
+
+	// Anthropic path (claude-code UA, no anthropic-version header).
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	req.Header.Set("User-Agent", "claude-code/2.1.217")
+	s.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d", w.Code)
+	}
+	var resp struct {
+		Data []entry `json:"data"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	byID := map[string]entry{}
+	for _, e := range resp.Data {
+		if _, dup := byID[e.ID]; dup {
+			t.Errorf("duplicate entry id %q", e.ID)
+		}
+		byID[e.ID] = e
+	}
+
+	// Raw model row stays in the envelope.
+	if _, ok := byID["Qwen3.6-35B"]; !ok {
+		t.Errorf("raw model row missing: %v", byID)
+	}
+	// claude-prefixed alias row exists, inheriting the parent's extras.
+	alias, ok := byID["claude-cq35"]
+	if !ok {
+		t.Fatalf("claude-cq35 alias row missing: %v", byID)
+	}
+	if alias.DisplayName != "Local Qwen" {
+		t.Errorf("alias display_name = %q, want parent override %q", alias.DisplayName, "Local Qwen")
+	}
+	if alias.Default == nil || !*alias.Default {
+		t.Errorf("alias default = %v, want true", alias.Default)
+	}
+	if len(alias.Efforts) != 2 || alias.Efforts[0] != "low" || alias.Efforts[1] != "high" {
+		t.Errorf("alias efforts = %v, want [low high]", alias.Efforts)
+	}
+	if len(alias.InputModalities) != 1 || alias.InputModalities[0] != "text" {
+		t.Errorf("alias input_modalities = %v, want [text]", alias.InputModalities)
+	}
+	if alias.Description != "local qwen" {
+		t.Errorf("alias description = %q", alias.Description)
+	}
+	if alias.CreatedAt == "" {
+		t.Error("alias created_at must be non-empty")
+	}
+	// Non-claude alias stays OUT of the picker listing.
+	if _, ok := byID["cq35"]; ok {
+		t.Error("non-claude alias cq35 must not appear in the Anthropic envelope")
+	}
+
+	// OpenAI path (no UA/header) unchanged: same single raw model row, no
+	// alias rows (includeAliasesInList is off).
+	w2 := httptest.NewRecorder()
+	s.ServeHTTP(w2, httptest.NewRequest(http.MethodGet, "/v1/models", nil))
+	var openai struct {
+		Object string        `json:"object"`
+		Data   []modelRecord `json:"data"`
+	}
+	if err := json.Unmarshal(w2.Body.Bytes(), &openai); err != nil {
+		t.Fatalf("decode openai: %v", err)
+	}
+	if openai.Object != "list" {
+		t.Errorf("object = %q, want OpenAI envelope %q", openai.Object, "list")
+	}
+	if len(openai.Data) != 1 || openai.Data[0].ID != "Qwen3.6-35B" {
+		t.Errorf("openai data = %+v, want exactly the raw model row", openai.Data)
+	}
+}
+
+func TestServer_HandleListModels_UserAgentNegotiation(t *testing.T) {
+	s := newTestServer(newStubRouter(nil, ""), newStubRouter(nil, ""))
+	s.cfg = config.Config{
+		Models: map[string]config.ModelConfig{
+			"qwen": {Name: "Qwen 35B"},
+		},
+	}
+
+	get := func(ua string) map[string]any {
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+		if ua != "" {
+			req.Header.Set("User-Agent", ua)
+		}
+		s.ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("UA %q: status = %d", ua, w.Code)
+		}
+		var resp map[string]any
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("UA %q: decode: %v", ua, err)
+		}
+		return resp
+	}
+
+	// Claude Code UA, no anthropic-version header -> Anthropic envelope.
+	resp := get("claude-code/2.1.217")
+	if resp["object"] == "list" {
+		t.Error("claude-code UA without anthropic-version got the OpenAI envelope")
+	}
+	if _, ok := resp["has_more"]; !ok {
+		t.Errorf("claude-code UA: expected Anthropic envelope fields, got %v", resp)
+	}
+
+	// curl UA, no headers -> OpenAI envelope.
+	resp = get("curl/8.7.1")
+	if resp["object"] != "list" {
+		t.Errorf("curl UA: object = %v, want OpenAI envelope %q", resp["object"], "list")
+	}
+}
+
 func TestServer_HandleListModels_Aliases(t *testing.T) {
 	s := newTestServer(newStubRouter(nil, ""), newStubRouter(nil, ""))
 	s.cfg = config.Config{

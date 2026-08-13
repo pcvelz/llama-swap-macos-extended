@@ -244,9 +244,65 @@
             "description": "Inject loading status updates into the reasoning field. When true, a stream of loading messages will be sent to the client."
         },
         "menu_bar": {
-            "type": "boolean",
-            "default": false,
-            "description": "Enable the macOS menu-bar helper."
+            "default": true,
+            "description": "Menu-bar (macOS) / system-tray (Windows, Linux) helper. Accepts a boolean (enable/disable with default bars) or an object with 'enabled' and 'bars'.",
+            "oneOf": [
+                {
+                    "type": "boolean"
+                },
+                {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "enabled": {
+                            "type": "boolean",
+                            "default": true,
+                            "description": "Enable the menu-bar/system-tray helper."
+                        },
+                        "bars": {
+                            "type": "array",
+                            "minItems": 1,
+                            "maxItems": 2,
+                            "default": ["gpu", "vram"],
+                            "items": {
+                                "type": "string",
+                                "enum": ["gpu", "vram", "cpu", "ram"]
+                            },
+                            "description": "Which metrics the helper renders as bars, top to bottom."
+                        }
+                    }
+                }
+            ]
+        },
+        "tiers": {
+            "type": "object",
+            "default": {},
+            "description": "Extra HTTP entry points into the one shared FIFO queue (docs/intent/llama-swap-tiers.md in the llama-cm repo). The main -listen port is always the implicit 'default' tier (rank 0) and is never declared here - an absent or empty tiers map is byte-identical, single-listener behavior. Each key is a tier name; its value declares that tier's own listener + queue rank.",
+            "additionalProperties": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["listen", "rank"],
+                "properties": {
+                    "listen": {
+                        "type": "string",
+                        "description": "This tier's own listen address, e.g. '127.0.0.1:8002'."
+                    },
+                    "rank": {
+                        "type": "integer",
+                        "description": "Orders the shared queue: higher ranks are serviced first, and a queued request is never granted while a strictly higher-rank request is still queued. The implicit default tier is rank 0; any nonzero rank is allowed here, including negative (background) ranks."
+                    },
+                    "preempts": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "When true, an arrival on this tier boots ANY running lower-rank request, including non-preemptible ones."
+                    },
+                    "preemptible": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "When true, a running request on this tier may be booted by any higher-rank arrival, even one without preempts set."
+                    }
+                }
+            }
         },
         "includeAliasesInList": {
             "type": "boolean",
@@ -488,6 +544,15 @@
             "default": [],
             "description": "Require an API key when making requests to inference endpoints. When empty, authorization will not be checked. Each key is a non-empty string."
         },
+        "residentAliases": {
+            "type": "array",
+            "items": {
+                "type": "string",
+                "minLength": 1
+            },
+            "default": [],
+            "description": "Model-id patterns (shell globs) resolved at request time to the currently-resident model; never triggers a load/swap; 404 unchanged when nothing is resident."
+        },
         "peers": {
             "type": "object",
             "additionalProperties": {
@@ -602,6 +667,13 @@
                                         "priority": {
                                             "type": "object",
                                             "description": "Per-model priority. Keys are model IDs, values are integers (default 0). Higher values are serviced first.",
+                                            "additionalProperties": {
+                                                "type": "integer"
+                                            }
+                                        },
+                                        "kvPoolTokens": {
+                                            "type": "object",
+                                            "description": "Per-model KV-aware admission budget, in estimated tokens (see EstimateTokens: buffered request body bytes / 4). For a model served with a single shared/unified KV pool across multiple parallel slots (e.g. llama.cpp --parallel 2 --kv-unified), a second concurrent large-context request can push the pool over capacity and abort both. Keys are model IDs; values are the pool's usable token budget. A request that would push the model's estimated in-flight tokens over this ceiling is parked in the normal queue instead of forwarded, until enough of the pool frees up. Omitted or 0 for a model disables admission control for it (default: today's unconditional forwarding).",
                                             "additionalProperties": {
                                                 "type": "integer"
                                             }

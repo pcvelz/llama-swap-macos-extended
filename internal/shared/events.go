@@ -45,6 +45,11 @@ func (e ModelPreloadedEvent) Type() uint32 {
 
 type InFlightRequestsEvent struct {
 	Total int
+	// ByTier is the in-flight/waiting count per tier name (including
+	// "default"). Populated only when more than one tier is configured
+	// (see docs/intent/llama-swap-tiers.md, "Inflight/menu" section); nil
+	// otherwise so single-listener deployments see byte-identical payloads.
+	ByTier map[string]int
 }
 
 func (e InFlightRequestsEvent) Type() uint32 {

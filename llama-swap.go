@@ -8,10 +8,12 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/http/pprof"
 	"os"
 	"os/signal"
 	"path/filepath"
-	"runtime"
+	"reflect"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -63,7 +65,7 @@ func main() {
 	flagKeyFile := flag.String("tls-key-file", "", "TLS key file")
 	flagVersion := flag.Bool("version", false, "show version and exit")
 	flagWatchConfig := flag.Bool("watch-config", false, "reload config on file change")
-	flagMenuBar := flag.Bool("menu-bar", false, "enable macOS menu-bar helper")
+	flagMenuBar := flag.Bool("menu-bar", false, "enable the menu-bar/system-tray helper")
 	flag.Parse()
 
 	if *flagVersion {
@@ -100,7 +102,7 @@ func main() {
 
 	// Flag overrides config when both are present.
 	if *flagMenuBar {
-		cfg.MenuBar = true
+		cfg.MenuBar.Enabled = true
 	}
 
 	// Loggers are wired per cfg.LogToStdout: proxy/upstream feed muxLog, which
@@ -164,22 +166,128 @@ func main() {
 	var activeMu sync.RWMutex
 	activeSrv := initialSrv
 
+	// The helper receives its settings via env vars at launch, so a changed
+	// `menu_bar` section needs a helper relaunch; applyMenuBar reconciles the
+	// running sidecar with the (re)loaded config and no-ops when unchanged.
+	var menuMu sync.Mutex
 	var menuBarLauncher *menubar.Launcher
-	if cfg.MenuBar && runtime.GOOS == "darwin" {
-		menuBarLauncher = menubar.New(proxyLog)
-		if err := menuBarLauncher.Start(); err != nil {
-			proxyLog.Warnf("menu-bar helper failed to start: %v", err)
+	var menuBarCfg config.MenuBarConfig
+
+	applyMenuBar := func(mc config.MenuBarConfig) {
+		menuMu.Lock()
+		defer menuMu.Unlock()
+		if reflect.DeepEqual(mc, menuBarCfg) {
+			return
+		}
+		if menuBarLauncher != nil {
+			if err := menuBarLauncher.Stop(); err != nil {
+				proxyLog.Warnf("menu-bar helper shutdown error: %v", err)
+			}
+			menuBarLauncher = nil
+		}
+		if mc.Enabled && menubar.Supported() {
+			menuBarLauncher = menubar.New(proxyLog, menubar.Options{
+				ListenAddr: listenAddr,
+				TLS:        useTLS,
+				Bars:       mc.Bars,
+			})
+			if err := menuBarLauncher.Start(); err != nil {
+				proxyLog.Warnf("menu-bar helper failed to start: %v", err)
+			}
+		}
+		menuBarCfg = mc
+	}
+
+	applyMenuBar(cfg.MenuBar)
+
+	// The sidecar is already running by this point, but the listener is not yet
+	// bound. Any exit between here and shutdown must stop it explicitly or it
+	// outlives the proxy as an orphan that keeps drawing a menu-bar icon -
+	// os.Exit runs neither deferred calls nor the signal handler below.
+	stopMenuBar := func() {
+		menuMu.Lock()
+		defer menuMu.Unlock()
+		if menuBarLauncher != nil {
+			if err := menuBarLauncher.Stop(); err != nil {
+				proxyLog.Warnf("menu-bar helper shutdown error: %v", err)
+			}
 		}
 	}
 
+	// Opt-in debug pprof listener, gated by LLAMA_SWAP_PPROF_PORT. Absent/empty
+	// leaves this fully off with zero behavior change. Deliberately NOT
+	// http.DefaultServeMux (that would also expose pprof on the main proxy
+	// listener via the blank net/http/pprof import side effect) - a dedicated
+	// mux bound to 127.0.0.1 keeps it off the network and off the proxy's
+	// request path.
+	if pprofPort := os.Getenv("LLAMA_SWAP_PPROF_PORT"); pprofPort != "" {
+		pprofMux := http.NewServeMux()
+		pprofMux.HandleFunc("/debug/pprof/", pprof.Index)
+		pprofMux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+		pprofMux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+		pprofMux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+		pprofMux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+		pprofMux.Handle("/debug/pprof/heap", pprof.Handler("heap"))
+		pprofMux.Handle("/debug/pprof/goroutine", pprof.Handler("goroutine"))
+		pprofMux.Handle("/debug/pprof/allocs", pprof.Handler("allocs"))
+		pprofMux.Handle("/debug/pprof/block", pprof.Handler("block"))
+		pprofMux.Handle("/debug/pprof/mutex", pprof.Handler("mutex"))
+
+		pprofAddr := "127.0.0.1:" + pprofPort
+		go func() {
+			proxyLog.Infof("debug pprof listener up on http://%s/debug/pprof/", pprofAddr)
+			if err := http.ListenAndServe(pprofAddr, pprofMux); err != nil {
+				proxyLog.Warnf("debug pprof listener stopped: %v", err)
+			}
+		}()
+	}
+
+	mainHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		activeMu.RLock()
+		srv := activeSrv
+		activeMu.RUnlock()
+		srv.ServeHTTP(w, r)
+	})
+
 	httpServer := &http.Server{
-		Addr: listenAddr,
-		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			activeMu.RLock()
-			srv := activeSrv
-			activeMu.RUnlock()
-			srv.ServeHTTP(w, r)
-		}),
+		Addr:    listenAddr,
+		Handler: mainHandler,
+	}
+
+	// Extra tier listeners (docs/intent/llama-swap-tiers.md, llama-cm): each
+	// configured tier gets its own http.Server sharing mainHandler, wrapped so
+	// every request that arrives through it is tagged with the tier before it
+	// ever reaches routing/scheduling. The main -listen port is always the
+	// implicit default tier and needs no wrapping. Absent `tiers:` => this
+	// loop is a no-op => byte-identical single-listener behavior.
+	//
+	// Fixed at startup, not reconciled on config reload/-watch-config: adding,
+	// removing, or moving a tier port requires restarting llama-swap. Given
+	// this fork's target here — a small number of long-lived local entry
+	// points — that is an acceptable v1 scope limit, not a correctness gap.
+	var tierServers []*http.Server
+	tierNames := make([]string, 0, len(cfg.Tiers))
+	for name := range cfg.Tiers {
+		tierNames = append(tierNames, name)
+	}
+	sort.Strings(tierNames)
+	for _, name := range tierNames {
+		tc := cfg.Tiers[name]
+		tier := shared.Tier{Name: name, Rank: tc.Rank, Preempts: tc.Preempts, Preemptible: tc.Preemptible}
+		tierHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			mainHandler.ServeHTTP(w, r.WithContext(shared.WithTier(r.Context(), tier)))
+		})
+		srv := &http.Server{Addr: tc.Listen, Handler: tierHandler}
+		tierServers = append(tierServers, srv)
+
+		go func(name string, srv *http.Server) {
+			proxyLog.Infof("llama-swap tier %q listening on http://%s (rank %d)", name, srv.Addr, tier.Rank)
+			if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				slog.Error("tier http server error", "tier", name, "error", err)
+				stopMenuBar()
+				os.Exit(1)
+			}
+		}(name, srv)
 	}
 
 	// reload guards against overlapping reloads triggered by concurrent signals
@@ -229,6 +337,7 @@ func main() {
 		activeMu.Unlock()
 
 		applyLogSettings(newCfg)
+		applyMenuBar(newCfg.MenuBar)
 
 		if err := old.Shutdown(shutdownTimeout); err != nil {
 			proxyLog.Warnf("error shutting down old server during reload: %v", err)
@@ -275,6 +384,9 @@ func main() {
 		}
 		if startErr != nil && !errors.Is(startErr, http.ErrServerClosed) {
 			slog.Error("http server error", "error", startErr)
+			// A redundant llama-swap start fails here with EADDRINUSE; without
+			// this the icon it just spawned would be stranded permanently.
+			stopMenuBar()
 			os.Exit(1)
 		}
 	}()
@@ -324,6 +436,21 @@ func main() {
 					proxyLog.Warnf("http server shutdown error: %v", err)
 				}
 
+				// Tier listeners share the same handler/deadline as the main
+				// listener; shut them all down in parallel so N extra tiers
+				// don't multiply the shutdown budget.
+				var tierWG sync.WaitGroup
+				for _, tsrv := range tierServers {
+					tierWG.Add(1)
+					go func(tsrv *http.Server) {
+						defer tierWG.Done()
+						if err := tsrv.Shutdown(shutdownCtx); err != nil {
+							proxyLog.Warnf("tier http server shutdown error (%s): %v", tsrv.Addr, err)
+						}
+					}(tsrv)
+				}
+				tierWG.Wait()
+
 				// Clamp the remaining budget to a small positive value: a
 				// non-positive timeout makes the router fall back to its own
 				// healthCheckTimeout, which would defeat the shared deadline.
@@ -339,11 +466,7 @@ func main() {
 					perfMon.Stop()
 				}
 
-				if menuBarLauncher != nil {
-					if err := menuBarLauncher.Stop(); err != nil {
-						proxyLog.Warnf("menu-bar helper shutdown error: %v", err)
-					}
-				}
+				stopMenuBar()
 
 				close(exitChan)
 				return

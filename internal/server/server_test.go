@@ -28,7 +28,7 @@ type stubRouter struct {
 	unloadCalls   atomic.Int32
 	loggers       map[string]*logmon.Monitor
 	lastUseMap    map[string]time.Time
-	pinned        map[string]bool
+	pinned        map[string]time.Time // deadline; zero value = permanent pin
 }
 
 func newStubRouter(models []string, response string) *stubRouter {
@@ -65,15 +65,35 @@ func (s *stubRouter) ProcessLastUse(modelID string) (time.Time, bool) {
 	return time.Time{}, false
 }
 func (s *stubRouter) Pin(modelID string) {
+	s.PinWithTTL(modelID, 0)
+}
+func (s *stubRouter) PinWithTTL(modelID string, ttl time.Duration) time.Time {
 	if s.pinned == nil {
-		s.pinned = map[string]bool{}
+		s.pinned = map[string]time.Time{}
 	}
-	s.pinned[modelID] = true
+	var deadline time.Time
+	if ttl > 0 {
+		deadline = time.Now().Add(ttl)
+	}
+	s.pinned[modelID] = deadline
+	return deadline
 }
 func (s *stubRouter) Unpin(modelID string) {
 	delete(s.pinned, modelID)
 }
-func (s *stubRouter) IsPinned(modelID string) bool { return s.pinned[modelID] }
+func (s *stubRouter) IsPinned(modelID string) bool {
+	deadline, ok := s.pinned[modelID]
+	if !ok {
+		return false
+	}
+	return deadline.IsZero() || time.Now().Before(deadline)
+}
+func (s *stubRouter) PinExpiry(modelID string) (time.Time, bool) {
+	if !s.IsPinned(modelID) {
+		return time.Time{}, false
+	}
+	return s.pinned[modelID], true
+}
 
 // newTestServer wires a Server with stub routers and a built mux.
 func newTestServer(local router.LocalRouter, peer router.Router) *Server {

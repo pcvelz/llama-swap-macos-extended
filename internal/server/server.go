@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -14,6 +15,7 @@ import (
 	"github.com/mostlygeek/llama-swap/internal/config"
 	"github.com/mostlygeek/llama-swap/internal/logmon"
 	"github.com/mostlygeek/llama-swap/internal/perf"
+	"github.com/mostlygeek/llama-swap/internal/process"
 	"github.com/mostlygeek/llama-swap/internal/router"
 	"github.com/mostlygeek/llama-swap/internal/shared"
 )
@@ -125,7 +127,7 @@ func New(cfg config.Config, muxlog *logmon.Monitor, proxylog *logmon.Monitor, up
 		proxylog:    proxylog,
 		upstreamlog: upstreamlog,
 		perf:        perfMon,
-		inflight:    &inflightCounter{},
+		inflight:    newInflightCounter(tierNames(cfg.Tiers)),
 		metrics:     newMetricsMonitor(proxylog, cfg.MetricsMaxInMemory, cfg.CaptureBuffer),
 		build:       build,
 		local:       local,
@@ -157,8 +159,67 @@ func (s *Server) localPeerHandler(w http.ResponseWriter, r *http.Request) {
 		s.proxylog.Debugf("dispatch: using peer for model: %s", data.ModelID)
 		s.peer.ServeHTTP(w, r)
 	default:
+		// Resident-alias resolution: ids matching cfg.ResidentAliases (e.g.
+		// "claude-haiku-*" — Claude Code housekeeping and subagent
+		// orchestrator turns — or "default" — hook-layer analyze calls) are
+		// served by whichever local model is ALREADY resident. Only ready
+		// processes qualify: resolving to a non-resident model would trigger
+		// a load/swap, i.e. exactly the standing cross-model eviction
+		// pressure a static alias was rejected for. With nothing resident we
+		// fall through to the 404, which stays a cheap no-op for idle-time
+		// housekeeping. The rewritten context is what the local router's
+		// scheduler reads (FetchContext returns the stored context first),
+		// so FIFO ordering and KV admission apply to the RESOLVED model; the
+		// earlier per-model concurrency/filter middleware saw the alias id
+		// and deliberately did not apply — those are keyed to real model
+		// blocks, which an alias-only id never is.
+		if resolved, ok := resolveResidentAlias(s.cfg, s.local.RunningModels(), data.Model); ok {
+			s.proxylog.Debugf("dispatch: resident alias %s -> %s", data.Model, resolved)
+			data.ModelID = resolved
+			*r = *r.WithContext(shared.SetContext(r.Context(), data))
+			s.local.ServeHTTP(w, r)
+			return
+		}
 		shared.SendError(w, r, router.ErrNoRouterFound)
 	}
+}
+
+// resolveResidentAlias maps a request whose model id matches a configured
+// residentAliases pattern to the currently-resident local model. Returns
+// false when the id matches no pattern or no local process is ready — it
+// never causes a load. Pure function over its inputs so it is testable
+// without a Server.
+func resolveResidentAlias(cfg config.Config, running map[string]process.ProcessState, requested string) (string, bool) {
+	if !cfg.MatchesResidentAlias(requested) {
+		return "", false
+	}
+	ready := make([]string, 0, len(running))
+	for id, state := range running {
+		if state == process.StateReady {
+			ready = append(ready, id)
+		}
+	}
+	if len(ready) == 0 {
+		return "", false
+	}
+	// Deterministic tie-break when several models are resident (possible in
+	// multi-group configs): smallest id. Single-resident deployments never
+	// hit this.
+	sort.Strings(ready)
+	return ready[0], true
+}
+
+// tierNames returns the configured tier names (excluding the implicit
+// default), used to seed inflightCounter.perTier at construction.
+func tierNames(tiers map[string]config.TierConfig) []string {
+	if len(tiers) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(tiers))
+	for name := range tiers {
+		names = append(names, name)
+	}
+	return names
 }
 
 // stripVersionPrefix rewrites versionless /v/... requests to their /... form
@@ -177,10 +238,16 @@ func (s *Server) routes() {
 	modelChain := chain.New(
 		authMW,
 		CreateRequestContextMiddleware(s.cfg),
+		// Inflight counting runs BEFORE the per-model concurrency semaphore so
+		// a request parked waiting for a permit is counted as "waiting" in the
+		// per-tier numbers the menu bar shows (docs/intent/llama-swap-tiers.md
+		// "Known soft spot") — previously it only counted once the semaphore
+		// had already been acquired, hiding same-model semaphore contention
+		// from the tier breakdown entirely.
+		CreateInflightMiddleware(s.inflight),
 		CreateConcurrencyMiddleware(s.cfg),
 		CreateFilterMiddleware(s.cfg),
 		CreateFormFilterMiddleware(s.cfg),
-		CreateInflightMiddleware(s.inflight),
 		CreateMetricsMiddleware(s.metrics, s.cfg),
 	)
 	// Custom endpoints only need auth.

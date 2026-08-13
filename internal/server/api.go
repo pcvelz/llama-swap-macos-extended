@@ -135,8 +135,42 @@ func filterCappedMetadata(md map[string]any) map[string]any {
 }
 
 // handleListModels serves the OpenAI-compatible model listing: local models
-// (with optional aliases) plus peer models.
+// (with optional aliases) plus peer models. When the request is identified as
+// coming from an Anthropic client the SAME record set is encoded in the
+// Anthropic model-list envelope instead, so Claude Code's gateway discovery can
+// populate its /model picker. Identification: an `anthropic-version` header, OR
+// a User-Agent starting with "claude-code" (case-insensitive prefix).
+// WHY the UA check: Claude Code's actual gateway discovery call sends neither
+// anthropic-version nor x-api-key (witnessed 2026-07-22 in the llama-swap log:
+// "GET /v1/models" from UA "claude-code/2.1.217" returned the 919-byte OpenAI
+// envelope where the Anthropic envelope is 1533 bytes) - its User-Agent is the
+// only stable discriminator, and no OpenAI consumer of this endpoint
+// (curl/llama.cpp clients) identifies as claude-code. Negotiation deliberately
+// does NOT key on x-api-key: keyed OpenAI consumers may also send it, so OpenAI
+// clients keep getting the byte-identical OpenAI envelope.
 func (s *Server) handleListModels(w http.ResponseWriter, r *http.Request) {
+	records := s.collectModelRecords()
+
+	// Echo the Origin so browser clients can read the listing.
+	if origin := r.Header.Get("Origin"); origin != "" {
+		w.Header().Set("Access-Control-Allow-Origin", origin)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if r.Header.Get("anthropic-version") != "" ||
+		strings.HasPrefix(strings.ToLower(r.Header.Get("User-Agent")), "claude-code") {
+		s.writeAnthropicModelList(w, records)
+		return
+	}
+	json.NewEncoder(w).Encode(map[string]any{
+		"object": "list",
+		"data":   records,
+	})
+}
+
+// collectModelRecords builds the sorted OpenAI modelRecord list shared by both
+// listing envelopes (extraction keeps the OpenAI encoding path byte-identical).
+func (s *Server) collectModelRecords() []modelRecord {
 	created := time.Now().Unix()
 	data := make([]modelRecord, 0, len(s.cfg.Models))
 
@@ -182,17 +216,143 @@ func (s *Server) handleListModels(w http.ResponseWriter, r *http.Request) {
 	}
 
 	sort.Slice(data, func(i, j int) bool { return data[i].ID < data[j].ID })
+	return data
+}
 
-	// Echo the Origin so browser clients can read the listing.
-	if origin := r.Header.Get("Origin"); origin != "" {
-		w.Header().Set("Access-Control-Allow-Origin", origin)
+// anthropicModelEntry is one model in the Anthropic /v1/models envelope — the
+// shape Claude Code's gateway model discovery renders in its /model picker
+// (verified against macaz-cli internal/gateway/server.go:430).
+type anthropicModelEntry struct {
+	ID              string   `json:"id"`
+	Type            string   `json:"type"`
+	DisplayName     string   `json:"display_name"`
+	CreatedAt       string   `json:"created_at"`
+	Description     string   `json:"description,omitempty"`
+	Default         *bool    `json:"default,omitempty"`
+	Efforts         []string `json:"efforts,omitempty"`
+	InputModalities []string `json:"input_modalities,omitempty"`
+}
+
+// writeAnthropicModelList encodes the sorted records in the Anthropic
+// model-list envelope: {"data":[...], "has_more":false, "first_id", "last_id"}.
+func (s *Server) writeAnthropicModelList(w http.ResponseWriter, data []modelRecord) {
+	entries := make([]anthropicModelEntry, 0, len(data))
+	// seen maps a row's public ID to its index in entries, so an alias row
+	// already emitted from the record list (includeAliasesInList) can be
+	// REPLACED below by the metadata-enriched version rather than duplicated.
+	seen := make(map[string]int, len(data))
+	recByID := make(map[string]modelRecord, len(data))
+	for _, rec := range data {
+		recByID[rec.ID] = rec
+		seen[rec.ID] = len(entries)
+		entries = append(entries, s.anthropicEntry(rec.ID, rec, rec.ID))
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{
-		"object": "list",
-		"data":   data,
-	})
+	// Claude Code's /model picker only surfaces discovered models whose IDs
+	// start with "claude" (macaz-cli prefixes every public ID with
+	// "claude-macaz-" for exactly this reason), so our raw GGUF IDs
+	// (Qwen3.6-...) are dropped by the picker. llama-swap already routes
+	// /v1/messages by alias (the claude-haiku-* rewrite works this way), so
+	// emitting one row per alias whose ID starts with "claude"
+	// (case-insensitive) — inheriting the PARENT model's metadata — makes a
+	// picked claude-* alias reach the right child with ZERO routing changes.
+	// Non-claude shell aliases (cq35 etc.) are deliberately skipped so they
+	// stay out of the picker. Model IDs are iterated sorted for determinism
+	// (Go map order is random).
+	modelIDs := make([]string, 0, len(s.cfg.Models))
+	for id := range s.cfg.Models {
+		modelIDs = append(modelIDs, id)
+	}
+	sort.Strings(modelIDs)
+	for _, id := range modelIDs {
+		mc := s.cfg.Models[id]
+		if mc.Unlisted {
+			continue
+		}
+		rec, ok := recByID[id]
+		if !ok {
+			continue
+		}
+		for _, alias := range mc.Aliases {
+			alias = strings.TrimSpace(alias)
+			if alias == "" {
+				continue
+			}
+			if !strings.HasPrefix(strings.ToLower(alias), "claude") {
+				continue
+			}
+			if idx, dup := seen[alias]; dup {
+				// Alias already listed via the record pass (includeAliasesInList):
+				// enrich in place with the parent's Anthropic extras.
+				entries[idx] = s.anthropicEntry(alias, rec, id)
+				continue
+			}
+			seen[alias] = len(entries)
+			entries = append(entries, s.anthropicEntry(alias, rec, id))
+		}
+	}
+
+	// WHY a final full sort by id: alias rows are appended after the record
+	// pass, so re-sorting keeps entry order — and therefore first_id/last_id —
+	// deterministic regardless of how many alias rows were emitted.
+	sort.Slice(entries, func(i, j int) bool { return entries[i].ID < entries[j].ID })
+
+	resp := map[string]any{
+		"data":     entries,
+		"has_more": false, // single-shot listing; llama-swap never paginates
+	}
+	if len(entries) > 0 {
+		resp["first_id"] = entries[0].ID
+		resp["last_id"] = entries[len(entries)-1].ID
+	}
+	json.NewEncoder(w).Encode(resp)
+}
+
+// anthropicEntry builds one envelope row. id is the row's public ID (model ID
+// or alias); rec carries the shared name/description/created fields; parentID
+// keys the per-model config metadata lookup (== id for plain model rows, the
+// owning model's ID for alias rows).
+func (s *Server) anthropicEntry(id string, rec modelRecord, parentID string) anthropicModelEntry {
+	e := anthropicModelEntry{
+		ID:   id,
+		Type: "model",
+		// Fallback chain: explicit metadata override, then the configured
+		// display name, then the raw row ID.
+		DisplayName: rec.Name,
+		// Anthropic uses a string timestamp, not a unix int.
+		CreatedAt:   time.Unix(rec.Created, 0).UTC().Format(time.RFC3339),
+		Description: rec.Description,
+	}
+	// Per-model config carries the Anthropic extras, looked up by parent model
+	// ID inside the encoder (rather than threading ModelConfig through
+	// modelRecord) so the OpenAI record shape stays untouched. Guard with
+	// ok: peer models have no local config — omit extras for those.
+	if mc, ok := s.cfg.Models[parentID]; ok {
+		if v, ok := mc.Metadata["anthropic_display_name"].(string); ok && v != "" {
+			e.DisplayName = v
+		}
+		// Never default `default` to true silently — only emit when the
+		// operator explicitly set anthropic_default.
+		if v, ok := mc.Metadata["anthropic_default"].(bool); ok {
+			e.Default = &v
+		}
+		// yaml decodes a sequence into []any — convert and skip non-string
+		// entries rather than failing the whole listing.
+		if raw, ok := mc.Metadata["anthropic_efforts"].([]any); ok {
+			for _, item := range raw {
+				if str, ok := item.(string); ok {
+					e.Efforts = append(e.Efforts, str)
+				}
+			}
+		}
+		if len(mc.Capabilities.In) > 0 {
+			e.InputModalities = mc.Capabilities.In
+		}
+	}
+	if e.DisplayName == "" {
+		e.DisplayName = id
+	}
+	return e
 }
 
 // runningModel is one entry in the /running listing.

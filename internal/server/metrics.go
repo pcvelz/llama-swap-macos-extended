@@ -42,6 +42,10 @@ type ActivityLogEntry struct {
 	Tokens          TokenMetrics `json:"tokens"`
 	DurationMs      int          `json:"duration_ms"`
 	HasCapture      bool         `json:"has_capture"`
+	// Tier is the request's tier name (shared.TierFromContext), e.g.
+	// "default" or a configured tier's key. Always populated - an
+	// untagged request resolves to shared.DefaultTier.Name ("default").
+	Tier string `json:"tier"`
 }
 
 // ActivityLogEvent carries a single activity log entry to event subscribers.
@@ -135,6 +139,9 @@ func (mp *metricsMonitor) record(modelID string, r *http.Request, recorder *resp
 		RespContentType: recorder.Header().Get("Content-Type"),
 		RespStatusCode:  recorder.Status(),
 		DurationMs:      int(time.Since(recorder.StartTime()).Milliseconds()),
+		// Tier falls back to shared.DefaultTier.Name ("default") for any
+		// request that never passed through tier-wrapping.
+		Tier: shared.TierFromContext(r.Context()).Name,
 	}
 
 	queueAndEmit := func() {

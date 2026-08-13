@@ -53,12 +53,22 @@ type LocalRouter interface {
 	// ProcessLastUse returns the last-use time for the named model's process.
 	ProcessLastUse(modelID string) (time.Time, bool)
 
-	// Pin marks a model as pinned so the TTL goroutine will not idle-evict it.
+	// Pin marks a model as permanently pinned so the TTL goroutine will not
+	// idle-evict it. Equivalent to PinWithTTL(modelID, 0).
 	Pin(modelID string)
+
+	// PinWithTTL pins a model with a lease deadline (ttl <= 0 pins
+	// permanently, matching Pin). Returns the stored deadline (zero for a
+	// permanent pin). Re-pinning refreshes an existing lease's deadline.
+	PinWithTTL(modelID string, ttl time.Duration) time.Time
 
 	// Unpin removes a model's pin, re-enabling idle eviction.
 	Unpin(modelID string)
 
 	// IsPinned reports whether the model is currently pinned.
 	IsPinned(modelID string) bool
+
+	// PinExpiry reports the pin state and lease deadline for modelID. The
+	// deadline is the zero time.Time for a permanent pin.
+	PinExpiry(modelID string) (deadline time.Time, pinned bool)
 }

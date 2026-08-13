@@ -1726,7 +1726,7 @@ models:
 `
 		config, err := LoadConfigFromReader(strings.NewReader(content))
 		require.NoError(t, err)
-		assert.True(t, config.MenuBar)
+		assert.True(t, config.MenuBar.Enabled)
 	})
 
 	t.Run("menu_bar defaults to true (fork default)", func(t *testing.T) {
@@ -1737,7 +1737,7 @@ models:
 `
 		config, err := LoadConfigFromReader(strings.NewReader(content))
 		require.NoError(t, err)
-		assert.True(t, config.MenuBar)
+		assert.True(t, config.MenuBar.Enabled)
 	})
 
 	t.Run("menu_bar false opts out", func(t *testing.T) {
@@ -1749,6 +1749,6 @@ models:
 `
 		config, err := LoadConfigFromReader(strings.NewReader(content))
 		require.NoError(t, err)
-		assert.False(t, config.MenuBar)
+		assert.False(t, config.MenuBar.Enabled)
 	})
 }

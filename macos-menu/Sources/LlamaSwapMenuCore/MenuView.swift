@@ -32,7 +32,7 @@ public struct MenuView: View {
         // full opacity for readability.
         Text("\(state.completed) completed")
 
-        Text("\(state.waiting) waiting")
+        Text(state.waitingSummary)
 
         Text("Load")
             .foregroundStyle(.secondary)

@@ -1,0 +1,62 @@
+# tiers.example.yaml - tiered queue citizens
+# --------------------------------------------
+#
+# A tier is NOT a separate queue. The queue stays one uniform whole (the
+# single-goroutine FIFO scheduler in internal/router/scheduler). A tier IS an
+# EXTRA HTTP entry point (its own port) that tags every request arriving
+# through it with a rank BEFORE it joins the one shared queue. Which port a
+# consumer is pointed at pre-determines its place in line.
+#
+# Full design: docs/intent/llama-swap-tiers.md (llama-cm, the private
+# deployment repo that consumes this fork).
+#
+# The main `-listen` port (the one you already pass on the command line, or
+# leave at its :8080/:8443 default) is ALWAYS the implicit "default" tier —
+# rank 0. It is never declared here, so a config with no `tiers:` block at
+# all is byte-identical, single-listener behavior. Only declare the EXTRA
+# entry points you actually want.
+
+tiers:
+  # An arrival on the priority tier boots ANY running lower-rank request
+  # (default or background), never another priority request (preemption never
+  # crosses equal ranks).
+  priority:
+    listen: "127.0.0.1:8002"
+    rank: 10
+    preempts: true
+
+  # A request running on the background tier may be booted by ANY higher-rank
+  # arrival (default or priority) — it never boots anything itself.
+  background:
+    listen: "127.0.0.1:8003"
+    rank: -10
+    preemptible: true
+
+# Semantics recap (see docs/intent/llama-swap-tiers.md for the full spec):
+#
+#   1. Queue order: rank DESC, then the existing per-model
+#      `routing.scheduler.settings.fifo.priority`, then arrival order.
+#   2. Rank barrier: a queued request is never granted while a strictly
+#      higher-rank request is still queued — background work runs only once
+#      the priority + default queues are empty.
+#   3. Preemption rule: an arrival A that cannot be granted because of
+#      in-flight work boots a running request B iff
+#      rank(B) < rank(A) AND (B.preemptible OR A.preempts).
+#   4. "Booted back into the queue" (v1): server-side context cancel of the
+#      proxied upstream request, then a 503 with `X-LlamaSwap-Preempted: 1`
+#      + `Retry-After: 1`. Well-behaved clients (Claude Code, this fork's
+#      `dispatch.sh` never-give-up loop) retry, so the request re-enters the
+#      queue through its own tier port.
+#
+# Claude Code CLI stub - point a session at the priority tier's port instead
+# of the default llama-swap port:
+#
+#   ANTHROPIC_BASE_URL=http://127.0.0.1:8002 \
+#   ANTHROPIC_AUTH_TOKEN=local \
+#   claude --model qwen35 --dangerously-skip-permissions
+#
+# ...and a long-running background session at the background tier instead:
+#
+#   ANTHROPIC_BASE_URL=http://127.0.0.1:8003 \
+#   ANTHROPIC_AUTH_TOKEN=local \
+#   claude --model qwen35 --dangerously-skip-permissions

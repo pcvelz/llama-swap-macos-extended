@@ -4,6 +4,17 @@ public struct MenuState: Encodable {
     public var backendOnline = false
     public var completed = 0
     public var waiting = 0
+    /// Per-tier waiting breakdown (docs/intent/llama-swap-tiers.md, llama-cm).
+    /// Populated only when the backend's inflight event carried more than one
+    /// tier; empty otherwise, so a single-listener backend renders exactly as
+    /// before tiers existed.
+    public var waitingByTier: [String: Int] = [:]
+    /// When each waiting count ("" = total) last peaked, for the anti-flap hold.
+    private var heldSince: [String: Date] = [:]
+
+    /// Mirrors the config's swapGraceSeconds (600) — anti-flap display hold;
+    /// slot stability: llama-cm docs/intent/llama-swap-backend.md § Slot stability.
+    static let waitingHold: TimeInterval = 600
     public var models: [ModelRow] = []
     /// The model the user last picked. Kept after the switch completes: it is
     /// what makes `activeModelID` keep tracking their choice once several models
@@ -23,6 +34,40 @@ public struct MenuState: Encodable {
         MenuState.activeModel(in: models, preferring: chosenModelID)
     }
 
+    /// The waiting-count row text: a per-tier breakdown ("priority 2, default
+    /// 1 waiting") when more than one tier is in play, otherwise the plain
+    /// "N waiting" string unchanged from before tiers existed.
+    public var waitingSummary: String {
+        if waitingByTier.count > 1 {
+            let parts = waitingByTier.keys.sorted().map { "\($0) \(waitingByTier[$0] ?? 0)" }
+            return parts.joined(separator: ", ") + " waiting"
+        }
+        return "\(waiting) waiting"
+    }
+
+    /// Applies an inflight event through the anti-flap hold: rises show
+    /// immediately (and refresh the peak timestamp); drops only apply once the
+    /// count has not re-peaked for waitingHold. No flapping — slot stability.
+    public mutating func applyInflight(total: Int, byTier: [String: Int], now: Date = Date()) {
+        waiting = holdWaiting(key: "", held: waiting, raw: total, now: now)
+        var merged = byTier
+        for key in waitingByTier.keys where merged[key] == nil { merged[key] = 0 }
+        guard !merged.isEmpty else { return }
+        var held: [String: Int] = [:]
+        for (key, raw) in merged {
+            held[key] = holdWaiting(key: key, held: waitingByTier[key] ?? 0, raw: raw, now: now)
+        }
+        waitingByTier = held
+    }
+
+    private mutating func holdWaiting(key: String, held: Int, raw: Int, now: Date) -> Int {
+        if raw >= held || now.timeIntervalSince(heldSince[key] ?? .distantPast) > MenuState.waitingHold {
+            heldSince[key] = now
+            return raw
+        }
+        return held
+    }
+
     /// Several models can be ready at once, so "first ready row" is just config
     /// order. The user's chosen model wins; a starting model wins only when
     /// nothing is ready yet.
@@ -36,7 +81,7 @@ public struct MenuState: Encodable {
 
     // Hand-written so the debug snapshot still carries the derived activeModelID.
     private enum CodingKeys: String, CodingKey {
-        case backendOnline, completed, waiting, models, chosenModelID
+        case backendOnline, completed, waiting, waitingByTier, models, chosenModelID
         case pendingModelID, lastSwitchError, barValues, activeModelID
     }
 
@@ -45,6 +90,7 @@ public struct MenuState: Encodable {
         try c.encode(backendOnline, forKey: .backendOnline)
         try c.encode(completed, forKey: .completed)
         try c.encode(waiting, forKey: .waiting)
+        try c.encode(waitingByTier, forKey: .waitingByTier)
         try c.encode(models, forKey: .models)
         try c.encode(barValues, forKey: .barValues)
         try c.encodeIfPresent(chosenModelID, forKey: .chosenModelID)
@@ -106,4 +152,5 @@ struct EventEnvelope: Codable {
 
 struct InFlightStats: Codable {
     let total: Int
+    let byTier: [String: Int]?
 }

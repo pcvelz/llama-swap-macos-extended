@@ -27,6 +27,13 @@ type ReqContextData struct {
 	Streaming        bool
 	SendLoadingState bool
 
+	// Tier is the entry-point tier this request arrived through (see tier.go).
+	// Set from the request context at extraction time, which is itself tagged
+	// by the listener (llama-swap.go) before routing ever sees the request.
+	// DefaultTier for every request on the main listener / when no tiers are
+	// configured.
+	Tier Tier
+
 	// Body is the raw request body buffered once by extractContext (nil for
 	// GET requests, which carry no body). Downstream middleware (filters,
 	// metrics) reuse this instead of re-reading r.Body, so the body is only
@@ -113,6 +120,28 @@ func FetchContext(r *http.Request, cfg config.Config) (ReqContextData, error) {
 	return ReqContextData{}, ErrNoModelInContext
 }
 
+// EstimateTokens gives a cheap, conservative estimate of a request's context
+// size in tokens, from its already-buffered body — used only by KV-aware
+// admission (config.FifoConfig.KVPoolTokens / router/scheduler.FIFO.kvAdmit).
+// It is intentionally NOT a real tokenizer: this only needs to be a rough,
+// fast proxy the scheduler can use to decide whether to park a request behind
+// another, not an exact count.
+//
+// Rule: len(body) / 4. Four bytes/token is roughly the middle of the range
+// for mixed English prose (~4 chars/token) and code (denser, closer to
+// ~3 chars/token — lots of short symbols and whitespace). Dividing by 4
+// slightly UNDERestimates token count for code-heavy bodies and slightly
+// OVERestimates it for prose-heavy ones; there is no single constant that is
+// exact for both. This is a known, accepted limitation: the estimate only
+// needs to keep two large concurrent requests from being admitted together
+// when they'd actually oversubscribe the KV pool, and gets checked against
+// reality by whatever headroom the configured kvPoolTokens leaves under the
+// server's real --ctx-size. An empty/absent body (GET requests) estimates 0,
+// which never blocks admission on its own.
+func EstimateTokens(body []byte) int {
+	return len(body) / 4
+}
+
 func SetContext(ctx context.Context, data ReqContextData) context.Context {
 	return context.WithValue(ctx, ReqContextKey, data)
 }
@@ -138,6 +167,7 @@ func extractContext(r *http.Request) (ReqContextData, error) {
 			Model:     q.Get("model"),
 			Streaming: q.Get("stream") == "true",
 			ApiKey:    apiKey,
+			Tier:      TierFromContext(r.Context()),
 		}, nil
 	}
 
@@ -157,6 +187,7 @@ func extractContext(r *http.Request) (ReqContextData, error) {
 			Streaming: gjson.GetBytes(bodyBytes, "stream").Bool(),
 			ApiKey:    apiKey,
 			Body:      bodyBytes,
+			Tier:      TierFromContext(r.Context()),
 		}, nil
 	}
 
@@ -179,6 +210,7 @@ func extractContext(r *http.Request) (ReqContextData, error) {
 		Streaming: r.FormValue("stream") == "true",
 		ApiKey:    apiKey,
 		Body:      bodyBytes,
+		Tier:      TierFromContext(r.Context()),
 	}, nil
 }
 
