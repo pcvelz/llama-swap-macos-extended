@@ -26,12 +26,23 @@ test-dev:
 	go test -short ./...
 	staticcheck ./... || true
 
-test:
+test: ensure-simple-responder
 	go test -short -count=1 ./internal/...
 
 # for CI - full test (takes longer)
-test-all:
+test-all: ensure-simple-responder
 	go test -race -count=1 ./internal/...
+
+# internal/process tests silently SKIP (not fail) when the simple-responder
+# helper binary is missing, so a bare `make test`/`make test-all` can look
+# green while doing nothing. Build it only if it's not already there, so CI's
+# cache-restore step (see .github/workflows/go-ci*.yml) is still respected.
+ensure-simple-responder:
+	@if [ "$$(go env GOOS)" = "windows" ]; then \
+		test -f $(BUILD_DIR)/simple-responder.exe || $(MAKE) simple-responder-windows; \
+	else \
+		test -f $(BUILD_DIR)/simple-responder_$$(go env GOOS)_$$(go env GOARCH) || $(MAKE) simple-responder; \
+	fi
 
 ui/node_modules:
 	cd ui-svelte && npm install
@@ -120,5 +131,5 @@ test-mac-menu:
 	cd macos-menu && swift test
 
 # Phony targets
-.PHONY: all clean ui mac mac-menu tray windows simple-responder simple-responder-windows test test-all test-dev test-ui test-mac-menu wol-proxy
+.PHONY: all clean ui mac mac-menu tray windows simple-responder simple-responder-windows ensure-simple-responder test test-all test-dev test-ui test-mac-menu wol-proxy
 .PHONE: linux linux-arm64 linux-amd64
