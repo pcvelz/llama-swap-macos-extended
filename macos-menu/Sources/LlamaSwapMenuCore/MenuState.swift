@@ -143,7 +143,17 @@ struct SysStat: Codable {
     }
 }
 
-struct ActivityLogEntry: Codable {}
+/// Decodes GET /api/metrics/stats — the aggregate activity-stats object that
+/// replaced the old bare-array GET /api/metrics endpoint. Only the total
+/// request count is needed for the "N completed" badge; the histogram fields
+/// are intentionally left undecoded.
+struct ActivityStats: Codable {
+    let totalRequests: Int
+
+    enum CodingKeys: String, CodingKey {
+        case totalRequests = "total_requests"
+    }
+}
 
 struct EventEnvelope: Codable {
     let type: String

@@ -129,18 +129,23 @@ func (c *Client) fetchPerformance(ctx context.Context) (perfResponse, error) {
 	return out, nil
 }
 
-// fetchCompletedCount counts entries in the activity log, mirroring the
-// macOS helper's "N completed" readout.
+// fetchCompletedCount reads the aggregate total request count, mirroring the
+// macOS helper's "N completed" readout. GET /api/metrics/activity is
+// paginated (sqlite-backed, default page size 25) - counting its "data" array
+// would report a page size, not a true total. /api/metrics/stats carries the
+// aggregate total_requests count directly.
 func (c *Client) fetchCompletedCount(ctx context.Context) (int, error) {
-	body, err := c.get(ctx, "/api/metrics")
+	body, err := c.get(ctx, "/api/metrics/stats")
 	if err != nil {
 		return 0, err
 	}
-	var entries []json.RawMessage
-	if err := json.Unmarshal(body, &entries); err != nil {
+	var stats struct {
+		TotalRequests int `json:"total_requests"`
+	}
+	if err := json.Unmarshal(body, &stats); err != nil {
 		return 0, err
 	}
-	return len(entries), nil
+	return stats.TotalRequests, nil
 }
 
 func (c *Client) get(ctx context.Context, path string) ([]byte, error) {

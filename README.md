@@ -1,4 +1,7 @@
-![llama-swap header image](docs/assets/hero3.webp)
+![llama-swap header image](docs/assets/hero4.webp)
+![GitHub Downloads (all assets, all releases)](https://img.shields.io/github/downloads/mostlygeek/llama-swap/total)
+![GitHub Actions Workflow Status](https://img.shields.io/github/actions/workflow/status/mostlygeek/llama-swap/go-ci.yml)
+![GitHub Repo stars](https://img.shields.io/github/stars/mostlygeek/llama-swap)
 
 # llama-swap (macos-extended fork)
 
@@ -244,8 +247,7 @@ llama-swap-tray -base-url http://my-server:8080 -bars cpu,ram
 ## Features
 
 - ✅ Easy to deploy and configure: one binary, one configuration file. no external dependencies
-- ✅ On-demand model switching
-- ✅ Use any local OpenAI compatible server (llama.cpp, vllm, tabbyAPI, stable-diffusion.cpp, etc.)
+- ✅ On-demand model switching for many local AI servers (llama.cpp + forks, vllm, stable-diffusion.cpp, audio.cpp, ComfyUI, etc.)
   - future proof, upgrade your inference servers at any time.
 - ✅ OpenAI API supported endpoints:
   - `v1/completions`
@@ -265,16 +267,23 @@ llama-swap-tray -base-url http://my-server:8080 -bars cpu,ram
   - `v1/rerank`, `v1/reranking`, `/rerank`
   - `/infill` - for code infilling
   - `/completion` - for completion endpoint
+  - `/models` - list available models. same behavior as `v1/models`
+  - `/props` - requires `?model={model_id}` query parameter to be provided. The autoload parameter is not supported and will be ignored.
 - ✅ SDAPI via [stable-diffusion.cpp's server](https://github.com/leejet/stable-diffusion.cpp/tree/master/examples/server)
   - `/sdapi/v1/txt2img`
   - `/sdapi/v1/img2img`
   - `/sdapi/v1/loras` - requires `model` in request body to fetch the correct loras
+- ✅ [audio.cpp](https://github.com/0xShug0/audio.cpp) supported [extra endpoints](https://github.com/0xShug0/audio.cpp/blob/main/app/server/README.md#post-v1tasksrun)
+  - `/audioapi/v1/tasks/run`
+- ✅ `/comfyui/` - ComfyUI custom endpoint ([#1001](https://github.com/mostlygeek/llama-swap/issues/1001)) for more reliable swapping
 - ✅ llama-swap API
   - `/ui` - web UI
-  - `/upstream/:model_id` - direct access to upstream server ([demo](https://github.com/mostlygeek/llama-swap/pull/31))
+  - `/upstream/:model_id` - direct access to upstream server ([demo](https://github.com/mostlygeek/llama-swap/pull/31))  
   - `/running` - list currently running models ([#61](https://github.com/mostlygeek/llama-swap/issues/61))
   - `POST /api/models/unload` - manually unload all running models ([#58](https://github.com/mostlygeek/llama-swap/issues/58))
   - `POST /api/models/unload/:model_id` - unload a specific model
+  - `GET /api/profiles` - list configured profiles and the active selection
+  - `PUT /api/profiles/active` - activate a profile or select none
   - `/logs` - remote log monitoring
     - `GET /logs` returns buffered plain text logs.
       - If `Accept: text/html` is sent, `/logs` redirects to `/ui/`.
@@ -286,7 +295,8 @@ llama-swap-tray -base-url http://my-server:8080 -bars cpu,ram
   - `/health` - just returns "OK"
   - `/metrics` - system and GPU metrics for prometheus
 - ✅ API Key support - define keys to restrict access to API endpoints
-- ✅ Customizable
+- ✅ Customization
+  - Switch model ID routing at runtime with profiles
   - Run concurrent models with a custom DSL swap matrix ([#643](https://github.com/mostlygeek/llama-swap/issues/643))
   - Automatic unloading of models after timeout by setting a `ttl`
   - Docker and Podman support using `cmd` and `cmdStop` together
@@ -298,23 +308,128 @@ llama-swap-tray -base-url http://my-server:8080 -bars cpu,ram
 
 llama-swap includes a real time web interface with a playground for testing out all sorts of local models:
 
-<img width="1125" height="876" alt="image" src="https://github.com/user-attachments/assets/8ee41947-97af-463d-b0f0-8e9c478fac07" />
+<img width="1094" height="667" alt="image" src="https://github.com/user-attachments/assets/a79b3cea-5ee1-45f1-8db9-5f5331690e64" />
 
 View detailed token metrics:
 
-<img width="1111" height="515" alt="image" src="https://github.com/user-attachments/assets/64bfb280-d7a3-4126-971a-a128fd40410c" />
+<img width="1090" height="672" alt="image" src="https://github.com/user-attachments/assets/145f4ece-af2f-4a45-a3c1-45ae5d3c7e7f" />
 
 Inspect request and responses:
 
-<img width="1111" height="720" alt="image" src="https://github.com/user-attachments/assets/24fe4aca-1448-4d7c-b9e8-a967589bda6c" />
+<img width="1078" height="668" alt="image" src="https://github.com/user-attachments/assets/947cda4f-9aa1-4fa5-a550-5c469968c1d9" />
 
 Manually load and unload models:
 
-<img width="1109" height="719" alt="image" src="https://github.com/user-attachments/assets/02b1e1f2-abd0-4050-84ae-facd66ff01c4" />
+<img width="1088" height="659" alt="image" src="https://github.com/user-attachments/assets/b6b850f3-c5b0-4c14-ba90-be2de25b51c7" />
 
 Real time log streaming:
 
-<img width="1107" height="559" alt="image" src="https://github.com/user-attachments/assets/39669a10-cff2-409e-836a-5bad8bd0140c" />
+<img width="1087" height="668" alt="image" src="https://github.com/user-attachments/assets/9bb0c362-862c-4e68-820c-4c977fc9de4e" />
+
+<details>
+<summary>
+Installing upstream llama-swap directly (Docker, Homebrew, MacPorts, WinGet, building from source)
+</summary>
+
+These methods track [mostlygeek/llama-swap](https://github.com/mostlygeek/llama-swap) upstream, not this fork - they get you plain llama-swap without the menu-bar/tray helper. Use the installers above if you want the fork's desktop companion.
+
+#### Docker Install ([download images](https://github.com/mostlygeek/llama-swap/pkgs/container/llama-swap))
+
+Two types of container images are built nightly for llama-swap:
+
+1. A unified container with llama-server, ik-llama-server, stable-diffusion.cpp, whisper.cpp and llama-swap built from source. This is only available for cuda and vulkan but has more capabilities. This one is recommended for use.
+2. A legacy image that is based on llama.cpp's images and llama-swap copied into the container. Use this one if you prefer to stay close to llama.cpp's container images.
+
+##### Unified container (Recommended)
+
+```shell
+$ docker pull ghcr.io/mostlygeek/llama-swap:unified-cuda
+
+# run with a custom configuration and models directory
+$ docker run -it --rm --runtime nvidia -p 9292:8080 \
+ -v /path/to/models:/models \
+ -v /path/to/custom/config.yaml:/etc/llama-swap/config/config.yaml \
+ ghcr.io/mostlygeek/llama-swap:unified-cuda
+```
+
+##### Legacy container
+
+```shell
+$ docker pull ghcr.io/mostlygeek/llama-swap:cuda
+
+# run with a custom configuration and models directory
+$ docker run -it --rm --runtime nvidia -p 9292:8080 \
+ -v /path/to/models:/models \
+ -v /path/to/custom/config.yaml:/app/config.yaml \
+ ghcr.io/mostlygeek/llama-swap:cuda
+```
+
+<details>
+<summary>
+more examples
+</summary>
+
+```shell
+# pull latest images per platform
+docker pull ghcr.io/mostlygeek/llama-swap:cpu
+docker pull ghcr.io/mostlygeek/llama-swap:cuda
+docker pull ghcr.io/mostlygeek/llama-swap:vulkan
+docker pull ghcr.io/mostlygeek/llama-swap:intel
+docker pull ghcr.io/mostlygeek/llama-swap:musa
+
+# tagged llama-swap, platform and llama-server version images
+docker pull ghcr.io/mostlygeek/llama-swap:v166-cuda-b6795
+
+# non-root cuda
+docker pull ghcr.io/mostlygeek/llama-swap:cuda-non-root
+
+```
+
+</details>
+
+#### Homebrew Install (macOS/Linux)
+
+```shell
+brew tap mostlygeek/llama-swap
+brew install llama-swap
+llama-swap --config path/to/config.yaml --listen localhost:8080
+```
+
+#### MacPorts (macOS)
+
+> [!NOTE]
+> Maintained by MacPorts community - [llama-swap port](https://ports.macports.org/port/llama-swap). It is not an official part of llama-swap.
+
+```shell
+sudo port install llama-swap
+llama-swap --config path/to/config.yaml --listen localhost:8080
+```
+
+#### WinGet Install (Windows)
+
+> [!NOTE]
+> WinGet is maintained by community contributor [Dvd-Znf](https://github.com/Dvd-Znf) ([#327](https://github.com/mostlygeek/llama-swap/issues/327)). It is not an official part of llama-swap.
+
+```shell
+# install
+C:\> winget install llama-swap
+
+# upgrade
+C:\> winget upgrade llama-swap
+```
+
+#### Pre-built Binaries (upstream)
+
+Binaries are available on the [release](https://github.com/mostlygeek/llama-swap/releases) page for Linux, Mac, Windows and FreeBSD.
+
+#### Building from source (upstream)
+
+1. Building requires Go and Node.js (for UI).
+1. `git clone https://github.com/mostlygeek/llama-swap.git`
+1. `make clean all`
+1. look in the `build/` subdirectory for the llama-swap binary
+
+</details>
 
 ## How does llama-swap work?
 

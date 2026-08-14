@@ -1,6 +1,7 @@
 package scheduler
 
 import (
+	"context"
 	"errors"
 	"io"
 	"testing"
@@ -9,6 +10,7 @@ import (
 	"github.com/mostlygeek/llama-swap/internal/config"
 	"github.com/mostlygeek/llama-swap/internal/logmon"
 	"github.com/mostlygeek/llama-swap/internal/process"
+	"github.com/mostlygeek/llama-swap/internal/swaputil"
 )
 
 // FIFO methods all run on the router's single run-loop goroutine, so these
@@ -52,8 +54,9 @@ type stopRec struct {
 // fakeEffects is an in-memory scheduler.Effects. Tests program process states
 // and GrantServe outcomes, then assert on the recorded calls.
 type fakeEffects struct {
-	states      map[string]process.ProcessState // model -> state; missing => not handled
-	serveResult map[string]bool                 // GrantServe return per model (default true)
+	states       map[string]process.ProcessState // model -> state; missing => not handled
+	serveResult  map[string]bool                 // GrantServe return per model (default true)
+	lastServeReq HandlerReq
 
 	starts []startRec
 	grants []grantRec
@@ -96,6 +99,7 @@ func (f *fakeEffects) GrantServe(req HandlerReq, modelID string) bool {
 	if v, set := f.serveResult[modelID]; set {
 		ok = v
 	}
+	f.lastServeReq = req
 	f.grants = append(f.grants, grantRec{model: modelID, serve: ok})
 	return ok
 }
@@ -142,62 +146,91 @@ func newFIFO(planner Swapper, eff Effects) *FIFO {
 }
 
 // newFIFOGrace builds a FIFO with a controllable clock (*clk) and per-model
-// swap-grace, for deterministic grace tests.
+// swap-grace, for deterministic grace tests. The grace seconds are threaded
+// through the model config, the way production resolves them.
 func newFIFOGrace(planner Swapper, eff Effects, grace map[string]time.Duration, clk *time.Time) *FIFO {
-	s := NewFIFO("test", logmon.NewWriter(io.Discard), planner, config.FifoConfig{}, grace, eff)
+	models := make(map[string]config.ModelConfig, len(grace))
+	for id, g := range grace {
+		models[id] = config.ModelConfig{SwapGraceSeconds: int(g / time.Second)}
+	}
+	s := NewFIFO("test", logmon.NewWriter(io.Discard), planner, config.FifoConfig{}, models, eff)
 	s.now = func() time.Time { return *clk }
 	return s
 }
 
-func req(model string) HandlerReq { return HandlerReq{Model: model} }
+func req(model string) HandlerReq {
+	return HandlerReq{
+		Model: model,
+		Ctx:   context.Background(),
+		Admit: make(chan error, 1),
+	}
+}
 
 // reqCh creates a HandlerReq with a unique Respond channel so OnCancel can
 // identify it among queued requests and swap waiters.
 func reqCh(model string) HandlerReq {
-	return HandlerReq{
-		Model:   model,
-		Respond: make(chan HandlerResp, 1),
+	r := req(model)
+	r.Respond = make(chan HandlerResp, 1)
+	return r
+}
+
+func admitErr(t *testing.T, req HandlerReq) error {
+	t.Helper()
+	select {
+	case err := <-req.Admit:
+		return err
+	default:
+		t.Fatal("admission result not sent")
+		return nil
 	}
 }
 
-// TestFIFO_SwapGrace asserts a competing request does NOT evict a model still
-// inside its swap-grace window, and that the swap proceeds (via OnTick) once the
-// grace elapses with the model idle.
-func TestFIFO_SwapGrace(t *testing.T) {
-	eff := newFakeEffects()
-	eff.states["a"] = process.StateReady
-	eff.states["b"] = process.StateStopped
-	clk := time.Unix(1000, 0)
-	grace := map[string]time.Duration{"a": 60 * time.Second}
-	s := newFIFOGrace(&stubPlanner{evict: map[string][]string{"b": {"a"}}}, eff, grace, &clk)
+func assertAdmitted(t *testing.T, req HandlerReq) {
+	t.Helper()
+	if err := admitErr(t, req); err != nil {
+		t.Fatalf("admission err=%v want nil", err)
+	}
+}
 
-	// a serves and finishes -> its idle clock starts now.
-	s.OnRequest(req("a"))
-	s.OnServeDone(ServeDoneEvent{ModelID: "a"})
+// assertParkedAtCapacity is this fork's replacement for upstream's
+// assertAdmission429: an over-capacity request is still ADMITTED (nothing is
+// written to the client) and parked in the queue until a serving slot frees.
+// See FIFO.admit / FIFO.atCapacity for why waiting beats 429 here.
+func assertParkedAtCapacity(t *testing.T, s *FIFO, req HandlerReq) {
+	t.Helper()
+	assertAdmitted(t, req)
+	for _, q := range s.queued {
+		if q.Admit == req.Admit {
+			return
+		}
+	}
+	t.Fatalf("request for %s not parked in the queue (len=%d)", req.Model, len(s.queued))
+}
 
-	// b arrives 10s later: a is only 10s idle (< 60s) -> deferred, no swap.
-	clk = clk.Add(10 * time.Second)
-	s.OnRequest(reqCh("b"))
-	if got := eff.startsFor("b"); got != 0 {
-		t.Fatalf("b should be deferred within a's grace; got %d swap starts", got)
+func TestFIFO_SendAdmission_CancelledContextWins(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	r := HandlerReq{
+		Ctx:   ctx,
+		Admit: make(chan error, 1),
 	}
 
-	// A tick at 59s idle still defers.
-	clk = clk.Add(49 * time.Second)
-	s.OnTick()
-	if got := eff.startsFor("b"); got != 0 {
-		t.Fatalf("b should still be deferred at 59s idle; got %d swap starts", got)
+	if sendAdmission(r, nil) {
+		t.Fatal("sendAdmission returned true for cancelled request")
 	}
+	select {
+	case err := <-r.Admit:
+		t.Fatalf("admission sent after cancellation: %v", err)
+	default:
+	}
+}
 
-	// Past 60s idle, a tick starts the swap evicting a.
-	clk = clk.Add(2 * time.Second)
-	s.OnTick()
-	if got := eff.startsFor("b"); got != 1 {
-		t.Fatalf("b should swap once a's grace elapsed; got %d swap starts", got)
-	}
-	last := eff.starts[len(eff.starts)-1]
-	if !containsString(last.evict, "a") {
-		t.Fatalf("swap for b should evict a; got evict=%v", last.evict)
+func TestFIFO_SendAdmission_NilAdmitPreservesExistingBehavior(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if !sendAdmission(HandlerReq{Ctx: ctx}, nil) {
+		t.Fatal("nil Admit should preserve existing accepted behavior")
 	}
 }
 
@@ -216,20 +249,42 @@ func TestFIFO_FastPath(t *testing.T) {
 	}
 }
 
+func TestFIFO_GrantSetsPriorityMetadata(t *testing.T) {
+	eff := newFakeEffects()
+	eff.states["a"] = process.StateReady
+	cfg := config.FifoConfig{Priority: map[string]int{"a": 7}}
+	s := NewFIFO("test", logmon.NewWriter(io.Discard), &stubPlanner{}, cfg, nil, eff)
+
+	ctx := swaputil.SetContext(context.Background(), swaputil.ReqContextData{ModelID: "a", Metadata: make(map[string]string)})
+	s.OnRequest(HandlerReq{Model: "a", Ctx: ctx})
+
+	if got := eff.served("a"); got != 1 {
+		t.Fatalf("served(a)=%d want 1", got)
+	}
+	data, ok := swaputil.ReadContext(eff.lastServeReq.Ctx)
+	if !ok {
+		t.Fatal("context data missing from granted request")
+	}
+	if data.Metadata["fifo_priority"] != "7" {
+		t.Errorf("fifo_priority = %q, want 7", data.Metadata["fifo_priority"])
+	}
+}
+
 func TestFIFO_ModelNotFound(t *testing.T) {
 	eff := newFakeEffects() // no states => model unknown
 	s := newFIFO(&stubPlanner{}, eff)
 
-	s.OnRequest(req("ghost"))
+	r := req("ghost")
+	s.OnRequest(r)
 
 	if got := len(eff.starts); got != 0 {
 		t.Errorf("StartSwap calls=%d want 0", got)
 	}
-	if eff.errored("ghost") != 1 {
-		t.Fatalf("want 1 error grant for ghost, grants=%+v", eff.grants)
+	if got := eff.errored("ghost"); got != 0 {
+		t.Fatalf("error grants=%d want 0 for admission rejection", got)
 	}
-	if !errors.Is(eff.grants[0].err, ErrModelNotFound) {
-		t.Errorf("err=%v want ErrModelNotFound", eff.grants[0].err)
+	if err := admitErr(t, r); !errors.Is(err, ErrModelNotFound) {
+		t.Errorf("admission err=%v want ErrModelNotFound", err)
 	}
 }
 
@@ -678,6 +733,329 @@ func TestFIFO_OnCancel_NotPresent(t *testing.T) {
 	}
 	if len(s.queued) != 0 {
 		t.Errorf("queue should be empty, len=%d", len(s.queued))
+	}
+}
+
+// newFIFOWithLimit builds a FIFO whose single model has the given concurrency
+// limit, already in StateReady so every request exercises the fast path.
+func newFIFOWithLimit(t *testing.T, model string, limit int) (*FIFO, *fakeEffects) {
+	t.Helper()
+	eff := newFakeEffects()
+	eff.states[model] = process.StateReady
+	models := map[string]config.ModelConfig{
+		model: {ConcurrencyLimit: limit},
+	}
+	s := NewFIFO("test", logmon.NewWriter(io.Discard), &stubPlanner{}, config.FifoConfig{}, models, eff)
+	return s, eff
+}
+
+// TestFIFO_ConcurrencyLimit_ParksOverLimit is this fork's counterpart to
+// upstream's TestFIFO_ConcurrencyLimit_RejectsOverLimit: a request arriving
+// while the model is at capacity is NOT bounced with a 429 — it parks in the
+// queue and is served as soon as a slot frees (see FIFO.admit for the
+// rationale).
+func TestFIFO_ConcurrencyLimit_ParksOverLimit(t *testing.T) {
+	s, eff := newFIFOWithLimit(t, "a", 1)
+
+	// First request: served (inFlight 0 → 1).
+	r1 := req("a")
+	s.OnRequest(r1)
+	assertAdmitted(t, r1)
+	if got := eff.served("a"); got != 1 {
+		t.Fatalf("served(a)=%d want 1", got)
+	}
+
+	// Second request while the slot is occupied: parked, not rejected.
+	r2 := req("a")
+	s.OnRequest(r2)
+	assertParkedAtCapacity(t, s, r2)
+	if got := eff.errored("a"); got != 0 {
+		t.Fatalf("errored(a)=%d want 0 (over-limit waits, never errors)", got)
+	}
+	if got := eff.served("a"); got != 1 {
+		t.Fatalf("served(a)=%d want 1 while the slot is still held", got)
+	}
+
+	// When the in-flight request finishes, the parked one is served.
+	s.OnServeDone(ServeDoneEvent{ModelID: "a"})
+	if got := eff.served("a"); got != 2 {
+		t.Fatalf("served(a)=%d want 2 after the slot freed", got)
+	}
+	if len(s.queued) != 0 {
+		t.Fatalf("queue should have drained, len=%d", len(s.queued))
+	}
+}
+
+// TestFIFO_ConcurrencyLimit_ExemptRequestBypassesCap covers the count_tokens
+// exemption re-homed from the deleted internal/server concurrency middleware:
+// a tokenize-only request holds no model slot, so it is served immediately even
+// when the model is at its cap.
+func TestFIFO_ConcurrencyLimit_ExemptRequestBypassesCap(t *testing.T) {
+	s, eff := newFIFOWithLimit(t, "a", 1)
+
+	s.OnRequest(req("a")) // occupies the only slot
+	if got := eff.served("a"); got != 1 {
+		t.Fatalf("served(a)=%d want 1", got)
+	}
+
+	exempt := req("a")
+	exempt.ConcurrencyExempt = true
+	s.OnRequest(exempt)
+	assertAdmitted(t, exempt)
+	if got := eff.served("a"); got != 2 {
+		t.Fatalf("served(a)=%d want 2 (count_tokens must not wait for a slot)", got)
+	}
+	if len(s.queued) != 0 {
+		t.Fatalf("exempt request must not park, queue len=%d", len(s.queued))
+	}
+}
+
+// TestFIFO_ConcurrencyLimit_DefaultIsTen verifies that a model without an
+// explicit ConcurrencyLimit gets the default cap of 10.
+func TestFIFO_ConcurrencyLimit_DefaultIsTen(t *testing.T) {
+	eff := newFakeEffects()
+	eff.states["a"] = process.StateReady
+	// nil models → every model gets defaultConcurrencyLimit (10).
+	s := newFIFO(&stubPlanner{}, eff)
+
+	for i := 0; i < 10; i++ {
+		r := req("a")
+		s.OnRequest(r)
+		assertAdmitted(t, r)
+	}
+	if got := eff.served("a"); got != 10 {
+		t.Fatalf("served(a)=%d want 10 (default limit)", got)
+	}
+
+	// 11th request parks (fork behaviour; upstream rejects it with 429).
+	r := req("a")
+	s.OnRequest(r)
+	assertParkedAtCapacity(t, s, r)
+	if got := eff.errored("a"); got != 0 {
+		t.Fatalf("errored(a)=%d want 0 (over default limit waits, never errors)", got)
+	}
+}
+
+// TestFIFO_ConcurrencyLimit_CustomLimit verifies a ConcurrencyLimit greater
+// than zero overrides the default.
+func TestFIFO_ConcurrencyLimit_CustomLimit(t *testing.T) {
+	s, eff := newFIFOWithLimit(t, "a", 2)
+
+	r1 := req("a")
+	r2 := req("a")
+	r3 := req("a")
+	s.OnRequest(r1)
+	s.OnRequest(r2)
+	s.OnRequest(r3)
+	assertAdmitted(t, r1)
+	assertAdmitted(t, r2)
+	assertParkedAtCapacity(t, s, r3)
+
+	if got := eff.served("a"); got != 2 {
+		t.Fatalf("served(a)=%d want 2 (custom limit)", got)
+	}
+	if got := eff.errored("a"); got != 0 {
+		t.Fatalf("errored(a)=%d want 0 (over custom limit waits, never errors)", got)
+	}
+}
+
+// TestFIFO_ConcurrencyLimit_SwapWaiters verifies that when more swap waiters
+// exist than the concurrency limit, the excess waiter is re-queued when the
+// swap completes (upstream instead rejects it with a 429 at admission) and is
+// served once a slot frees.
+func TestFIFO_ConcurrencyLimit_SwapWaiters(t *testing.T) {
+	eff := newFakeEffects()
+	eff.states["a"] = process.StateStopped
+	models := map[string]config.ModelConfig{
+		"a": {ConcurrencyLimit: 2},
+	}
+	s := NewFIFO("test", logmon.NewWriter(io.Discard), &stubPlanner{}, config.FifoConfig{}, models, eff)
+
+	// Three requests arrive while model is loading: one starts swap, two join.
+	r1 := req("a")
+	r2 := req("a")
+	r3 := req("a")
+	s.OnRequest(r1)
+	s.OnRequest(r2)
+	s.OnRequest(r3)
+	assertAdmitted(t, r1)
+	assertAdmitted(t, r2)
+	assertAdmitted(t, r3)
+
+	if got := eff.startsFor("a"); got != 1 {
+		t.Fatalf("StartSwap(a)=%d want 1", got)
+	}
+	if sw := s.active["a"]; len(sw.waiters) != 3 {
+		t.Fatalf("waiters=%d want 3 (every admitted request joins the swap)", len(sw.waiters))
+	}
+
+	// Swap completes: only two waiters fit the cap, the third is re-queued.
+	eff.states["a"] = process.StateReady
+	s.OnSwapDone(SwapDone{ModelID: "a"})
+
+	if got := eff.served("a"); got != 2 {
+		t.Fatalf("served(a)=%d want 2", got)
+	}
+	if got := eff.errored("a"); got != 0 {
+		t.Fatalf("errored(a)=%d want 0 (excess waiter waits, never errors)", got)
+	}
+	if len(s.queued) != 1 {
+		t.Fatalf("excess waiter should be queued, len=%d", len(s.queued))
+	}
+
+	// A slot frees: the re-queued waiter is served.
+	s.OnServeDone(ServeDoneEvent{ModelID: "a"})
+	if got := eff.served("a"); got != 3 {
+		t.Fatalf("served(a)=%d want 3 after a slot freed", got)
+	}
+	if len(s.queued) != 0 {
+		t.Fatalf("queue should have drained, len=%d", len(s.queued))
+	}
+}
+
+// TestFIFO_ConcurrencyLimit_QueuedWaitersDoNotReserveCapacity: upstream
+// reserves a slot at admission time (so a queued request can 429 a later
+// arrival); this fork counts only requests actually in flight, so every
+// arrival queues and the cap is applied at grant time.
+func TestFIFO_ConcurrencyLimit_QueuedWaitersDoNotReserveCapacity(t *testing.T) {
+	eff := newFakeEffects()
+	eff.states["a"] = process.StateStopped
+	eff.states["b"] = process.StateStopped
+	models := map[string]config.ModelConfig{
+		"a": {ConcurrencyLimit: 2},
+		"b": {},
+	}
+	s := NewFIFO("test", logmon.NewWriter(io.Discard), &stubPlanner{evict: map[string][]string{"a": {"b"}}}, config.FifoConfig{}, models, eff)
+
+	bReq := req("b")
+	aReq1 := req("a")
+	aReq2 := req("a")
+	aReq3 := req("a")
+
+	s.OnRequest(bReq)  // StartSwap(b)
+	s.OnRequest(aReq1) // queued behind b
+	s.OnRequest(aReq2) // queued behind b
+	s.OnRequest(aReq3) // queued behind b too — queueing is free of the cap
+
+	assertAdmitted(t, bReq)
+	assertAdmitted(t, aReq1)
+	assertAdmitted(t, aReq2)
+	assertAdmitted(t, aReq3)
+
+	if got := len(s.queued); got != 3 {
+		t.Fatalf("queue len=%d want 3 (queued requests hold no slot in this fork)", got)
+	}
+	if got := eff.startsFor("a"); got != 0 {
+		t.Fatalf("StartSwap(a)=%d want 0 while b is loading", got)
+	}
+
+	eff.states["b"] = process.StateReady
+	s.OnSwapDone(SwapDone{ModelID: "b"})
+	s.OnServeDone(ServeDoneEvent{ModelID: "b"})
+	if got := eff.startsFor("a"); got != 1 {
+		t.Fatalf("StartSwap(a)=%d want 1 after b drains", got)
+	}
+
+	// Only the cap's worth is granted when a comes up; the third waits.
+	eff.states["a"] = process.StateReady
+	s.OnSwapDone(SwapDone{ModelID: "a"})
+	if got := eff.served("a"); got != 2 {
+		t.Fatalf("served(a)=%d want 2", got)
+	}
+	if got := len(s.queued); got != 1 {
+		t.Fatalf("queue len=%d want 1 (third request still waiting for a slot)", got)
+	}
+
+	// A slot frees: the parked request re-runs the whole decision tree. This
+	// stub planner always reports a as evicting b, so it takes the swap path
+	// again rather than the fast path; completing that swap serves it.
+	s.OnServeDone(ServeDoneEvent{ModelID: "a"})
+	s.OnSwapDone(SwapDone{ModelID: "a"})
+	if got := eff.served("a"); got != 3 {
+		t.Fatalf("served(a)=%d want 3 after a slot freed", got)
+	}
+}
+
+// TestFIFO_ConcurrencyLimit_CancelledQueuedWaiterLeavesQueue is the fork
+// counterpart of upstream's ...ReleasesReservation: a queued request whose
+// client disappears is pruned so it can never consume the slot it was waiting
+// for.
+func TestFIFO_ConcurrencyLimit_CancelledQueuedWaiterLeavesQueue(t *testing.T) {
+	eff := newFakeEffects()
+	eff.states["a"] = process.StateStopped
+	eff.states["b"] = process.StateStopped
+	models := map[string]config.ModelConfig{
+		"a": {ConcurrencyLimit: 1},
+		"b": {},
+	}
+	s := NewFIFO("test", logmon.NewWriter(io.Discard), &stubPlanner{evict: map[string][]string{"a": {"b"}}}, config.FifoConfig{}, models, eff)
+
+	bReq := req("b")
+	cancelledReq := reqCh("a")
+	keptReq := reqCh("a")
+
+	s.OnRequest(bReq)
+	s.OnRequest(cancelledReq)
+	s.OnRequest(keptReq)
+	assertAdmitted(t, bReq)
+	assertAdmitted(t, cancelledReq)
+	assertAdmitted(t, keptReq)
+
+	s.OnCancel(cancelledReq)
+
+	if got := len(s.queued); got != 1 {
+		t.Fatalf("queue len=%d want 1 after the cancelled request was pruned", got)
+	}
+
+	// b drains, a swaps in: the surviving request gets the single slot.
+	eff.states["b"] = process.StateReady
+	s.OnSwapDone(SwapDone{ModelID: "b"})
+	s.OnServeDone(ServeDoneEvent{ModelID: "b"})
+	eff.states["a"] = process.StateReady
+	s.OnSwapDone(SwapDone{ModelID: "a"})
+	if got := eff.served("a"); got != 1 {
+		t.Fatalf("served(a)=%d want 1", got)
+	}
+}
+
+// TestFIFO_SwapGrace asserts a competing request does NOT evict a model still
+// inside its swap-grace window, and that the swap proceeds (via OnTick) once the
+// grace elapses with the model idle.
+func TestFIFO_SwapGrace(t *testing.T) {
+	eff := newFakeEffects()
+	eff.states["a"] = process.StateReady
+	eff.states["b"] = process.StateStopped
+	clk := time.Unix(1000, 0)
+	grace := map[string]time.Duration{"a": 60 * time.Second}
+	s := newFIFOGrace(&stubPlanner{evict: map[string][]string{"b": {"a"}}}, eff, grace, &clk)
+
+	// a serves and finishes -> its idle clock starts now.
+	s.OnRequest(req("a"))
+	s.OnServeDone(ServeDoneEvent{ModelID: "a"})
+
+	// b arrives 10s later: a is only 10s idle (< 60s) -> deferred, no swap.
+	clk = clk.Add(10 * time.Second)
+	s.OnRequest(reqCh("b"))
+	if got := eff.startsFor("b"); got != 0 {
+		t.Fatalf("b should be deferred within a's grace; got %d swap starts", got)
+	}
+
+	// A tick at 59s idle still defers.
+	clk = clk.Add(49 * time.Second)
+	s.OnTick()
+	if got := eff.startsFor("b"); got != 0 {
+		t.Fatalf("b should still be deferred at 59s idle; got %d swap starts", got)
+	}
+
+	// Past 60s idle, a tick starts the swap evicting a.
+	clk = clk.Add(2 * time.Second)
+	s.OnTick()
+	if got := eff.startsFor("b"); got != 1 {
+		t.Fatalf("b should swap once a's grace elapsed; got %d swap starts", got)
+	}
+	last := eff.starts[len(eff.starts)-1]
+	if !containsString(last.evict, "a") {
+		t.Fatalf("swap for b should evict a; got evict=%v", last.evict)
 	}
 }
 

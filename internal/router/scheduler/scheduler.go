@@ -11,18 +11,20 @@ package scheduler
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"sync/atomic"
 	"time"
 
+	"github.com/mostlygeek/llama-swap/internal/config"
 	"github.com/mostlygeek/llama-swap/internal/logmon"
 	"github.com/mostlygeek/llama-swap/internal/process"
-	"github.com/mostlygeek/llama-swap/internal/shared"
+	"github.com/mostlygeek/llama-swap/internal/swaputil"
 )
 
 // ErrModelNotFound is granted to callers whose model is not handled by this
-// router. It is an alias for shared.ErrNoLocalModelFound.
-var ErrModelNotFound = shared.ErrNoLocalModelFound
+// router. It is an alias for swaputil.ErrNoLocalModelFound.
+var ErrModelNotFound = swaputil.ErrNoLocalModelFound
 
 // Swapper is the eviction policy: it decides which running models must be
 // stopped before a target can serve. It is orthogonal to the scheduling
@@ -96,29 +98,51 @@ type Effects interface {
 	StopProcesses(timeout time.Duration, ids []string)
 }
 
-// Factory builds a Scheduler bound to a baseRouter's Effects. The concrete
-// router captures its Swapper in the closure it passes as a Factory.
-type Factory func(name string, logger *logmon.Monitor, eff Effects) Scheduler
+// New returns a Scheduler selected by conf.Routing.Scheduler.Use, configured
+// from conf and bound to the given planner and effects. Currently only "fifo"
+// (the default) is supported.
+func New(conf config.Config, name string, logger *logmon.Monitor, planner Swapper, eff Effects) (Scheduler, error) {
+	use := conf.Routing.Scheduler.Use
+	if use == "" {
+		use = "fifo"
+	}
+	switch use {
+	case "fifo":
+		return NewFIFO(name, logger, planner, conf.Routing.Scheduler.Settings.Fifo, conf.Models, eff), nil
+	default:
+		return nil, fmt.Errorf("unsupported scheduler type: %q", use)
+	}
+}
 
 // HandlerReq is one in-flight ServeHTTP request waiting for a routing decision.
 type HandlerReq struct {
-	Model      string
-	Ctx        context.Context
+	Model string
+	Ctx   context.Context
+	// Admit carries the pre-stream admission answer: nil once the scheduler
+	// has accepted the request, or an error the caller must return BEFORE any
+	// loading stream is committed (upstream #889). Buffered by the caller.
+	Admit      chan error
 	Respond    chan HandlerResp
 	PositionCh chan int
 	// EstimatedTokens is a conservative estimate of this request's context
 	// size, used only by KV-aware admission (config.FifoConfig.KVPoolTokens).
 	// baseRouter.ServeHTTP populates it from the buffered request body; see
-	// shared.EstimateTokens for the estimation rule. 0 for requests with no
+	// swaputil.EstimateTokens for the estimation rule. 0 for requests with no
 	// body (e.g. GET) or when the target model has no KV budget configured —
 	// either way it is inert unless KVPoolTokens > 0 for the model.
 	EstimatedTokens int
 
 	// Tier is the entry-point tier this request arrived through (see
-	// shared.Tier). shared.DefaultTier for every request on the main
+	// swaputil.Tier). swaputil.DefaultTier for every request on the main
 	// listener / when no `tiers:` block is configured — see
 	// docs/intent/llama-swap-tiers.md (llama-cm) for the full design.
-	Tier shared.Tier
+	Tier swaputil.Tier
+
+	// ConcurrencyExempt marks a request that must not be held back by the
+	// per-model concurrency cap (FIFO.atCapacity): tokenize-only
+	// count_tokens calls, which hold no model slot. Set by
+	// baseRouter.ServeHTTP; false for every ordinary inference request.
+	ConcurrencyExempt bool
 
 	// Preempted, when non-nil, is set to true by Preempt just before it
 	// cancels this request's serving context. Only populated on requests

@@ -7,7 +7,7 @@ import (
 	"github.com/mostlygeek/llama-swap/internal/config"
 	"github.com/mostlygeek/llama-swap/internal/logmon"
 	"github.com/mostlygeek/llama-swap/internal/process"
-	"github.com/mostlygeek/llama-swap/internal/shared"
+	"github.com/mostlygeek/llama-swap/internal/swaputil"
 )
 
 // Tiered-queue tests (docs/intent/llama-swap-tiers.md, llama-cm). These drive
@@ -16,25 +16,25 @@ import (
 // behavior already is: directly, synchronously, on the run-loop methods.
 
 var (
-	tierPriority = shared.Tier{Name: "priority", Rank: 10, Preempts: true}
-	tierBg       = shared.Tier{Name: "background", Rank: -10, Preemptible: true}
+	tierPriority = swaputil.Tier{Name: "priority", Rank: 10, Preempts: true}
+	tierBg       = swaputil.Tier{Name: "background", Rank: -10, Preemptible: true}
 	// tierSilent has a rank below the default tier but sets neither
 	// Preempts nor Preemptible — used to prove a non-preemptible victim
 	// survives an arrival that doesn't carry `preempts: true`.
-	tierSilent = shared.Tier{Name: "silent", Rank: -5}
+	tierSilent = swaputil.Tier{Name: "silent", Rank: -5}
 )
 
 // tierReq builds a HandlerReq tagged with tier and a unique Respond channel
 // (so queue/barrier logic that compares by channel identity never confuses
 // two distinct requests for the same model).
-func tierReq(model string, tier shared.Tier) HandlerReq {
+func tierReq(model string, tier swaputil.Tier) HandlerReq {
 	return HandlerReq{Model: model, Respond: make(chan HandlerResp, 1), Tier: tier}
 }
 
 // grantedTierReq is like tierReq but also wires a Preempt handle, so it can be
 // granted (via the fast path) and later found by the preemption branch as a
 // candidate victim. booted flips true the moment Preempt is invoked.
-func grantedTierReq(model string, tier shared.Tier) (req HandlerReq, booted *bool) {
+func grantedTierReq(model string, tier swaputil.Tier) (req HandlerReq, booted *bool) {
 	booted = new(bool)
 	req = tierReq(model, tier)
 	req.Preempt = func() { *booted = true }
@@ -58,13 +58,13 @@ func TestFIFO_TierEnqueueOrder(t *testing.T) {
 	cfg := config.FifoConfig{Priority: map[string]int{"d1": 1, "d2": 5}}
 	s := NewFIFO("test", logmon.NewWriter(io.Discard), planner, cfg, nil, eff)
 
-	s.OnRequest(tierReq("z", shared.DefaultTier)) // StartSwap(z, [...])
+	s.OnRequest(tierReq("z", swaputil.DefaultTier)) // StartSwap(z, [...])
 
 	// Arrive out of rank order; d1 before d2 exercises the priority
 	// tie-break within the same (default) rank.
 	s.OnRequest(tierReq("b", tierBg))
-	s.OnRequest(tierReq("d1", shared.DefaultTier))
-	s.OnRequest(tierReq("d2", shared.DefaultTier))
+	s.OnRequest(tierReq("d1", swaputil.DefaultTier))
+	s.OnRequest(tierReq("d2", swaputil.DefaultTier))
 	s.OnRequest(tierReq("p", tierPriority))
 
 	got := make([]string, len(s.queued))
@@ -98,7 +98,7 @@ func TestFIFO_TierRankBarrier(t *testing.T) {
 	s := NewFIFO("test", logmon.NewWriter(io.Discard), planner, config.FifoConfig{}, nil, eff)
 
 	// "busy" goes in-flight via the ordinary fast path.
-	s.OnRequest(tierReq("busy", shared.DefaultTier))
+	s.OnRequest(tierReq("busy", swaputil.DefaultTier))
 	if eff.served("busy") != 1 {
 		t.Fatalf("busy should be served immediately")
 	}
@@ -112,7 +112,7 @@ func TestFIFO_TierRankBarrier(t *testing.T) {
 	// "lo" (default) is ready with nothing to evict — normally an instant
 	// fast-path grant — but "hi" is still queued at a strictly higher rank,
 	// so the barrier must defer it too.
-	s.OnRequest(tierReq("lo", shared.DefaultTier))
+	s.OnRequest(tierReq("lo", swaputil.DefaultTier))
 	if eff.served("lo") != 0 {
 		t.Fatalf("lo must not be served while a higher-rank request is queued")
 	}
@@ -152,7 +152,7 @@ func TestFIFO_Preempt_DefaultBootsBackground(t *testing.T) {
 		t.Fatalf("bg should be granted")
 	}
 
-	s.OnRequest(tierReq("x", shared.DefaultTier))
+	s.OnRequest(tierReq("x", swaputil.DefaultTier))
 	if !*bgBooted {
 		t.Errorf("default arrival should preempt the running background request")
 	}
@@ -181,7 +181,7 @@ func TestFIFO_Preempt_PriorityBootsBackgroundAndDefault(t *testing.T) {
 	s := NewFIFO("test", logmon.NewWriter(io.Discard), planner, config.FifoConfig{}, nil, eff)
 
 	bgReq, bgBooted := grantedTierReq("bg", tierBg)
-	defReq, defBooted := grantedTierReq("def", shared.DefaultTier)
+	defReq, defBooted := grantedTierReq("def", swaputil.DefaultTier)
 	s.OnRequest(bgReq)
 	s.OnRequest(defReq)
 	if eff.served("bg") != 1 || eff.served("def") != 1 {
@@ -206,14 +206,14 @@ func TestFIFO_Preempt_NeverCrossesEqualRank(t *testing.T) {
 	planner := &stubPlanner{evict: map[string][]string{"p2": {"p1"}}}
 	s := NewFIFO("test", logmon.NewWriter(io.Discard), planner, config.FifoConfig{}, nil, eff)
 
-	victimTier := shared.Tier{Name: "priority", Rank: 10, Preempts: true, Preemptible: true}
+	victimTier := swaputil.Tier{Name: "priority", Rank: 10, Preempts: true, Preemptible: true}
 	p1Req, p1Booted := grantedTierReq("p1", victimTier)
 	s.OnRequest(p1Req)
 	if eff.served("p1") != 1 {
 		t.Fatalf("p1 should be granted")
 	}
 
-	s.OnRequest(tierReq("p2", shared.Tier{Name: "priority", Rank: 10, Preempts: true}))
+	s.OnRequest(tierReq("p2", swaputil.Tier{Name: "priority", Rank: 10, Preempts: true}))
 	if *p1Booted {
 		t.Errorf("preemption must never cross equal ranks")
 	}
@@ -240,7 +240,7 @@ func TestFIFO_Preempt_NonPreemptibleVictimSurvives(t *testing.T) {
 
 	// default (rank 0, no preempts flag) arrives; s1's rank (-5) is strictly
 	// lower, but neither side opts in to preemption.
-	s.OnRequest(tierReq("d1", shared.DefaultTier))
+	s.OnRequest(tierReq("d1", swaputil.DefaultTier))
 	if *s1Booted {
 		t.Errorf("a non-preemptible victim must survive a non-preempts arrival")
 	}

@@ -25,6 +25,7 @@ ENV PATH="/usr/lib/ccache:${PATH}"
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential cmake git python3 python3-pip libssl-dev \
     curl ca-certificates ccache make wget \
+    pkg-config libavcodec-dev libavformat-dev libavutil-dev libswresample-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
@@ -42,6 +43,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential cmake git python3 python3-pip libssl-dev \
     curl ca-certificates ccache make wget software-properties-common \
     libvulkan-dev glslang-tools spirv-tools vulkan-validationlayers glslc \
+    pkg-config libavcodec-dev libavformat-dev libavutil-dev libswresample-dev \
     spirv-headers \
     && rm -rf /var/lib/apt/lists/*
 
@@ -55,11 +57,13 @@ FROM builder-base-${BACKEND} AS builder-base
 
 FROM builder-base AS whisper-build
 ARG BACKEND=cuda
+ARG WHISPER_FFMPEG=yes
 ARG WHISPER_COMMIT_HASH=master
 COPY install-whisper.sh /build/
 RUN --mount=type=cache,id=ccache-${BACKEND},target=/ccache \
     --mount=type=cache,id=whisper-${BACKEND},target=/src/whisper.cpp/build \
-    BACKEND=${BACKEND} bash /build/install-whisper.sh "${WHISPER_COMMIT_HASH}"
+    BACKEND=${BACKEND} WHISPER_FFMPEG=${WHISPER_FFMPEG} \
+    bash /build/install-whisper.sh "${WHISPER_COMMIT_HASH}"
 
 # ── Build stable-diffusion.cpp ────────────────────────────────────────
 
@@ -70,6 +74,16 @@ COPY install-sd.sh /build/
 RUN --mount=type=cache,id=ccache-${BACKEND},target=/ccache \
     --mount=type=cache,id=sd-${BACKEND},target=/src/stable-diffusion.cpp/build \
     BACKEND=${BACKEND} bash /build/install-sd.sh "${SD_COMMIT_HASH}"
+
+# ── Build audio.cpp ───────────────────────────────────────────────────
+
+FROM builder-base AS audio-build
+ARG BACKEND=cuda
+ARG AUDIO_COMMIT_HASH=main
+COPY install-audio.sh /build/
+RUN --mount=type=cache,id=ccache-${BACKEND},target=/ccache \
+    --mount=type=cache,id=audio-${BACKEND},target=/src/audio.cpp/build \
+    BACKEND=${BACKEND} bash /build/install-audio.sh "${AUDIO_COMMIT_HASH}"
 
 # ── Build llama.cpp (slowest build, run last) ─────────────────────────
 
@@ -109,6 +123,18 @@ ARG LS_VERSION=latest
 COPY install-llama-swap.sh /build/
 RUN bash /build/install-llama-swap.sh "${LS_VERSION}"
 
+# ── Build vllm-wrapper from llama-swap source ─────────────────────────
+#
+# vllm-wrapper is not shipped in the llama-swap release archives, so it is
+# compiled from the same revision as the llama-swap binary above.
+
+FROM golang:1.26-bookworm AS vllm-wrapper-build
+ARG LS_VERSION=latest
+COPY install-vllm-wrapper.sh /build/
+RUN --mount=type=cache,id=go-build,target=/root/.cache/go-build \
+    --mount=type=cache,id=go-mod,target=/go/pkg/mod \
+    bash /build/install-vllm-wrapper.sh "${LS_VERSION}"
+
 # ── Runtime bases ─────────────────────────────────────────────────────
 
 FROM nvidia/cuda:12.9.1-runtime-ubuntu24.04 AS runtime-cuda
@@ -119,6 +145,8 @@ ENV PATH="/usr/local/bin:${PATH}"
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libgomp1 python3 curl ca-certificates \
+    libavcodec60 libavformat60 libavutil58 libswresample4 \
+    ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
 # CUDA stub drivers for container compatibility
@@ -134,7 +162,10 @@ ENV PATH="/usr/local/bin:${PATH}"
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libgomp1 libvulkan1 mesa-vulkan-drivers \
+    rocm-smi \
     python3 curl ca-certificates \
+    libavcodec60 libavformat60 libavutil58 libswresample4 \
+    ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
 # ── Select runtime base by BACKEND ────────────────────────────────────
@@ -146,6 +177,7 @@ ARG LLAMA_COMMIT_HASH=unknown
 ARG WHISPER_COMMIT_HASH=unknown
 ARG SD_COMMIT_HASH=unknown
 ARG IK_LLAMA_COMMIT_HASH=unknown
+ARG AUDIO_COMMIT_HASH=unknown
 ARG RUN_UID=0
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -173,9 +205,15 @@ COPY --from=sd-build /install/bin/sd-server /usr/local/bin/
 COPY --from=sd-build /install/bin/sd-cli /usr/local/bin/
 COPY --from=sd-build /install/lib/ /usr/local/lib/
 
+# Copy audio.cpp binaries (statically linked)
+COPY --from=audio-build /install/bin/audiocpp_server /usr/local/bin/
+COPY --from=audio-build /install/bin/audiocpp_cli /usr/local/bin/
+
 # Copy llama.cpp binaries (statically linked)
 COPY --from=llama-build /install/bin/llama-server /usr/local/bin/
 COPY --from=llama-build /install/bin/llama-cli /usr/local/bin/
+COPY --from=llama-build /install/bin/llama-tts /usr/local/bin/
+COPY --from=llama-build /install/bin/llama-bench /usr/local/bin/
 
 # Copy ik-llama-server (CUDA only; empty copy for vulkan)
 COPY --from=ik-llama-build /install/bin/ /usr/local/bin/
@@ -187,6 +225,9 @@ RUN pip install uv --break-system-packages
 COPY --from=llama-swap-download /install/bin/llama-swap /usr/local/bin/
 COPY --from=llama-swap-download /install/llama-swap-version /tmp/
 
+# Copy vllm-wrapper binary
+COPY --from=vllm-wrapper-build /install/bin/vllm-wrapper /usr/local/bin/
+
 RUN ldconfig
 
 COPY config.example.yaml /etc/llama-swap/config/config.yaml
@@ -196,6 +237,7 @@ RUN echo "llama.cpp: ${LLAMA_COMMIT_HASH}" > /versions.txt && \
     echo "whisper.cpp: ${WHISPER_COMMIT_HASH}" >> /versions.txt && \
     echo "stable-diffusion.cpp: ${SD_COMMIT_HASH}" >> /versions.txt && \
     echo "ik_llama.cpp: ${IK_LLAMA_COMMIT_HASH}" >> /versions.txt && \
+    echo "audio.cpp: ${AUDIO_COMMIT_HASH}" >> /versions.txt && \
     echo "llama-swap: $(cat /tmp/llama-swap-version)" >> /versions.txt && \
     echo "backend: ${BACKEND}" >> /versions.txt && \
     echo "build_timestamp: $(date -u +%Y-%m-%dT%H:%M:%SZ)" >> /versions.txt
@@ -204,4 +246,4 @@ RUN mkdir -p /models && chown ${RUN_UID}:${RUN_UID} /models
 WORKDIR /models
 USER ${RUN_UID}
 ENTRYPOINT ["llama-swap"]
-CMD ["-config", "/etc/llama-swap/config/config.yaml", "-listen", "0.0.0.0:8080"]
+CMD ["-config", "/etc/llama-swap/config/config.yaml", "-listen", "0.0.0.0:8080", "-watch-config"]

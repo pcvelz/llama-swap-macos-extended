@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -14,7 +16,7 @@ import (
 	"github.com/mostlygeek/llama-swap/internal/logmon"
 	"github.com/mostlygeek/llama-swap/internal/process"
 	"github.com/mostlygeek/llama-swap/internal/router/scheduler"
-	"github.com/mostlygeek/llama-swap/internal/shared"
+	"github.com/mostlygeek/llama-swap/internal/swaputil"
 )
 
 // maxReplays caps how many times a single client request may be
@@ -23,8 +25,8 @@ import (
 // (docs/intent/llama-swap-tiers.md "Known v1 limitations" -> v2). A hard
 // ceiling independent of maxReplayHeld: a pathological rapid-fire preemption
 // loop (each attempt preempted within milliseconds of being granted) would
-// otherwise hold the connection — and this model's concurrency-semaphore
-// permit, which is only released when ServeHTTP finally returns — for
+// otherwise hold the connection — and this model's serving slot, which is only
+// released when ServeHTTP finally returns — for
 // effectively unbounded wall-clock time without ever approaching the
 // held-time budget below.
 const maxReplays = 5
@@ -52,8 +54,7 @@ type unloadReq struct {
 
 // baseRouter owns the channels, run-loop, and process machinery shared by every
 // concrete router. Concrete routers embed *baseRouter and supply a
-// scheduler.Factory (which captures their scheduler.Swapper) describing how
-// requests are scheduled and how their eviction set is decided. baseRouter
+// scheduler.Swapper describing how eviction sets are decided. baseRouter
 // implements scheduler.Effects so the scheduler can call back for side-effects.
 type baseRouter struct {
 	name      string
@@ -115,8 +116,8 @@ func newBaseRouter(
 	conf config.Config,
 	processes map[string]process.Process,
 	logger *logmon.Monitor,
-	newSched scheduler.Factory,
-) *baseRouter {
+	planner scheduler.Swapper,
+) (*baseRouter, error) {
 	shutdownCtx, shutdownFn := context.WithCancel(context.Background())
 	procCtx, procCancel := context.WithCancel(context.Background())
 	b := &baseRouter{
@@ -137,8 +138,24 @@ func newBaseRouter(
 		runDone:     make(chan struct{}),
 		pinned:      make(map[string]time.Time),
 	}
-	b.schedule = newSched(name, logger, b)
-	return b
+
+	// Arm the run-loop ticker only when at least one model has a swap-grace
+	// configured, so the default (upstream) config pays no ticker overhead.
+	// The scheduler derives the per-model grace durations from the same
+	// config (see scheduler.NewFIFO).
+	for _, mc := range conf.Models {
+		if mc.SwapGraceSeconds > 0 {
+			b.graceTick = time.Second
+			break
+		}
+	}
+
+	sched, err := scheduler.New(conf, name, logger, planner, b)
+	if err != nil {
+		return nil, err
+	}
+	b.schedule = sched
+	return b, nil
 }
 
 func (b *baseRouter) notifyProcessed() {
@@ -321,16 +338,19 @@ func (b *baseRouter) doSwap(modelID string, toStop []string) {
 	}
 	wg.Wait()
 
+	// EnsureReady rather than a State() check followed by Run: the router must
+	// not assume anything about the process. Deciding out here means acting on
+	// a snapshot that the process's own run loop can invalidate at any moment —
+	// a TTL unload landing in that window used to leave the swap waiting on a
+	// process nobody was ever going to start (issue #946). EnsureReady makes
+	// the same decision inside the process, where the state is owned.
 	target := b.processes[modelID]
-	if target.State() == process.StateStopped {
-		go func() {
-			if err := target.Run(timeout); err != nil {
-				b.logger.Warnf("%s: running %s exited: %v", b.name, modelID, err)
-			}
-		}()
+	err := target.EnsureReady(b.shutdownCtx, timeout)
+	if err != nil && b.shutdownCtx.Err() == nil {
+		// Quiet during shutdown: every in-flight swap fails at once there, and
+		// that is expected rather than worth a warning per model.
+		b.logger.Warnf("%s: starting %s failed: %v", b.name, modelID, err)
 	}
-
-	err := target.WaitReady(b.shutdownCtx)
 
 	select {
 	case b.swapDoneCh <- scheduler.SwapDone{ModelID: modelID, Err: err}:
@@ -398,6 +418,17 @@ func (b *baseRouter) healthCheckTimeout() time.Duration {
 		return 30 * time.Second
 	}
 	return t
+}
+
+// unloadTimeout returns the graceful stop timeout for a model. Config parsing
+// guarantees both the global and per-model unloadTimeout are populated (a zero
+// model value is rewritten to the global default on parse), so no zero handling
+// is needed here.
+func (b *baseRouter) unloadTimeout(modelID string) time.Duration {
+	if mc, ok := b.config.Models[modelID]; ok {
+		return time.Duration(mc.UnloadTimeout) * time.Second
+	}
+	return time.Duration(b.config.UnloadTimeout) * time.Second
 }
 
 func (b *baseRouter) Handles(model string) bool {
@@ -534,6 +565,14 @@ func (b *baseRouter) RunningModels() map[string]process.ProcessState {
 // for — Stop kills the upstream, those callers see whatever error the
 // reverse proxy surfaces and may retry. Their trackedServe defers fire
 // normally and decrement inFlight as the dying handlers return.
+//
+// A timeout <= 0 unloads each targeted model with its configured
+// unloadTimeout: targets sharing a timeout are stopped in parallel within one
+// unload request, and the requests are processed smallest timeout first. The
+// requests are sequential, so a hung stop on a large model (long timeouts
+// usually mean multi-node unloads) cannot delay reclaiming the quick ones
+// queued behind it. A positive timeout overrides the configured values and
+// stops every target with that timeout.
 func (b *baseRouter) Unload(timeout time.Duration, models ...string) {
 	targets := models
 	if len(targets) == 0 {
@@ -546,6 +585,28 @@ func (b *baseRouter) Unload(timeout time.Duration, models ...string) {
 		return
 	}
 
+	if timeout > 0 {
+		b.sendUnload(targets, timeout)
+		return
+	}
+	buckets := make(map[time.Duration][]string)
+	for _, id := range targets {
+		t := b.unloadTimeout(id)
+		buckets[t] = append(buckets[t], id)
+	}
+	timeouts := make([]time.Duration, 0, len(buckets))
+	for t := range buckets {
+		timeouts = append(timeouts, t)
+	}
+	sort.Slice(timeouts, func(i, j int) bool { return timeouts[i] < timeouts[j] })
+	for _, t := range timeouts {
+		b.sendUnload(buckets[t], t)
+	}
+}
+
+// sendUnload funnels one unload request through the run loop and blocks until
+// the scheduler has stopped the targeted processes.
+func (b *baseRouter) sendUnload(targets []string, timeout time.Duration) {
 	req := unloadReq{targets: targets, timeout: timeout, respond: make(chan struct{})}
 	select {
 	case b.unloadCh <- req:
@@ -568,15 +629,43 @@ func (b *baseRouter) Shutdown(timeout time.Duration) error {
 	return <-req.respond
 }
 
+// isCountTokensPath reports whether p is a tokenize-only count_tokens request
+// (Anthropic /v1/messages/count_tokens and its versioned variants). These do no
+// generation and hold no model slot, so they are exempt from the per-model
+// concurrency cap — see HandlerReq.ConcurrencyExempt.
+func isCountTokensPath(p string) bool {
+	return strings.HasSuffix(p, "/count_tokens")
+}
+
 func (b *baseRouter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	if b.shuttingDown.Load() {
-		shared.SendError(w, req, fmt.Errorf("%s is shutting down", b.name))
+		swaputil.SendError(w, req, fmt.Errorf("%s is shutting down", b.name))
 		return
 	}
 
-	data, err := shared.FetchContext(req, b.config)
+	data, err := swaputil.FetchContext(req, b.config)
 	if err != nil {
-		shared.SendError(w, req, err)
+		swaputil.SendError(w, req, err)
+		return
+	}
+
+	// Ignored websocket connections are deliberately kept outside the
+	// scheduler: they cannot start or queue a model, consume concurrency, or
+	// prevent another request from swapping the process out. A process may stop
+	// immediately after this readiness check; dropping that websocket is the
+	// intended tradeoff of opting out of lifecycle tracking.
+	if swaputil.ShouldIgnoreWebsocket(req, b.config) {
+		p, ok := b.processes[data.ModelID]
+		if !ok {
+			swaputil.SendError(w, req, scheduler.ErrModelNotFound)
+			return
+		}
+		if p.State() != process.StateReady {
+			swaputil.SendResponse(w, req, http.StatusConflict,
+				fmt.Sprintf("model %s is not loaded; ignored websocket requests cannot start it", data.ModelID))
+			return
+		}
+		p.ServeHTTP(w, req)
 		return
 	}
 
@@ -591,9 +680,9 @@ func (b *baseRouter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	}
 
 	// arrivalCtx anchors every attempt below (see the per-attempt context
-	// derivation for why attempt 1 alone may reuse a shared.PreemptHandle
+	// derivation for why attempt 1 alone may reuse a swaputil.PreemptHandle
 	// context directly, while replay attempts never do). origBody is the
-	// body shared.FetchContext already buffered once at arrival — reused
+	// body swaputil.FetchContext already buffered once at arrival — reused
 	// verbatim on every replay attempt so a retry sends the client's EXACT
 	// original bytes, never a second read of an already-drained r.Body.
 	arrivalCtx := req.Context()
@@ -620,31 +709,33 @@ func (b *baseRouter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		// preemption is layered on top of that existing mechanism, not a
 		// replacement for it.
 		//
-		// Attempt 1 reuses the shared.PreemptHandle from
+		// Attempt 1 reuses the swaputil.PreemptHandle from
 		// CreateRequestContextMiddleware exactly as before this change (the
-		// "Known soft spot" fix): a same-model preemption at the semaphore
-		// stage (internal/server/concurrency.go) and this scheduler-stage
-		// preemption then cancel through the exact same Flag+Cancel pair.
+		// "Known soft spot" fix): any preemption raised outside this loop and
+		// this scheduler-stage preemption then cancel through the exact same
+		// Flag+Cancel pair. (Upstream moved the per-model concurrency cap into
+		// the scheduler, so same-model contention is now resolved by
+		// scheduler.FIFO.tryPreempt rather than by a separate semaphore layer.)
 		// That handle's own context is one-shot — once Cancel fires it
 		// reports Done() forever — so it cannot seed a REPLAY attempt.
 		// Attempts 2+ instead derive a fresh context from handle.Parent (the
 		// context that existed before the handle wrapped it, still alive
-		// after Cancel fires — see shared.PreemptHandle.Parent) when a
+		// after Cancel fires — see swaputil.PreemptHandle.Parent) when a
 		// handle was used, or from arrivalCtx directly otherwise (that
 		// branch never cancels arrivalCtx itself, only its own child, so
 		// arrivalCtx stays live for every attempt already).
 		//
-		// Known tradeoff: a same-model semaphore-triggered preemption that
-		// arrives while we're on a replay attempt (2+) no longer interrupts
-		// it — the semaphore's registered handle is the ORIGINAL one, spent
-		// after its first Cancel. Only a FIFO-scheduler preemption is
+		// Known tradeoff: a preemption raised through the ORIGINAL handle
+		// while we're on a replay attempt (2+) no longer interrupts it — that
+		// handle is spent after its first Cancel. Only a FIFO-scheduler
+		// preemption is
 		// observed on replay attempts, since hr.Preempt is rebuilt fresh
 		// every attempt below. Bounded either way by the replay cap.
 		var reqCtx context.Context
 		var reqCancel context.CancelFunc
 		var preempted *atomic.Bool
 		if attempt == 1 {
-			if handle, ok := shared.PreemptHandleFromContext(arrivalCtx); ok {
+			if handle, ok := swaputil.PreemptHandleFromContext(arrivalCtx); ok {
 				reqCtx = arrivalCtx
 				reqCancel = handle.Cancel
 				preempted = handle.Flag
@@ -652,7 +743,7 @@ func (b *baseRouter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 				reqCtx, reqCancel = context.WithCancel(arrivalCtx)
 				preempted = new(atomic.Bool)
 			}
-		} else if handle, ok := shared.PreemptHandleFromContext(arrivalCtx); ok && handle.Parent != nil {
+		} else if handle, ok := swaputil.PreemptHandleFromContext(arrivalCtx); ok && handle.Parent != nil {
 			reqCtx, reqCancel = context.WithCancel(handle.Parent)
 			preempted = new(atomic.Bool)
 		} else {
@@ -678,7 +769,7 @@ func (b *baseRouter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		// Bounded by maxReplays/maxReplayHeld so a pathological hot-loop of
 		// same-model contention still falls back to the v1 503 well under
 		// the client's own ~300s abort ceiling. Memory tradeoff: origBody
-		// (already buffered once by shared.FetchContext for every JSON POST,
+		// (already buffered once by swaputil.FetchContext for every JSON POST,
 		// replay-eligible or not) is retained for this attempt's lifetime —
 		// interactive request bodies can run multi-MB, so this scales with
 		// (concurrent preemptible requests) x (body size), not with replay
@@ -696,14 +787,23 @@ func (b *baseRouter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 			// Unbuffered: a successful send on Respond proves the waiter is
 			// alive and consuming. grant() relies on this to avoid handing a
 			// handleFunc to a cancelled waiter and leaking the inFlight count.
+			Admit:      make(chan error, 1),
 			Respond:    make(chan scheduler.HandlerResp),
 			PositionCh: make(chan int, 1),
+			// count_tokens is tokenize-only (no model slot, near-free), so it is
+			// exempt from the per-model concurrency cap the scheduler enforces
+			// (see scheduler.FIFO.atCapacity). Client turn-boundary fan-outs fire
+			// 15-30 of these in parallel; making them wait for a serving slot
+			// starved the pool and bounced real turns (2026-07-05). Re-homed here
+			// from the deleted internal/server concurrency middleware, which
+			// exempted the same path from its semaphore.
+			ConcurrencyExempt: isCountTokensPath(attemptReq.URL.Path),
 			// Inert unless the target model has a KVPoolTokens budget configured
-			// (see scheduler.FIFO.kvAdmit) — see shared.EstimateTokens for the
+			// (see scheduler.FIFO.kvAdmit) — see swaputil.EstimateTokens for the
 			// estimation rule.
-			EstimatedTokens: shared.EstimateTokens(origBody),
+			EstimatedTokens: swaputil.EstimateTokens(origBody),
 			// Tier is DefaultTier for every request on the main listener / when no
-			// `tiers:` block is configured (see shared.Tier).
+			// `tiers:` block is configured (see swaputil.Tier).
 			Tier:         data.Tier,
 			Preempted:    preempted,
 			ReplayWanted: replayWanted,
@@ -718,7 +818,31 @@ func (b *baseRouter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		case <-attemptReq.Context().Done():
 			return
 		case <-b.shutdownCtx.Done():
-			shared.SendError(w, attemptReq, fmt.Errorf("%s is shutting down", b.name))
+			swaputil.SendError(w, attemptReq, fmt.Errorf("%s is shutting down", b.name))
+			return
+		}
+
+		// Admission handshake (upstream #889): the scheduler answers here
+		// BEFORE any loading stream is started, so a pre-stream rejection
+		// (unknown model) can still be written as a plain HTTP error rather
+		// than injected into an already-committed SSE body. Our fork does not
+		// reject on concurrency here — over-capacity requests park in the
+		// scheduler queue and wait (see scheduler.FIFO.atCapacity).
+		var admissionErr error
+		select {
+		case admissionErr = <-hr.Admit:
+		case <-attemptReq.Context().Done():
+			select {
+			case b.cancelCh <- hr:
+			case <-b.shutdownCtx.Done():
+			}
+			return
+		case <-b.shutdownCtx.Done():
+			swaputil.SendError(w, attemptReq, fmt.Errorf("%s is shutting down", b.name))
+			return
+		}
+		if admissionErr != nil {
+			swaputil.SendError(w, attemptReq, admissionErr)
 			return
 		}
 
@@ -786,12 +910,12 @@ func (b *baseRouter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 			return
 		case <-b.shutdownCtx.Done():
 			finishLoading()
-			shared.SendError(w, attemptReq, fmt.Errorf("%s is shutting down", b.name))
+			swaputil.SendError(w, attemptReq, fmt.Errorf("%s is shutting down", b.name))
 			return
 		}
 
 		if resp.Err != nil {
-			shared.SendError(w, attemptReq, resp.Err)
+			swaputil.SendError(w, attemptReq, resp.Err)
 			return
 		}
 		resp.HandleFunc(w, attemptReq)

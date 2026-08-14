@@ -2,12 +2,10 @@ package router
 
 import (
 	"fmt"
-	"time"
 
 	"github.com/mostlygeek/llama-swap/internal/config"
 	"github.com/mostlygeek/llama-swap/internal/logmon"
 	"github.com/mostlygeek/llama-swap/internal/process"
-	"github.com/mostlygeek/llama-swap/internal/router/scheduler"
 )
 
 type Group struct {
@@ -30,25 +28,13 @@ func NewGroup(conf config.Config, proxylog, upstreamlog *logmon.Monitor) (*Group
 		modelToGroup: modelToGroup,
 	}
 
-	// Per-model swap-grace (resolved seconds -> duration). hasGrace arms the
-	// run-loop ticker only when at least one model has a grace, so the default
-	// (upstream) config pays no ticker overhead.
-	grace := make(map[string]time.Duration)
-	hasGrace := false
-	for mid := range modelToGroup {
-		if mc, _, ok := conf.FindConfig(mid); ok && mc.SwapGraceSeconds > 0 {
-			grace[mid] = time.Duration(mc.SwapGraceSeconds) * time.Second
-			hasGrace = true
-		}
-	}
-
+	// Per-model swap-grace and the run-loop grace ticker are both derived from
+	// the model config inside newBaseRouter / scheduler.NewFIFO, so nothing is
+	// wired here.
 	processes := make(map[string]process.Process, len(modelToGroup))
-	base := newBaseRouter("group", conf, processes, proxylog,
-		func(name string, logger *logmon.Monitor, eff scheduler.Effects) scheduler.Scheduler {
-			return scheduler.NewFIFO(name, logger, swapper, conf.Routing.Scheduler.Settings.Fifo, grace, eff)
-		})
-	if hasGrace {
-		base.graceTick = time.Second
+	base, err := newBaseRouter("group", conf, processes, proxylog, swapper)
+	if err != nil {
+		return nil, fmt.Errorf("creating base router: %w", err)
 	}
 
 	for mid := range modelToGroup {

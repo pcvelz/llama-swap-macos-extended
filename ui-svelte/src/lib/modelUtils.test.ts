@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { matchesCapabilities, groupModels } from "./modelUtils";
+import { formatCountdown, getTTLLabel, groupModels, matchesCapabilities, modelServerPath, ZERO_TIME } from "./modelUtils";
 import type { Model } from "./types";
 
 function makeModel(overrides: Partial<Model> = {}): Model {
@@ -16,6 +16,16 @@ function makeModel(overrides: Partial<Model> = {}): Model {
     ...overrides,
   };
 }
+
+describe("modelServerPath", () => {
+  it("uses the ComfyUI endpoint for the reserved model", () => {
+    expect(modelServerPath("comfyui_auto")).toBe("/comfyui/");
+  });
+
+  it("uses the encoded upstream endpoint for other models", () => {
+    expect(modelServerPath("org/model name")).toBe("/upstream/org%2Fmodel%20name/");
+  });
+});
 
 describe("matchesCapabilities", () => {
   it("returns true when required is empty", () => {
@@ -61,12 +71,55 @@ describe("matchesCapabilities", () => {
   });
 });
 
+describe("formatCountdown", () => {
+  it("formats sub-minute durations", () => {
+    expect(formatCountdown(7)).toBe("0:07");
+  });
+
+  it("formats minutes and seconds with zero-padding", () => {
+    expect(formatCountdown(468)).toBe("7:48");
+  });
+
+  it("clamps negative durations to 0:00", () => {
+    expect(formatCountdown(-5)).toBe("0:00");
+  });
+});
+
+describe("getTTLLabel", () => {
+  it("shows pinned regardless of ttl/lastUse", () => {
+    const model = makeModel({ pinned: true, ttl: 600, lastUse: ZERO_TIME });
+    expect(getTTLLabel(model)).toBe("pinned");
+  });
+
+  it("shows resident when ttl is 0", () => {
+    const model = makeModel({ ttl: 0 });
+    expect(getTTLLabel(model)).toBe("resident");
+  });
+
+  it("shows the full TTL when the model has never been used", () => {
+    const model = makeModel({ ttl: 600, lastUse: ZERO_TIME });
+    expect(getTTLLabel(model)).toBe("TTL 10:00");
+  });
+
+  it("shows a live countdown to eviction based on lastUse", () => {
+    const now = Date.parse("2026-08-14T12:05:00Z");
+    const model = makeModel({ ttl: 600, lastUse: "2026-08-14T12:00:00Z" });
+    expect(getTTLLabel(model, now)).toBe("evicts in 5:00");
+  });
+
+  it("shows evicting once the countdown reaches zero", () => {
+    const now = Date.parse("2026-08-14T12:10:00Z");
+    const model = makeModel({ ttl: 600, lastUse: "2026-08-14T12:00:00Z" });
+    expect(getTTLLabel(model, now)).toBe("evicting");
+  });
+});
+
 describe("groupModels", () => {
   const models: Model[] = [
     makeModel({ id: "chat-model", capabilities: { vision: true } }),
     makeModel({ id: "audio-model", capabilities: { audio_transcriptions: true } }),
     makeModel({ id: "no-caps-model" }),
-    makeModel({ id: "peer-model", peerID: "peer1" }),
+    makeModel({ id: "peer1/peer-model", peerID: "peer1" }),
     makeModel({ id: "unlisted-model", unlisted: true, capabilities: { vision: true } }),
   ];
 
@@ -76,10 +129,10 @@ describe("groupModels", () => {
     expect([...result.localMatching, ...result.local].every((m) => !m.unlisted)).toBe(true);
   });
 
-  it("separates peer models into peersByProvider", () => {
+  it("separates peer models into peers", () => {
     const result = groupModels(models);
-    expect(result.peersByProvider["peer1"]).toHaveLength(1);
-    expect(result.peersByProvider["peer1"][0].id).toBe("peer-model");
+    expect(result.peers).toHaveLength(1);
+    expect(result.peers[0].id).toBe("peer1/peer-model");
   });
 
   it("without capabilities, all local models go to local (non-matching)", () => {

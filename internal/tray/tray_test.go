@@ -88,6 +88,30 @@ func TestState_DecodeInflightEvent(t *testing.T) {
 	require.Equal(t, 3, s.Waiting)
 }
 
+// TestState_DecodeInflightEvent_ToleratesUpstreamUnionFields decodes the
+// merged /api/events "inflight" payload: our total/byTier fields plus
+// upstream's operation/requests/request/id in the same JSON object (see
+// internal/swaputil/events.go InFlightRequestsEvent). This was verified by
+// inspection (encoding/json ignores unrecognized keys by default) rather than
+// by a test; pinning it here means a future upstream merge that changes the
+// union shape again fails a test instead of silently zeroing the waiting
+// count.
+func TestState_DecodeInflightEvent_ToleratesUpstreamUnionFields(t *testing.T) {
+	data := `{"total":3,"byTier":{"default":2,"priority":1},"operation":"snapshot",` +
+		`"requests":[{"id":"abc123","timestamp":"2026-08-14T00:00:00Z","model":"cq35",` +
+		`"req_path":"/v1/chat/completions","method":"POST","req_headers":{},` +
+		`"remote_ip":"127.0.0.1","resp_headers":{},"resp_bytes":0,"elapsed_ms":120}],` +
+		`"id":"abc123"}`
+	env, err := json.Marshal(eventEnvelope{Type: "inflight", Data: data})
+	require.NoError(t, err)
+
+	var s State
+	require.True(t, s.decodeEvent(env))
+	require.Equal(t, 3, s.Waiting)
+	require.Equal(t, 2, s.WaitingByTier["default"])
+	require.Equal(t, 1, s.WaitingByTier["priority"])
+}
+
 func TestState_WaitingHoldSuppressesFlap(t *testing.T) {
 	now := time.Now()
 	s := State{Now: func() time.Time { return now }}

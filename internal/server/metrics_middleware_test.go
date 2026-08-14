@@ -18,7 +18,7 @@ import (
 // correct, retrievable capture once the response has streamed.
 func TestServer_MetricsMiddleware_RequestCaptureAfterEarlyRelease(t *testing.T) {
 	cfg := config.Config{}
-	mm := newMetricsMonitor(logmon.NewWriter(io.Discard), 100, 5)
+	mm := newTestMetricsMonitor(t, logmon.NewWriter(io.Discard), 100, 5)
 	if !mm.enableCaptures {
 		t.Fatal("captures should be enabled with non-zero buffer")
 	}
@@ -42,7 +42,7 @@ func TestServer_MetricsMiddleware_RequestCaptureAfterEarlyRelease(t *testing.T) 
 		t.Fatalf("downstream handler saw body %q, want %q", downstreamSawBody, reqBody)
 	}
 
-	metrics := mm.getMetrics()
+	metrics := metricsEntries(t, mm)
 	if len(metrics) != 1 {
 		t.Fatalf("got %d metrics entries, want 1", len(metrics))
 	}
@@ -76,7 +76,7 @@ func TestServer_MetricsMiddleware_RequestCaptureAfterEarlyRelease(t *testing.T) 
 // (compression, decompression, storage) happens when captures are off.
 func TestServer_MetricsMiddleware_CapturesDisabled(t *testing.T) {
 	cfg := config.Config{}
-	mm := newMetricsMonitor(logmon.NewWriter(io.Discard), 100, 0)
+	mm := newTestMetricsMonitor(t, logmon.NewWriter(io.Discard), 100, 0)
 	if mm.enableCaptures {
 		t.Fatal("captures should be disabled with zero buffer")
 	}
@@ -93,7 +93,7 @@ func TestServer_MetricsMiddleware_CapturesDisabled(t *testing.T) {
 
 	CreateMetricsMiddleware(mm, cfg)(final).ServeHTTP(httptest.NewRecorder(), r)
 
-	metrics := mm.getMetrics()
+	metrics := metricsEntries(t, mm)
 	if len(metrics) != 1 {
 		t.Fatalf("got %d metrics entries, want 1", len(metrics))
 	}

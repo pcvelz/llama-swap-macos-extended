@@ -8,7 +8,7 @@ import (
 
 	"github.com/mostlygeek/llama-swap/internal/chain"
 	"github.com/mostlygeek/llama-swap/internal/config"
-	"github.com/mostlygeek/llama-swap/internal/shared"
+	"github.com/mostlygeek/llama-swap/internal/swaputil"
 )
 
 // CreateAuthMiddleware returns middleware that validates API keys when the
@@ -22,7 +22,7 @@ func CreateAuthMiddleware(cfg config.Config) chain.Middleware {
 			return next
 		}
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			provided := shared.ExtractAPIKey(r)
+			provided := swaputil.ExtractAPIKey(r)
 
 			valid := false
 			for _, key := range keys {
@@ -33,7 +33,7 @@ func CreateAuthMiddleware(cfg config.Config) chain.Middleware {
 			}
 			if !valid {
 				w.Header().Set("WWW-Authenticate", `Basic realm="llama-swap"`)
-				shared.SendResponse(w, r, http.StatusUnauthorized, "unauthorized: invalid or missing API key")
+				swaputil.SendResponse(w, r, http.StatusUnauthorized, "unauthorized: invalid or missing API key")
 				return
 			}
 
@@ -46,21 +46,22 @@ func CreateAuthMiddleware(cfg config.Config) chain.Middleware {
 // auth info from the request into the context. Requests where no model can be
 // identified are rejected with a 404.
 //
-// It also tags the request with a fresh shared.PreemptHandle wrapping a
+// It also tags the request with a fresh swaputil.PreemptHandle wrapping a
 // cancellable child of the request's context - as early as possible, before
-// CreateConcurrencyMiddleware's per-model semaphore can ever block on it.
-// Every layer downstream that can hold a request up (the semaphore, the FIFO
-// scheduler) reuses this SAME handle instead of minting its own, so a
-// preemption at any layer cancels through the one Flag+Cancel pair
+// any downstream layer can block on it. Every layer that can hold a request up
+// (the FIFO scheduler's queue and concurrency limits) reuses this SAME handle
+// instead of minting its own, so a preemption at any layer cancels through the
+// one Flag+Cancel pair
 // (docs/intent/llama-swap-tiers.md "Known soft spot"; see
 // internal/router/base.go ServeHTTP, which reads this handle back out of the
 // context).
 func CreateRequestContextMiddleware(cfg config.Config) chain.Middleware {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			data, err := shared.FetchContext(r, cfg)
+			r = markInflightStart(r)
+			data, err := swaputil.FetchContext(r, cfg)
 			if err != nil {
-				shared.SendError(w, r, shared.ErrNoModelInContext)
+				swaputil.SendError(w, r, swaputil.ErrNoModelInContext)
 				return
 			}
 			_ = data
@@ -68,10 +69,10 @@ func CreateRequestContextMiddleware(cfg config.Config) chain.Middleware {
 			parent := r.Context()
 			ctx, cancel := context.WithCancel(parent)
 			// Parent (the pre-wrap context) stays alive after Cancel fires -
-			// see shared.PreemptHandle.Parent for why a transparent replay
+			// see swaputil.PreemptHandle.Parent for why a transparent replay
 			// attempt needs it.
-			handle := &shared.PreemptHandle{Flag: new(atomic.Bool), Cancel: cancel, Parent: parent}
-			*r = *r.WithContext(shared.WithPreemptHandle(ctx, handle))
+			handle := &swaputil.PreemptHandle{Flag: new(atomic.Bool), Cancel: cancel, Parent: parent}
+			*r = *r.WithContext(swaputil.WithPreemptHandle(ctx, handle))
 
 			next.ServeHTTP(w, r)
 		})

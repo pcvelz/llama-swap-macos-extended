@@ -3,13 +3,18 @@ package scheduler
 import (
 	"fmt"
 	"sort"
+	"strconv"
 	"time"
 
 	"github.com/mostlygeek/llama-swap/internal/config"
 	"github.com/mostlygeek/llama-swap/internal/logmon"
 	"github.com/mostlygeek/llama-swap/internal/process"
-	"github.com/mostlygeek/llama-swap/internal/shared"
+	"github.com/mostlygeek/llama-swap/internal/swaputil"
 )
+
+// defaultConcurrencyLimit caps simultaneous in-flight requests per model when
+// the model config leaves concurrencyLimit unset.
+const defaultConcurrencyLimit = 10
 
 // grantedReq is one currently-granted (in-flight) request's tier bookkeeping,
 // tracked alongside FIFO.inFlight so the preemption branch can find victims
@@ -18,7 +23,7 @@ import (
 // OnServeDone for that model, not necessarily the one that produced them —
 // exactly mirroring the existing inFlight counter's per-model granularity.
 type grantedReq struct {
-	tier    shared.Tier
+	tier    swaputil.Tier
 	preempt func()
 }
 
@@ -45,6 +50,11 @@ type FIFO struct {
 	cfg     config.FifoConfig
 	effects Effects
 
+	// limits is the per-model concurrency cap (config concurrencyLimit,
+	// defaultConcurrencyLimit when unset). Upstream enforces it by rejecting
+	// over-limit arrivals with 429 before they can start a loading stream;
+	// this fork instead PARKS them in the queue — see atCapacity.
+	limits   map[string]int
 	active   map[string]*activeSwap
 	inFlight map[string]int
 	queued   []HandlerReq
@@ -86,15 +96,31 @@ type FIFO struct {
 	now func() time.Time
 }
 
-// NewFIFO builds a FIFO scheduler. It matches scheduler.Factory once a planner
-// is captured in a closure.
-func NewFIFO(name string, logger *logmon.Monitor, planner Swapper, cfg config.FifoConfig, grace map[string]time.Duration, eff Effects) *FIFO {
+// NewFIFO builds a FIFO scheduler. Both per-model tables are derived from
+// models: the concurrency limit (ConcurrencyLimit, falling back to
+// defaultConcurrencyLimit) and the swap-grace window (SwapGraceSeconds; absent
+// or 0 means no grace, which is upstream's behaviour).
+func NewFIFO(name string, logger *logmon.Monitor, planner Swapper, cfg config.FifoConfig, models map[string]config.ModelConfig, eff Effects) *FIFO {
+	limits := make(map[string]int, len(models))
+	grace := make(map[string]time.Duration, len(models))
+	for id, mc := range models {
+		limit := defaultConcurrencyLimit
+		if mc.ConcurrencyLimit > 0 {
+			limit = mc.ConcurrencyLimit
+		}
+		limits[id] = limit
+		if mc.SwapGraceSeconds > 0 {
+			grace[id] = time.Duration(mc.SwapGraceSeconds) * time.Second
+		}
+	}
+
 	return &FIFO{
 		name:       name,
 		logger:     logger,
 		planner:    planner,
 		cfg:        cfg,
 		effects:    eff,
+		limits:     limits,
 		active:     make(map[string]*activeSwap),
 		inFlight:   make(map[string]int),
 		granted:    make(map[string][]*grantedReq),
@@ -113,7 +139,11 @@ func NewFIFO(name string, logger *logmon.Monitor, planner Swapper, cfg config.Fi
 //
 // The decision tree, in order:
 //
-//  1. Unknown model — respond with ErrModelNotFound and move on.
+//  1. Unknown model — reject the admission handshake with ErrModelNotFound
+//     (before any loading stream can start) and move on.
+//     1b. Every other request is admitted immediately: the per-model concurrency
+//     cap parks over-capacity requests in the queue rather than rejecting
+//     them with a 429 (see atCapacity).
 //  2. A swap to the same model is already in flight — attach this waiter so
 //     one swap serves all callers that asked for the same model.
 //  3. Fast path — the target process is already ready, the planner sees
@@ -130,7 +160,13 @@ func (s *FIFO) OnRequest(req HandlerReq) {
 	state, ok := s.effects.ModelState(req.Model)
 	if !ok {
 		s.logger.Debugf("%s: model %s not handled by this router", s.name, req.Model)
-		s.effects.GrantError(req, ErrModelNotFound)
+		s.rejectAdmission(req, ErrModelNotFound)
+		return
+	}
+
+	// (1b) Admit before anything else can commit a response stream. A false
+	// return means the caller is already gone; it never reaches the queue.
+	if !s.admit(req) {
 		return
 	}
 
@@ -150,6 +186,20 @@ func (s *FIFO) OnRequest(req HandlerReq) {
 	// proceeds once the priority + default queues are empty.
 	if s.blockedByRankBarrier(req) {
 		s.logger.Debugf("%s: queuing request for model %s (rank barrier: higher-rank request queued)", s.name, req.Model)
+		s.enqueue(req)
+		return
+	}
+
+	// (2c) Per-model concurrency cap: the model is already serving as many
+	// requests as it is allowed to. Park in the queue and wait instead of
+	// bouncing the caller with a 429 (see atCapacity), booting an eligible
+	// lower-rank holder first if this arrival outranks one — the same
+	// same-model preemption the deleted semaphore layer performed.
+	if s.atCapacity(req) {
+		if s.tryPreempt(req, []string{req.Model}) {
+			s.logger.Debugf("%s: preempting same-model in-flight request(s) on %s for higher-rank arrival at concurrency cap", s.name, req.Model)
+		}
+		s.logger.Debugf("%s: queuing request for model %s (concurrency limit %d reached)", s.name, req.Model, s.limit(req.Model))
 		s.enqueue(req)
 		return
 	}
@@ -285,9 +335,19 @@ func (s *FIFO) OnSwapDone(ev SwapDone) {
 	for _, w := range sw.waiters {
 		if ev.Err != nil {
 			s.effects.GrantError(w, ev.Err)
-		} else {
-			s.grantHandler(w, ev.ModelID)
+			continue
 		}
+		// Waiters joined this swap before the concurrency cap could apply
+		// (branch (2) of OnRequest runs first), so honour it here: anything
+		// over the freshly-ready model's allowance goes back in the queue
+		// instead of being granted. Upstream keeps the same invariant by
+		// rejecting the excess waiter with a 429 at admission time.
+		if s.atCapacity(w) {
+			s.logger.Debugf("%s: swap waiter for model %s re-queued (concurrency limit %d reached)", s.name, ev.ModelID, s.limit(ev.ModelID))
+			s.enqueue(w)
+			continue
+		}
+		s.grantHandler(w, ev.ModelID)
 	}
 
 	s.drainQueue()
@@ -295,10 +355,12 @@ func (s *FIFO) OnSwapDone(ev SwapDone) {
 
 // OnServeDone decrements the per-model in-flight count and releases this
 // request's KV-admission reservation (if any). It retries the queue whenever
-// either freed something a parked request might now fit in: the in-flight
-// count dropping to zero (as before — a swap may now be possible), OR a KV
-// reservation being released (a parallel-slot request may now fit the pool
-// even while a sibling request for the same model is still in flight).
+// something a parked request might now fit in was freed: the in-flight count
+// dropping to zero (a swap may now be possible), a KV reservation being
+// released (a parallel-slot request may now fit the pool even while a sibling
+// request for the same model is still in flight), or simply a serving slot
+// coming free under the per-model concurrency cap (atCapacity) — the last of
+// which is true of every serve-done, so a non-empty queue is always re-walked.
 func (s *FIFO) OnServeDone(ev ServeDoneEvent) {
 	s.inFlight[ev.ModelID]--
 	// Drop one granted-tracking entry for this model, mirroring the inFlight
@@ -322,7 +384,10 @@ func (s *FIFO) OnServeDone(ev ServeDoneEvent) {
 
 	kvReleased := s.releaseKV(ev.ModelID, ev.EstimatedTokens)
 
-	if wentIdle || kvReleased {
+	// A serving slot always came free here, so a request parked purely by the
+	// concurrency cap must get another chance; drainQueue is a no-op on an
+	// empty queue.
+	if wentIdle || kvReleased || len(s.queued) > 0 {
 		s.drainQueue()
 	}
 }
@@ -448,6 +513,14 @@ func (s *FIFO) OnShutdown(err error) {
 // that already walked away will never produce a matching OnServeDone, so
 // reserving its estimate would strand that budget forever too.
 func (s *FIFO) grantHandler(req HandlerReq, modelID string) {
+	// Nil Ctx only happens in tests that build a bare HandlerReq; skip rather
+	// than panic in ctx.Value.
+	if req.Ctx != nil {
+		if err := swaputil.SetReqData(req.Ctx, "fifo_priority", strconv.Itoa(s.cfg.Priority[req.Model])); err != nil {
+			s.logger.Debugf("failed to set fifo_priority metadata: %v", err)
+		}
+	}
+
 	if s.effects.GrantServe(req, modelID) {
 		s.inFlight[modelID]++
 		if req.EstimatedTokens > 0 {
@@ -461,6 +534,74 @@ func (s *FIFO) grantHandler(req HandlerReq, modelID string) {
 			s.granted[modelID] = append(s.granted[modelID], &grantedReq{tier: req.Tier, preempt: req.Preempt})
 		}
 	}
+}
+
+// admit performs upstream's pre-stream admission handshake: the caller parks
+// on req.Admit until the scheduler answers, so any rejection is written as a
+// plain HTTP error before a loading/SSE stream can be committed (upstream
+// #889). It returns false only when the caller has already gone away.
+//
+// Fork divergence: upstream ALSO rejects here with a 429 once a model is at
+// its concurrency limit. This fork never does — over-capacity requests wait
+// (see atCapacity). Rationale (2026-07-05, re-homed from the deleted
+// internal/server concurrency middleware): a slot is held for a request's
+// entire lifetime including time parked behind a swap, so bursts of parked
+// requests exhausted the pool and real turns got instant 429s. Waiting queues
+// fairly, still caps concurrent child inference, and releases automatically
+// when the client disconnects (keepalive pings in router/pinging.go keep the
+// waiting stream alive meanwhile).
+func (s *FIFO) admit(req HandlerReq) bool {
+	return sendAdmission(req, nil)
+}
+
+// rejectAdmission answers the handshake with err. Used only for failures that
+// must be visible before any stream starts (unknown model).
+func (s *FIFO) rejectAdmission(req HandlerReq, err error) {
+	sendAdmission(req, err)
+}
+
+func sendAdmission(req HandlerReq, err error) bool {
+	if req.Admit == nil {
+		return true
+	}
+	done := reqDone(req)
+	select {
+	case <-done:
+		return false
+	default:
+	}
+	select {
+	case req.Admit <- err:
+		return true
+	case <-done:
+		return false
+	}
+}
+
+func reqDone(req HandlerReq) <-chan struct{} {
+	if req.Ctx == nil {
+		return nil
+	}
+	return req.Ctx.Done()
+}
+
+// atCapacity reports whether req's model is already serving its full
+// concurrency allowance. Requests marked ConcurrencyExempt (tokenize-only
+// count_tokens calls) are never held back here.
+func (s *FIFO) atCapacity(req HandlerReq) bool {
+	if req.ConcurrencyExempt {
+		return false
+	}
+	return s.inFlight[req.Model] >= s.limit(req.Model)
+}
+
+// limit returns the per-model concurrency cap, defaulting to
+// defaultConcurrencyLimit when the model has no explicit entry.
+func (s *FIFO) limit(modelID string) int {
+	if l, ok := s.limits[modelID]; ok {
+		return l
+	}
+	return defaultConcurrencyLimit
 }
 
 // tryPreempt looks for granted (in-flight) requests on models in evict that
@@ -478,7 +619,7 @@ func (s *FIFO) tryPreempt(req HandlerReq, evict []string) bool {
 			continue
 		}
 		for _, v := range victims {
-			if !shared.CanPreempt(v.tier, req.Tier) {
+			if !swaputil.CanPreempt(v.tier, req.Tier) {
 				continue // rank(victim) >= rank(arrival), or victim isn't eligible
 			}
 			if v.preempt != nil {
@@ -555,7 +696,7 @@ func (s *FIFO) startSwap(initial HandlerReq, evict, running []string) {
 }
 
 // enqueue inserts req into the queue in order: tier rank DESC first (see
-// shared.Tier / docs/intent/llama-swap-tiers.md), then the existing per-model
+// swaputil.Tier / docs/intent/llama-swap-tiers.md), then the existing per-model
 // priority (also DESC), then arrival (FIFO) order for ties on both keys. It
 // goes just before the first queued item whose (rank, priority) key is
 // strictly lower than req's, so higher-rank/higher-priority requests are
@@ -646,6 +787,15 @@ func (s *FIFO) drainQueue() {
 		}
 		running := s.runningSet(req.Model)
 		evict := s.planner.EvictionFor(req.Model, running)
+		// Concurrency cap, mirroring the OnRequest branch: the model is still
+		// serving its full allowance, so this request keeps waiting.
+		if s.atCapacity(req) {
+			if s.tryPreempt(req, []string{req.Model}) {
+				s.logger.Debugf("%s: preempting same-model in-flight request(s) on %s for queued higher-rank request at concurrency cap", s.name, req.Model)
+			}
+			stick(req)
+			continue
+		}
 		if state == process.StateReady && len(evict) == 0 && !collidesWith(req.Model, evict, s.active) {
 			if !s.kvAdmit(req.Model, req.EstimatedTokens) {
 				// Same-model preemption, mirroring the OnRequest fast-path

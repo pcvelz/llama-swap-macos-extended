@@ -13,8 +13,7 @@ import (
 	"github.com/mostlygeek/llama-swap/internal/config"
 	"github.com/mostlygeek/llama-swap/internal/logmon"
 	"github.com/mostlygeek/llama-swap/internal/process"
-	"github.com/mostlygeek/llama-swap/internal/router/scheduler"
-	"github.com/mostlygeek/llama-swap/internal/shared"
+	"github.com/mostlygeek/llama-swap/internal/swaputil"
 )
 
 // Transparent-replay tests (docs/intent/llama-swap-tiers.md "Known v1
@@ -26,8 +25,8 @@ import (
 // itself is genuine, not simulated.
 
 var (
-	replayTierBackground = shared.Tier{Name: "background", Rank: -10, Preemptible: true}
-	replayTierDefault    = shared.Tier{Name: "default", Rank: 0}
+	replayTierBackground = swaputil.Tier{Name: "background", Rank: -10, Preemptible: true}
+	replayTierDefault    = swaputil.Tier{Name: "default", Rank: 0}
 )
 
 // newReplayTestBase mirrors newTestBase (base_test.go) but accepts a
@@ -36,10 +35,11 @@ var (
 func newReplayTestBase(t *testing.T, processes map[string]process.Process, fifoCfg config.FifoConfig) *baseRouter {
 	t.Helper()
 	conf := config.Config{HealthCheckTimeout: 5}
-	b := newBaseRouter("test", conf, processes, logmon.NewWriter(io.Discard),
-		func(name string, logger *logmon.Monitor, eff scheduler.Effects) scheduler.Scheduler {
-			return scheduler.NewFIFO(name, logger, &stubPlanner{}, fifoCfg, nil, eff)
-		})
+	conf.Routing.Scheduler.Settings.Fifo = fifoCfg
+	b, err := newBaseRouter("test", conf, processes, logmon.NewWriter(io.Discard), &stubPlanner{})
+	if err != nil {
+		t.Fatalf("newBaseRouter: %v", err)
+	}
 	b.testProcessed = make(chan struct{}, 64)
 	go b.run()
 	t.Cleanup(func() {
@@ -53,14 +53,14 @@ func newReplayTestBase(t *testing.T, processes map[string]process.Process, fifoC
 // buildReplayReq constructs a POST /v1/chat/completions request for model,
 // tagged with tier (as a tier-listener would) and an optional X-Role header
 // so a shared fakeProcess.serveFunc can script per-caller behavior.
-func buildReplayReq(model, role string, tier shared.Tier) *http.Request {
+func buildReplayReq(model, role string, tier swaputil.Tier) *http.Request {
 	body := fmt.Sprintf(`{"model":%q}`, model)
 	r := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body))
 	r.Header.Set("Content-Type", "application/json")
 	if role != "" {
 		r.Header.Set("X-Role", role)
 	}
-	ctx := shared.WithTier(context.Background(), tier)
+	ctx := swaputil.WithTier(context.Background(), tier)
 	return r.WithContext(ctx)
 }
 

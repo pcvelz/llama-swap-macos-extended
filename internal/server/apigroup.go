@@ -10,28 +10,95 @@ import (
 	"strings"
 	"time"
 
+	"github.com/mostlygeek/llama-swap/internal/config"
 	"github.com/mostlygeek/llama-swap/internal/event"
 	"github.com/mostlygeek/llama-swap/internal/perf"
-	"github.com/mostlygeek/llama-swap/internal/shared"
+	"github.com/mostlygeek/llama-swap/internal/store"
+	"github.com/mostlygeek/llama-swap/internal/swaputil"
 )
 
 // apiModel is one entry in the /api/events modelStatus payload.
 type apiModel struct {
-	Id           string         `json:"id"`
-	Name         string         `json:"name"`
-	Description  string         `json:"description"`
-	State        string         `json:"state"`
-	Unlisted     bool           `json:"unlisted"`
-	PeerID       string         `json:"peerID"`
-	Aliases      []string       `json:"aliases,omitempty"`
-	Capabilities map[string]any `json:"capabilities,omitempty"`
-	TTL          int            `json:"ttl"`
-	LastUse      time.Time      `json:"lastUse"`
-	Pinned       bool           `json:"pinned,omitempty"`
+	Id            string         `json:"id"`
+	Name          string         `json:"name"`
+	Description   string         `json:"description"`
+	State         string         `json:"state"`
+	Unlisted      bool           `json:"unlisted"`
+	PeerID        string         `json:"peerID"`
+	Aliases       []string       `json:"aliases,omitempty"`
+	Capabilities  map[string]any `json:"capabilities,omitempty"`
+	ContextLength int            `json:"context_length,omitempty"`
+	TTL           int            `json:"ttl"`
+	LastUse       time.Time      `json:"lastUse"`
+	Pinned        bool           `json:"pinned,omitempty"`
 	// PinExpiresAt is the active lease deadline for a leased pin, RFC3339.
 	// Omitted for an unpinned model AND for a permanent pin (zero deadline)
 	// so existing clients that only look at Pinned see no behavior change.
 	PinExpiresAt string `json:"pinExpiresAt,omitempty"`
+}
+
+type apiProfile struct {
+	ID          string            `json:"id"`
+	Description string            `json:"description"`
+	Pins        map[string]string `json:"pins"`
+}
+
+func nullableProfile(name string) any {
+	if name == "" {
+		return nil
+	}
+	return name
+}
+
+func (s *Server) handleAPIProfiles(w http.ResponseWriter, r *http.Request) {
+	ids := make([]string, 0, len(s.cfg.Profiles))
+	for id := range s.cfg.Profiles {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+
+	profiles := make([]apiProfile, 0, len(ids))
+	for _, id := range ids {
+		profile := s.cfg.Profiles[id]
+		profiles = append(profiles, apiProfile{
+			ID:          id,
+			Description: profile.Description,
+			Pins:        profile.Pins,
+		})
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		"active":   nullableProfile(s.ActiveProfile()),
+		"profiles": profiles,
+	})
+}
+
+func (s *Server) handleAPIActiveProfile(w http.ResponseWriter, r *http.Request) {
+	var body map[string]json.RawMessage
+	decoder := json.NewDecoder(r.Body)
+	if err := decoder.Decode(&body); err != nil {
+		swaputil.SendResponse(w, r, http.StatusBadRequest, "invalid profile request")
+		return
+	}
+	raw, ok := body["name"]
+	if !ok {
+		swaputil.SendResponse(w, r, http.StatusBadRequest, "profile name is required")
+		return
+	}
+
+	var name string
+	if string(raw) != "null" {
+		if err := json.Unmarshal(raw, &name); err != nil {
+			swaputil.SendResponse(w, r, http.StatusBadRequest, "profile name must be a string or null")
+			return
+		}
+	}
+	if _, err := s.setActiveProfile(name); err != nil {
+		swaputil.SendResponse(w, r, http.StatusNotFound, err.Error())
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{"active": nullableProfile(s.ActiveProfile())})
 }
 
 // modelStatus returns every configured model joined with its current process
@@ -52,7 +119,7 @@ func (s *Server) modelStatus() []apiModel {
 		if st, ok := running[id]; ok {
 			state = string(st)
 		}
-		_, capsMap, _, _ := renderCapabilities(mc.Capabilities)
+		_, capsMap, _, ctxLen := renderCapabilities(mc.Capabilities)
 		lastUse, _ := s.local.ProcessLastUse(id)
 		pinDeadline, pinned := s.local.PinExpiry(id)
 		pinExpiresAt := ""
@@ -60,23 +127,24 @@ func (s *Server) modelStatus() []apiModel {
 			pinExpiresAt = pinDeadline.UTC().Format(time.RFC3339)
 		}
 		models = append(models, apiModel{
-			Id:           id,
-			Name:         mc.Name,
-			Description:  mc.Description,
-			State:        state,
-			Unlisted:     mc.Unlisted,
-			Aliases:      mc.Aliases,
-			Capabilities: capsMap,
-			TTL:          mc.UnloadAfter,
-			LastUse:      lastUse,
-			Pinned:       pinned,
-			PinExpiresAt: pinExpiresAt,
+			Id:            id,
+			Name:          mc.Name,
+			Description:   mc.Description,
+			State:         state,
+			Unlisted:      mc.Unlisted,
+			Aliases:       mc.Aliases,
+			Capabilities:  capsMap,
+			ContextLength: ctxLen,
+			TTL:           mc.UnloadAfter,
+			LastUse:       lastUse,
+			Pinned:        pinned,
+			PinExpiresAt:  pinExpiresAt,
 		})
 	}
 
 	for peerID, peer := range s.cfg.Peers {
 		for _, modelID := range peer.Models {
-			models = append(models, apiModel{Id: modelID, PeerID: peerID})
+			models = append(models, apiModel{Id: config.PeerModelFQN(peerID, modelID), PeerID: peerID})
 		}
 	}
 
@@ -85,7 +153,7 @@ func (s *Server) modelStatus() []apiModel {
 
 // handleAPIUnloadAll stops every running local process.
 func (s *Server) handleAPIUnloadAll(w http.ResponseWriter, r *http.Request) {
-	s.local.Unload(apiUnloadTimeout)
+	s.local.Unload(0)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"msg": "ok"})
 }
@@ -95,34 +163,109 @@ func (s *Server) handleAPIUnloadModel(w http.ResponseWriter, r *http.Request) {
 	requested := strings.TrimPrefix(r.PathValue("model"), "/")
 	realName, found := s.cfg.RealModelName(requested)
 	if !found {
-		shared.SendResponse(w, r, http.StatusNotFound, "model not found")
+		swaputil.SendResponse(w, r, http.StatusNotFound, "model not found")
 		return
 	}
 	if !s.local.Handles(realName) {
-		shared.SendResponse(w, r, http.StatusNotFound, "no local server found for requested model")
+		swaputil.SendResponse(w, r, http.StatusNotFound, "no local server found for requested model")
 		return
 	}
-	s.local.Unload(apiUnloadTimeout, realName)
+	s.local.Unload(0, realName)
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte("OK"))
 }
 
-// handleAPIMetrics serves the activity log as a JSON array.
-func (s *Server) handleAPIMetrics(w http.ResponseWriter, r *http.Request) {
-	data, err := s.metrics.getMetricsJSON()
+// handleAPIActivity serves paginated activity table rows.
+func (s *Server) handleAPIActivity(w http.ResponseWriter, r *http.Request) {
+	query, err := parseActivityQuery(r)
 	if err != nil {
-		shared.SendResponse(w, r, http.StatusInternalServerError, "failed to get metrics")
+		swaputil.SendResponse(w, r, http.StatusBadRequest, err.Error())
+		return
+	}
+	page, err := s.store.ListActivity(r.Context(), query)
+	if err != nil {
+		swaputil.SendResponse(w, r, http.StatusInternalServerError, "failed to get activity")
+		return
+	}
+	s.metrics.overlayCaptureState(page.Data)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(page)
+}
+
+// handleAPIActivityStats serves aggregate activity statistics and histograms.
+func (s *Server) handleAPIActivityStats(w http.ResponseWriter, r *http.Request) {
+	stats, err := s.store.ActivityStats(r.Context(), store.ActivityStatsQuery{
+		Model: strings.TrimSpace(r.URL.Query().Get("model")),
+	})
+	if err != nil {
+		swaputil.SendResponse(w, r, http.StatusInternalServerError, "failed to get activity stats")
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	w.Write(data)
+	json.NewEncoder(w).Encode(stats)
+}
+
+func parseActivityLimit(raw string) (int, error) {
+	limit, err := strconv.Atoi(raw)
+	if err != nil {
+		return 0, fmt.Errorf("invalid limit")
+	}
+	if limit > 0 && limit < 1000 {
+		return limit, nil
+	}
+	return 0, fmt.Errorf("limit must be between 1 and 999")
+}
+
+func parseActivityQuery(r *http.Request) (store.ActivityQuery, error) {
+	const defaultLimit = 25
+	query := store.ActivityQuery{
+		Model: strings.TrimSpace(r.URL.Query().Get("model")),
+		Limit: defaultLimit,
+		Page:  1,
+	}
+
+	if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
+		limit, err := parseActivityLimit(raw)
+		if err != nil {
+			return store.ActivityQuery{}, err
+		}
+		query.Limit = limit
+	}
+
+	if raw := strings.TrimSpace(r.URL.Query().Get("page")); raw != "" {
+		page, err := strconv.Atoi(raw)
+		if err != nil || page < 1 {
+			return store.ActivityQuery{}, fmt.Errorf("page must be >= 1")
+		}
+		query.Page = page
+	}
+
+	if raw := strings.TrimSpace(r.URL.Query().Get("sort")); raw != "" {
+		if _, ok := store.ActivitySortColumn(raw); !ok {
+			return store.ActivityQuery{}, fmt.Errorf("invalid sort column")
+		}
+		query.Sort = raw
+	}
+
+	if raw := strings.TrimSpace(r.URL.Query().Get("order")); raw != "" {
+		switch strings.ToLower(raw) {
+		case "asc", "desc":
+			query.Order = strings.ToLower(raw)
+		default:
+			return store.ActivityQuery{}, fmt.Errorf("order must be asc or desc")
+		}
+	}
+
+	return query, nil
 }
 
 // handleAPIPerformance serves the buffered system/GPU stats, optionally
 // filtered to samples after the ?after=<RFC3339> timestamp.
 func (s *Server) handleAPIPerformance(w http.ResponseWriter, r *http.Request) {
 	if s.perf == nil {
-		shared.SendResponse(w, r, http.StatusServiceUnavailable, "performance monitor not available")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(map[string]bool{"enabled": false})
 		return
 	}
 
@@ -131,7 +274,7 @@ func (s *Server) handleAPIPerformance(w http.ResponseWriter, r *http.Request) {
 	if afterStr := r.URL.Query().Get("after"); afterStr != "" {
 		after, err := time.Parse(time.RFC3339, afterStr)
 		if err != nil {
-			shared.SendResponse(w, r, http.StatusBadRequest, "invalid 'after' timestamp, use RFC3339 format")
+			swaputil.SendResponse(w, r, http.StatusBadRequest, "invalid 'after' timestamp, use RFC3339 format")
 			return
 		}
 		filteredSys := make([]perf.SysStat, 0, len(sysStats))
@@ -153,6 +296,7 @@ func (s *Server) handleAPIPerformance(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{
+		"enabled":   true,
 		"sys_stats": sysStats,
 		"gpu_stats": gpuStats,
 	})
@@ -168,23 +312,35 @@ func (s *Server) handleAPIVersion(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleAPIHardware serves the hardware snapshot captured at process startup.
+func (s *Server) handleAPIHardware(w http.ResponseWriter, r *http.Request) {
+	if s.hardware == nil {
+		swaputil.SendResponse(w, r, http.StatusServiceUnavailable, "hardware detection unavailable")
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(s.hardware); err != nil {
+		s.proxylog.Warnf("failed to encode hardware snapshot: %v", err)
+	}
+}
+
 // handleAPICapture returns the stored request/response capture for a metric ID.
 func (s *Server) handleAPICapture(w http.ResponseWriter, r *http.Request) {
 	id, err := strconv.Atoi(r.PathValue("id"))
 	if err != nil {
-		shared.SendResponse(w, r, http.StatusBadRequest, "invalid capture ID")
+		swaputil.SendResponse(w, r, http.StatusBadRequest, "invalid capture ID")
 		return
 	}
 
 	capture := s.metrics.getCaptureByID(id)
 	if capture == nil {
-		shared.SendResponse(w, r, http.StatusNotFound, "capture not found")
+		swaputil.SendResponse(w, r, http.StatusNotFound, "capture not found")
 		return
 	}
 
 	jsonBytes, err := json.Marshal(capture)
 	if err != nil {
-		shared.SendResponse(w, r, http.StatusInternalServerError, "failed to marshal capture")
+		swaputil.SendResponse(w, r, http.StatusInternalServerError, "failed to marshal capture")
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -203,11 +359,11 @@ func (s *Server) handleAPIPin(w http.ResponseWriter, r *http.Request) {
 	requested := r.PathValue("model")
 	realName, found := s.cfg.RealModelName(requested)
 	if !found {
-		shared.SendResponse(w, r, http.StatusNotFound, "model not found")
+		swaputil.SendResponse(w, r, http.StatusNotFound, "model not found")
 		return
 	}
 	if !s.local.Handles(realName) {
-		shared.SendResponse(w, r, http.StatusNotFound, "no local server found for requested model")
+		swaputil.SendResponse(w, r, http.StatusNotFound, "no local server found for requested model")
 		return
 	}
 
@@ -215,7 +371,7 @@ func (s *Server) handleAPIPin(w http.ResponseWriter, r *http.Request) {
 	if ttlStr := r.URL.Query().Get("ttl"); ttlStr != "" {
 		ttlSeconds, err := strconv.Atoi(ttlStr)
 		if err != nil || ttlSeconds < 0 {
-			shared.SendResponse(w, r, http.StatusBadRequest, "invalid ttl, must be a non-negative integer number of seconds")
+			swaputil.SendResponse(w, r, http.StatusBadRequest, "invalid ttl, must be a non-negative integer number of seconds")
 			return
 		}
 		ttl = time.Duration(ttlSeconds) * time.Second
@@ -235,11 +391,11 @@ func (s *Server) handleAPIUnpin(w http.ResponseWriter, r *http.Request) {
 	requested := r.PathValue("model")
 	realName, found := s.cfg.RealModelName(requested)
 	if !found {
-		shared.SendResponse(w, r, http.StatusNotFound, "model not found")
+		swaputil.SendResponse(w, r, http.StatusNotFound, "model not found")
 		return
 	}
 	if !s.local.Handles(realName) {
-		shared.SendResponse(w, r, http.StatusNotFound, "no local server found for requested model")
+		swaputil.SendResponse(w, r, http.StatusNotFound, "no local server found for requested model")
 		return
 	}
 	s.local.Unpin(realName)
@@ -247,13 +403,28 @@ func (s *Server) handleAPIUnpin(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{"msg": "unpinned"})
 }
 
+// handleAPICancelInflight cancels an active model-dispatched request by its
+// inflight ID. Normal request cleanup removes the row and emits the update.
+func (s *Server) handleAPICancelInflight(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" || !s.inflight.Cancel(id) {
+		swaputil.SendResponse(w, r, http.StatusNotFound, "inflight request not found")
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"msg": "ok"})
+}
+
 type messageType string
 
 const (
 	msgTypeModelStatus messageType = "modelStatus"
 	msgTypeLogData     messageType = "logData"
-	msgTypeMetrics     messageType = "metrics"
+	msgTypeActivity    messageType = "activity"
 	msgTypeInFlight    messageType = "inflight"
+	msgTypeUIConfig    messageType = "uiConfig"
+	msgTypeProfile     messageType = "profileChanged"
 )
 
 type messageEnvelope struct {
@@ -273,7 +444,7 @@ func (s *Server) handleAPIEvents(w http.ResponseWriter, r *http.Request) {
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
-		shared.SendResponse(w, r, http.StatusInternalServerError, "streaming unsupported")
+		swaputil.SendResponse(w, r, http.StatusInternalServerError, "streaming unsupported")
 		return
 	}
 
@@ -302,37 +473,54 @@ func (s *Server) handleAPIEvents(w http.ResponseWriter, r *http.Request) {
 			send(messageEnvelope{Type: msgTypeLogData, Data: string(j)})
 		}
 	}
-	sendMetrics := func(metrics []ActivityLogEntry) {
-		if j, err := json.Marshal(metrics); err == nil {
-			send(messageEnvelope{Type: msgTypeMetrics, Data: string(j)})
+	sendActivity := func(id int) {
+		if j, err := json.Marshal(map[string]int{"id": id}); err == nil {
+			send(messageEnvelope{Type: msgTypeActivity, Data: string(j)})
 		}
 	}
-	// byTier is included only when it carries more than one tier (see
-	// inflightCounter.tierSnapshot/byTierOrNil) so a config with no `tiers:`
-	// block emits the same {"total":N} payload as before tiers existed.
-	sendInFlight := func(total int, byTier map[string]int) {
-		payload := map[string]any{"total": total}
-		if len(byTier) > 1 {
-			payload["byTier"] = byTier
+	// The marshalled event carries upstream's operation/requests fields AND
+	// our aggregate "total" plus the per-tier "byTier" breakdown (stamped by
+	// inflightTracker.withCountsLocked). byTier is present only when more than
+	// one tier is configured, so a config with no `tiers:` block emits the same
+	// {"total":N,...} shape as before tiers existed — this is what the macOS
+	// menu-bar helper and internal/tray decode.
+	sendInFlight := func(update swaputil.InFlightRequestsEvent) {
+		if update.Operation == inflightOperationSnapshot && update.Requests == nil {
+			update.Requests = []swaputil.InflightRequestEntry{}
 		}
-		if j, err := json.Marshal(payload); err == nil {
+		if j, err := json.Marshal(update); err == nil {
 			send(messageEnvelope{Type: msgTypeInFlight, Data: string(j)})
 		}
 	}
+	sendUIConfig := func() {
+		if j, err := json.Marshal(s.cfg.UI); err == nil {
+			send(messageEnvelope{Type: msgTypeUIConfig, Data: string(j)})
+		}
+	}
+	sendProfile := func() {
+		if j, err := json.Marshal(map[string]any{"active": nullableProfile(s.ActiveProfile())}); err == nil {
+			send(messageEnvelope{Type: msgTypeProfile, Data: string(j)})
+		}
+	}
 
-	defer event.On(func(e shared.ProcessStateChangeEvent) { sendModels() })()
-	defer event.On(func(e shared.ConfigFileChangedEvent) { sendModels() })()
+	defer event.On(func(e swaputil.ProcessStateChangeEvent) { sendModels() })()
+	defer event.On(func(e swaputil.ConfigFileChangedEvent) { sendModels() })()
+	defer event.On(func(e swaputil.ProfileChangedEvent) {
+		sendProfile()
+		sendModels()
+	})()
 	defer s.proxylog.OnLogData(func(data []byte) { sendLogData("proxy", data) })()
 	defer s.upstreamlog.OnLogData(func(data []byte) { sendLogData("upstream", data) })()
-	defer event.On(func(e ActivityLogEvent) { sendMetrics([]ActivityLogEntry{e.Metrics}) })()
-	defer event.On(func(e shared.InFlightRequestsEvent) { sendInFlight(e.Total, e.ByTier) })()
+	defer event.On(func(e ActivityLogEvent) { sendActivity(e.Metrics.ID) })()
+	defer event.On(func(e swaputil.InFlightRequestsEvent) { sendInFlight(e) })()
 
 	// initial payload
 	sendLogData("proxy", s.proxylog.GetHistory())
 	sendLogData("upstream", s.upstreamlog.GetHistory())
 	sendModels()
-	sendMetrics(s.metrics.getMetrics())
-	sendInFlight(int(s.inflight.Current()), s.inflight.tierSnapshot())
+	sendUIConfig()
+	sendProfile()
+	sendInFlight(s.inflight.Current())
 
 	for {
 		select {

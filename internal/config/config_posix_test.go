@@ -60,6 +60,7 @@ models:
 	assert.Equal(t, 5800, config.StartPort)
 	assert.Equal(t, "info", config.LogLevel)
 	assert.Equal(t, "", config.LogTimeFormat)
+	assert.Equal(t, DEFAULT_UNLOAD_TIMEOUT, config.UnloadTimeout)
 
 	// Test default group exists
 	defaultGroup, exists := config.Groups["(default)"]
@@ -81,6 +82,7 @@ models:
 		assert.Equal(t, []string{}, model1.Aliases)
 		assert.Equal(t, []string{}, model1.Env)
 		assert.Equal(t, 0, model1.UnloadAfter)
+		assert.Equal(t, DEFAULT_UNLOAD_TIMEOUT, model1.UnloadTimeout)
 		assert.Equal(t, false, model1.Unlisted)
 		assert.Equal(t, "", model1.UseModelName)
 		assert.Equal(t, 0, model1.ConcurrencyLimit)
@@ -138,8 +140,10 @@ models:
 healthCheckTimeout: 15
 profiles:
   test:
-    - model1
-    - model2
+    description: Test profile
+    pins:
+      fast: model1
+      disabled: ~
 groups:
   group1:
     swap: true
@@ -207,6 +211,7 @@ groups:
 		},
 		SendLoadingState: false,
 		MenuBar:          DefaultMenuBarConfig(),
+		UnloadTimeout:    DEFAULT_UNLOAD_TIMEOUT,
 		Models: map[string]ModelConfig{
 			"model1": {
 				Cmd:                "path/to/cmd --arg1 one",
@@ -219,6 +224,7 @@ groups:
 				SendLoadingState:   &modelLoadingState,
 				Timeouts:           defaultTimeout,
 				HealthCheckTimeout: 15,
+				UnloadTimeout:      DEFAULT_UNLOAD_TIMEOUT,
 			},
 			"model2": {
 				Cmd:                "path/to/server --arg1 one",
@@ -229,6 +235,7 @@ groups:
 				SendLoadingState:   &modelLoadingState,
 				Timeouts:           defaultTimeout,
 				HealthCheckTimeout: 15,
+				UnloadTimeout:      DEFAULT_UNLOAD_TIMEOUT,
 			},
 			"model3": {
 				Cmd:                "path/to/cmd --arg1 one",
@@ -239,6 +246,7 @@ groups:
 				SendLoadingState:   &modelLoadingState,
 				Timeouts:           defaultTimeout,
 				HealthCheckTimeout: 15,
+				UnloadTimeout:      DEFAULT_UNLOAD_TIMEOUT,
 			},
 			"model4": {
 				Cmd:                "path/to/cmd --arg1 one",
@@ -249,16 +257,27 @@ groups:
 				SendLoadingState:   &modelLoadingState,
 				Timeouts:           defaultTimeout,
 				HealthCheckTimeout: 15,
+				UnloadTimeout:      DEFAULT_UNLOAD_TIMEOUT,
 			},
 		},
 		HealthCheckTimeout: 15,
 		MetricsMaxInMemory: 1000,
 		CaptureBuffer:      5,
+		UI: UIConfig{Activity: UIActivityConfig{SessionID: []string{
+			"X-Session-ID",
+			"X-Litellm-Session-Id",
+		}}},
 		Performance: PerformanceConfig{
 			Every: 5 * time.Second,
 		},
-		Profiles: map[string][]string{
-			"test": {"model1", "model2"},
+		Profiles: map[string]ProfileConfig{
+			"test": {
+				Description: "Test profile",
+				Pins: map[string]string{
+					"fast":     "model1",
+					"disabled": "",
+				},
+			},
 		},
 		aliases: map[string]string{
 			"m1":        "model1",
@@ -267,6 +286,9 @@ groups:
 			"mthree":    "model3",
 		},
 		Groups: expectedGroups,
+		Upstream: UpstreamConfig{
+			IgnorePaths: DefaultUpstreamIgnorePaths(),
+		},
 		Routing: RoutingConfig{
 			Router: RouterConfig{
 				Use: "group",

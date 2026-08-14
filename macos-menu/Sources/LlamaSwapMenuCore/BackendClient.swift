@@ -94,12 +94,16 @@ public final class BackendClient: ObservableObject {
     }
 
     private func fetchMetrics() {
-        let url = baseURL.appendingPathComponent("/api/metrics")
+        // GET /api/metrics/activity is paginated (sqlite-backed, default page
+        // size 25) - counting its "data" array would report a page size, not
+        // a true total. /api/metrics/stats carries the aggregate total_requests
+        // count directly.
+        let url = baseURL.appendingPathComponent("/api/metrics/stats")
         URLSession.shared.dataTask(with: url) { [weak self] data, _, _ in
             guard let data else { return }
-            if let entries = try? JSONDecoder().decode([ActivityLogEntry].self, from: data) {
+            if let stats = try? JSONDecoder().decode(ActivityStats.self, from: data) {
                 DispatchQueue.main.async {
-                    self?.menuState.completed = entries.count
+                    self?.menuState.completed = stats.totalRequests
                 }
             }
         }.resume()

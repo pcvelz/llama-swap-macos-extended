@@ -14,7 +14,7 @@ import (
 	"github.com/mostlygeek/llama-swap/internal/chain"
 	"github.com/mostlygeek/llama-swap/internal/config"
 	"github.com/mostlygeek/llama-swap/internal/logmon"
-	"github.com/mostlygeek/llama-swap/internal/shared"
+	"github.com/mostlygeek/llama-swap/internal/swaputil"
 )
 
 // NewLoggers builds the proxy, upstream, and combined (mux) log monitors,
@@ -76,7 +76,7 @@ func (s *Server) getLogger(logMonitorID string) (*logmon.Monitor, error) {
 	case "upstream":
 		return s.upstreamlog, nil
 	default:
-		if _, modelID, _, found := findModelInPath(s.cfg, "/"+logMonitorID); found {
+		if _, modelID, _, found := swaputil.FindModelInPath(s.cfg, "/"+logMonitorID); found {
 			if log, ok := s.local.ProcessLogger(modelID); ok {
 				return log, nil
 			}
@@ -102,13 +102,13 @@ func (s *Server) handleLogStream(w http.ResponseWriter, r *http.Request) {
 
 	logger, err := s.getLogger(logMonitorID)
 	if err != nil {
-		shared.SendResponse(w, r, http.StatusBadRequest, err.Error())
+		swaputil.SendResponse(w, r, http.StatusBadRequest, err.Error())
 		return
 	}
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
-		shared.SendResponse(w, r, http.StatusInternalServerError, "streaming unsupported")
+		swaputil.SendResponse(w, r, http.StatusInternalServerError, "streaming unsupported")
 		return
 	}
 
@@ -226,10 +226,10 @@ func CreateRequestLogMiddleware(proxylog *logmon.Monitor) chain.Middleware {
 			rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 			next.ServeHTTP(rec, r)
 
-			// TierFromContext falls back to shared.DefaultTier ("default") for
+			// TierFromContext falls back to swaputil.DefaultTier ("default") for
 			// any request that never passed through tier-wrapping, so this
 			// field is always populated, never blank.
-			tier := shared.TierFromContext(r.Context()).Name
+			tier := swaputil.TierFromContext(r.Context()).Name
 
 			proxylog.Infof("Request %s \"%s %s %s\" %d %d \"%s\" %v tier=%s",
 				ip, method, path, proto, rec.status, rec.size, ua, time.Since(start), tier)

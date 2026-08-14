@@ -1,6 +1,7 @@
 export type ConnectionState = "connected" | "connecting" | "disconnected";
 
 export type ModelStatus = "ready" | "starting" | "stopping" | "stopped" | "shutdown" | "unknown";
+export type PlaygroundModelType = "model" | "peer" | "selector" | "profile";
 
 export interface ModelCapabilities {
   vision?: boolean;
@@ -19,15 +20,34 @@ export interface Model {
   description: string;
   unlisted: boolean;
   peerID: string;
+  playgroundType?: PlaygroundModelType;
   aliases?: string[];
   capabilities?: ModelCapabilities;
   ttl: number;
   lastUse: string;
   pinned: boolean;
+  context_length?: number;
+  // selector-only fields from the v1/models llamaswap metadata
+  strategy?: string;
+  targets?: string[];
+  spillover?: number;
+}
+
+export interface Profile {
+  id: string;
+  description: string;
+  pins: Record<string, string>;
+}
+
+export interface ProfileState {
+  active: string | null;
+  profiles: Profile[];
 }
 
 export interface TokenMetrics {
   cache_tokens: number;
+  draft_tokens: number;
+  draft_acc_tokens: number;
   input_tokens: number;
   output_tokens: number;
   prompt_per_second: number;
@@ -44,6 +64,16 @@ export interface ActivityLogEntry {
   tokens: TokenMetrics;
   duration_ms: number;
   has_capture: boolean;
+  error_msg?: string;
+  metadata?: Record<string, string>;
+}
+
+export interface ActivityPage {
+  data: ActivityLogEntry[];
+  page: number;
+  limit: number;
+  total: number;
+  total_pages: number;
 }
 
 export interface ReqRespCapture {
@@ -60,8 +90,32 @@ export interface LogData {
   data: string;
 }
 
+export interface InflightRequestEntry {
+  id: string;
+  timestamp: string;
+  model: string;
+  req_path: string;
+  method: string;
+  req_headers: Record<string, string>;
+  remote_ip: string;
+  resp_headers: Record<string, string>;
+  resp_bytes: number;
+  elapsed_ms: number;
+  client_received_at_ms?: number;
+  metadata?: Record<string, string>;
+}
+
 export interface InFlightStats {
-  total: number;
+  operation: "snapshot" | "upsert" | "remove";
+  requests?: InflightRequestEntry[];
+  request?: InflightRequestEntry;
+  id?: string;
+}
+
+export interface UIConfig {
+  activity: {
+    session_id: string[];
+  };
 }
 
 export interface NetIOStat {
@@ -105,7 +159,7 @@ export interface PerformanceResponse {
 }
 
 export interface APIEventEnvelope {
-  type: "modelStatus" | "logData" | "metrics" | "inflight" | "perfsys" | "perfgpu";
+  type: "modelStatus" | "logData" | "activity" | "inflight" | "uiConfig" | "profileChanged" | "perfsys" | "perfgpu";
   data: string;
 }
 
@@ -119,10 +173,84 @@ export interface HistogramData {
   p50: number;
 }
 
+export interface ActivityStatsData {
+  total_requests: number;
+  total_input_tokens: number;
+  total_output_tokens: number;
+  total_cache_tokens: number;
+  prompt_histogram: HistogramData | null;
+  gen_histogram: HistogramData | null;
+}
+
 export interface VersionInfo {
   build_date: string;
   commit: string;
   version: string;
+}
+
+export interface HardwareSnapshot {
+  schema_version: number;
+  captured_at: string;
+  capture: HardwareCapture;
+  architecture: HardwareArchitecture;
+  operating_system: HardwareOperatingSystem;
+  environment: HardwareEnvironment;
+  cpu: HardwareCPU;
+  memory: HardwareMemory;
+  accelerators: HardwareAccelerator[];
+}
+
+export interface HardwareCapture {
+  scope: "inference_host";
+  method: "detected" | "detected_and_edited" | "manual";
+  detector: { name: string; version: string } | null;
+}
+
+export interface HardwareArchitecture {
+  name: string;
+  raw_name?: string | null;
+}
+
+export interface HardwareOperatingSystem {
+  family: string;
+  name: string | null;
+  version: string | null;
+  kernel: string | null;
+  raw_family?: string | null;
+}
+
+export interface HardwareEnvironment {
+  kind: string;
+  name: string | null;
+  version: string | null;
+  raw_kind?: string | null;
+}
+
+export interface HardwareCPU {
+  vendor: string | null;
+  model: string | null;
+  socket_count: number | null;
+  physical_core_count: number | null;
+  logical_thread_count: number | null;
+}
+
+export interface HardwareMemory {
+  capacity_bytes: number;
+}
+
+export interface HardwareAccelerator {
+  index: number;
+  kind: "gpu" | "npu" | "other";
+  raw_kind?: string | null;
+  vendor: string | null;
+  model: string | null;
+  architecture: string | null;
+  memory: {
+    kind: "dedicated" | "unified" | "shared_system" | "unknown";
+    capacity_bytes: number | null;
+  };
+  driver: { name: string | null; version: string | null } | null;
+  power_limit_watts: number | null;
 }
 
 export type ScreenWidth = "xs" | "sm" | "md" | "lg" | "xl" | "2xl";

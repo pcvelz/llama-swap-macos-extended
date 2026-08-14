@@ -21,12 +21,14 @@ import (
 
 	"github.com/mostlygeek/llama-swap/internal/config"
 	"github.com/mostlygeek/llama-swap/internal/event"
+	"github.com/mostlygeek/llama-swap/internal/hw"
 	"github.com/mostlygeek/llama-swap/internal/logmon"
 	"github.com/mostlygeek/llama-swap/internal/menubar"
 	"github.com/mostlygeek/llama-swap/internal/perf"
 	"github.com/mostlygeek/llama-swap/internal/process"
 	"github.com/mostlygeek/llama-swap/internal/server"
-	"github.com/mostlygeek/llama-swap/internal/shared"
+	"github.com/mostlygeek/llama-swap/internal/store"
+	"github.com/mostlygeek/llama-swap/internal/swaputil"
 	"github.com/mostlygeek/llama-swap/internal/watcher"
 )
 
@@ -58,8 +60,16 @@ var logTimeFormats = map[string]string{
 	"stampnano":   time.StampNano,
 }
 
+func configStorePath(cfg config.Config) string {
+	if cfg.Store == nil {
+		return ""
+	}
+	return strings.TrimSpace(cfg.Store.Path)
+}
+
 func main() {
-	flagConfig := flag.String("config", "", "path to config file (required)")
+	flagConfig := flag.String("config", "", "path to config file")
+	flagConfigDir := flag.String("config-dir", "", "directory of *.yml/*.yaml config files (additive to -config)")
 	flagListen := flag.String("listen", "", "listen address (default :8080 or :8443 for TLS)")
 	flagCertFile := flag.String("tls-cert-file", "", "TLS certificate file")
 	flagKeyFile := flag.String("tls-key-file", "", "TLS key file")
@@ -73,8 +83,8 @@ func main() {
 		os.Exit(0)
 	}
 
-	if *flagConfig == "" {
-		slog.Error("-config is required")
+	if *flagConfig == "" && *flagConfigDir == "" {
+		slog.Error("at least one of -config or -config-dir must be provided")
 		os.Exit(1)
 	}
 
@@ -93,10 +103,9 @@ func main() {
 		}
 	}
 
-	configPath := *flagConfig
-	cfg, err := config.LoadConfig(configPath)
+	cfg, err := config.LoadConfigSources(*flagConfig, *flagConfigDir)
 	if err != nil {
-		slog.Error("failed to load config", "path", configPath, "error", err)
+		slog.Error("failed to load config", "config", *flagConfig, "config-dir", *flagConfigDir, "error", err)
 		os.Exit(1)
 	}
 
@@ -109,10 +118,6 @@ func main() {
 	// owns the combined history served by /logs. They outlive config reloads,
 	// so a LogToStdout change requires a restart to take effect.
 	muxLog, proxyLog, upstreamLog := server.NewLoggers(cfg.LogToStdout)
-
-	if len(cfg.Profiles) > 0 {
-		proxyLog.Warn("Profile functionality has been removed in favor of Groups. See the README for more information.")
-	}
 
 	applyLogSettings := func(cfg config.Config) {
 		level := logmon.LevelInfo
@@ -133,6 +138,19 @@ func main() {
 
 	applyLogSettings(cfg)
 	proxyLog.Debugf("PID: %d", os.Getpid())
+
+	// Hardware describes the inference host and remains stable for the life of
+	// this process, including config reloads. Detection is best effort so an
+	// unavailable platform probe never prevents llama-swap from starting.
+	var hardwareSnapshot *hw.HardwareSnapshot
+	detectCtx, detectCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	detectedHardware, detectErr := hw.Detect(detectCtx, version)
+	detectCancel()
+	if detectErr != nil {
+		proxyLog.Warnf("hardware detection unavailable: %v", detectErr)
+	} else {
+		hardwareSnapshot = &detectedHardware
+	}
 
 	// On Windows, bind the process tree to a Job Object so every upstream
 	// process is reaped when llama-swap exits — even on a forced kill. No-op
@@ -156,15 +174,25 @@ func main() {
 
 	buildInfo := server.BuildInfo{Version: version, Commit: commit, Date: date}
 
-	initialSrv, err := server.New(cfg, muxLog, proxyLog, upstreamLog, perfMon, buildInfo)
+	initialStorePath := configStorePath(cfg)
+	initialStore, err := store.New(initialStorePath)
+	if err != nil {
+		slog.Error("failed to create store", "error", err)
+		os.Exit(1)
+	}
+
+	initialSrv, err := server.New(cfg, muxLog, proxyLog, upstreamLog, perfMon, initialStore, buildInfo, hardwareSnapshot)
 	if err != nil {
 		slog.Error("failed to create server", "error", err)
+		initialStore.Close()
 		os.Exit(1)
 	}
 
 	// activeSrv is swapped atomically during hot reload.
 	var activeMu sync.RWMutex
 	activeSrv := initialSrv
+	activeStore := initialStore
+	activeStorePath := initialStorePath
 
 	// The helper receives its settings via env vars at launch, so a changed
 	// `menu_bar` section needs a helper relaunch; applyMenuBar reconciles the
@@ -273,9 +301,9 @@ func main() {
 	sort.Strings(tierNames)
 	for _, name := range tierNames {
 		tc := cfg.Tiers[name]
-		tier := shared.Tier{Name: name, Rank: tc.Rank, Preempts: tc.Preempts, Preemptible: tc.Preemptible}
+		tier := swaputil.Tier{Name: name, Rank: tc.Rank, Preempts: tc.Preempts, Preemptible: tc.Preemptible}
 		tierHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			mainHandler.ServeHTTP(w, r.WithContext(shared.WithTier(r.Context(), tier)))
+			mainHandler.ServeHTTP(w, r.WithContext(swaputil.WithTier(r.Context(), tier)))
 		})
 		srv := &http.Server{Addr: tc.Listen, Handler: tierHandler}
 		tierServers = append(tierServers, srv)
@@ -311,29 +339,47 @@ func main() {
 
 		proxyLog.Info("reloading configuration")
 
-		newCfg, err := config.LoadConfig(configPath)
+		newCfg, err := config.LoadConfigSources(*flagConfig, *flagConfigDir)
 		if err != nil {
 			proxyLog.Warnf("failed to reload config: %v", err)
 			return
-		}
-
-		if len(newCfg.Profiles) > 0 {
-			proxyLog.Warn("Profile functionality has been removed in favor of Groups. See the README for more information.")
 		}
 
 		if perfMon != nil {
 			perfMon.UpdateConfig(newCfg.Performance)
 		}
 
-		newSrv, err := server.New(newCfg, muxLog, proxyLog, upstreamLog, perfMon, buildInfo)
+		newStorePath := configStorePath(newCfg)
+		activeMu.RLock()
+		currentStore := activeStore
+		currentStorePath := activeStorePath
+		activeMu.RUnlock()
+
+		newStore := currentStore
+		storeChanged := newStorePath != currentStorePath
+		if storeChanged {
+			newStore, err = store.New(newStorePath)
+			if err != nil {
+				proxyLog.Warnf("failed to create new store during reload: %v", err)
+				return
+			}
+		}
+
+		newSrv, err := server.New(newCfg, muxLog, proxyLog, upstreamLog, perfMon, newStore, buildInfo, hardwareSnapshot)
 		if err != nil {
 			proxyLog.Warnf("failed to build new server during reload: %v", err)
+			if storeChanged {
+				newStore.Close()
+			}
 			return
 		}
 
 		activeMu.Lock()
 		old := activeSrv
+		oldStore := activeStore
 		activeSrv = newSrv
+		activeStore = newStore
+		activeStorePath = newStorePath
 		activeMu.Unlock()
 
 		applyLogSettings(newCfg)
@@ -342,10 +388,15 @@ func main() {
 		if err := old.Shutdown(shutdownTimeout); err != nil {
 			proxyLog.Warnf("error shutting down old server during reload: %v", err)
 		}
+		if storeChanged {
+			if err := oldStore.Close(); err != nil {
+				proxyLog.Warnf("error closing old store during reload: %v", err)
+			}
+		}
 
 		// Notify UI after a short delay so it can refresh model state.
 		time.AfterFunc(3*time.Second, func() {
-			event.Emit(shared.ConfigFileChangedEvent{State: shared.ReloadingStateEnd})
+			event.Emit(swaputil.ConfigFileChangedEvent{State: swaputil.ReloadingStateEnd})
 		})
 
 		proxyLog.Info("configuration reloaded")
@@ -355,19 +406,37 @@ func main() {
 	defer watcherCancel()
 
 	if *flagWatchConfig {
-		absConfigPath, err := filepath.Abs(configPath)
-		if err != nil {
-			slog.Error("watch-config: failed to resolve config path", "error", err)
-			os.Exit(1)
-		}
 		proxyLog.Info("watching configuration for changes (poll-based, 2s interval)")
-		go func() {
-			(&configwatcher.Watcher{
-				Path:     absConfigPath,
-				Interval: configwatcher.DefaultInterval,
-				OnChange: reload,
-			}).Run(watcherCtx)
-		}()
+
+		if *flagConfig != "" {
+			absConfigPath, err := filepath.Abs(*flagConfig)
+			if err != nil {
+				slog.Error("watch-config: failed to resolve config path", "error", err)
+				os.Exit(1)
+			}
+			go func() {
+				(&configwatcher.Watcher{
+					Path:     absConfigPath,
+					Interval: configwatcher.DefaultInterval,
+					OnChange: reload,
+				}).Run(watcherCtx)
+			}()
+		}
+
+		if *flagConfigDir != "" {
+			absConfigDir, err := filepath.Abs(*flagConfigDir)
+			if err != nil {
+				slog.Error("watch-config: failed to resolve config-dir path", "error", err)
+				os.Exit(1)
+			}
+			go func() {
+				(&configwatcher.DirWatcher{
+					Path:     absConfigDir,
+					Interval: configwatcher.DefaultInterval,
+					OnChange: reload,
+				}).Run(watcherCtx)
+			}()
+		}
 	}
 
 	sigChan := make(chan os.Signal, 1)
@@ -391,7 +460,7 @@ func main() {
 		}
 	}()
 
-	if !shared.IsLoopbackAddr(listenAddr) {
+	if !swaputil.IsLoopbackAddr(listenAddr) {
 		_, port, _ := net.SplitHostPort(listenAddr)
 		proxyLog.Infof("llama-swap is reachable by all hosts on the network, use -listen localhost:%s to restrict to loopback only", port)
 	}
@@ -421,6 +490,7 @@ func main() {
 
 				activeMu.RLock()
 				srv := activeSrv
+				st := activeStore
 				activeMu.RUnlock()
 
 				// Close long-lived SSE streams first so httpServer.Shutdown can
@@ -464,6 +534,9 @@ func main() {
 
 				if perfMon != nil {
 					perfMon.Stop()
+				}
+				if err := st.Close(); err != nil {
+					proxyLog.Warnf("store shutdown error: %v", err)
 				}
 
 				stopMenuBar()
