@@ -41,6 +41,27 @@ const maxReplays = 5
 // connection out from under us.
 const maxReplayHeld = 270 * time.Second
 
+// parkGiveUpBudget bounds how long a PREEMPTIBLE request may sit parked
+// waiting to be granted a serving slot before llama-swap gives up on it
+// itself and answers with the canonical preempt-503 (see writePreemptGiveUp).
+//
+// WHY (llama-cm incident
+// 2026-08-18-cq27-background-admission-park-bare-502-retry-storm): the park
+// had no server-side time bound at all. A background-tier request behind a
+// monopolized slot simply waited until the CLIENT's own ~300s zero-byte abort
+// cancelled its context, at which point ServeHTTP returned BARE - writing
+// nothing. That rendered in the access log as `502 0` (the reverse proxy's own
+// status) or `200 0` (nothing wrote a status at all), always at a metronomic
+// 5m00, and Claude Code 0s-retried it into a self-sustaining storm. Answering
+// with a real 503 + Retry-After BEFORE the client's ceiling is what makes the
+// client back off instead.
+//
+// Set to maxReplayHeld: the same "comfortably under the client's ~300s
+// zero-byte abort" reasoning applies verbatim, and a request that has been
+// parked this long has already blown the replay budget anyway. A var, not a
+// const, purely so tests can shorten it.
+var parkGiveUpBudget = maxReplayHeld
+
 type shutdownReq struct {
 	timeout time.Duration
 	respond chan error
@@ -230,6 +251,84 @@ func (b *baseRouter) grant(req scheduler.HandlerReq, resp scheduler.HandlerResp)
 	case <-b.shutdownCtx.Done():
 		return false
 	}
+}
+
+// cancelParked tells the run loop to prune hr from the scheduler's queue and
+// from every in-flight swap's waiter list. Every path on which ServeHTTP walks
+// away from a request it already handed to the scheduler must call this, or
+// drainQueue would eventually start a model load for a caller that is gone.
+func (b *baseRouter) cancelParked(hr scheduler.HandlerReq) {
+	select {
+	case b.cancelCh <- hr:
+	case <-b.shutdownCtx.Done():
+	}
+}
+
+// armParkGiveUp returns the channel that fires when a parked request has
+// waited out parkGiveUpBudget, or nil when this request must never be given up
+// on. Nil disables the case entirely (a receive on a nil channel blocks
+// forever), so the select degrades to exactly its previous shape.
+//
+// Eligibility is deliberately narrow - this is the preemption core, and the
+// population that actually suffers the bare give-up is small and specific:
+//
+//   - tier.Preemptible only. A non-preemptible (interactive) request is not
+//     what the incident observed (100% of the occurrences were
+//     tier=background) and giving up on one would be a visible regression for
+//     paid interactive traffic.
+//   - responseCommitted must be false. A streaming Anthropic request gets a
+//     pingWriter (see isAnthropicStreamPath above) whose SSE keepalives have
+//     long since committed a 200 and real bytes by the time this budget would
+//     expire. Those requests are NOT the zero-byte victim class - the pings are
+//     what keep the client from aborting at ~300s in the first place - so
+//     giving up on them would abort a request that is currently kept alive and
+//     eventually served, and the 503 could not even be written over the
+//     committed status line.
+//
+// The deadline measures from replayStart (request arrival), so it is one
+// budget across every replay attempt rather than a fresh one per attempt -
+// the same accounting maxReplayHeld uses.
+func armParkGiveUp(tier swaputil.Tier, responseCommitted bool, replayStart time.Time) (<-chan time.Time, func()) {
+	if !tier.Preemptible || responseCommitted {
+		return nil, func() {}
+	}
+	remaining := parkGiveUpBudget - time.Since(replayStart)
+	if remaining < 0 {
+		remaining = 0
+	}
+	t := time.NewTimer(remaining)
+	return t.C, func() { t.Stop() }
+}
+
+// giveUpParked is the shared body of both park-stage give-ups. Order is
+// load-bearing:
+//
+//  1. reqCancel FIRST. baseRouter.grant blocks on an UNBUFFERED send to
+//     hr.Respond and escapes only via hr.Ctx.Done() or shutdown. The instant
+//     this goroutine stops receiving on Respond while its context is still
+//     alive, a concurrent grant from the run loop would block there forever -
+//     deadlocking the whole router, every model, every tier. Cancelling first
+//     makes grant return false, which also makes scheduler.FIFO.grantHandler
+//     skip its inFlight++/KV reservation, so no counter is stranded either.
+//     (The send itself cannot have been lost: an unbuffered send completes
+//     only when a receiver takes it, so if select chose this case instead,
+//     nothing was handed over.)
+//  2. Write the canonical 503 - before the client's own ~300s zero-byte abort,
+//     which is the whole point: the client sees a real status with Retry-After
+//     and backs off instead of 0s-retrying into a storm. This comes BEFORE the
+//     prune because the prune blocks on the run loop: if the loop is itself
+//     wedged (the only condition under which the admission wait can park at
+//     all), pruning first would hold the 503 hostage to the very wedge the
+//     client is timing out on. Step 1 already guarantees a late grant returns
+//     false, so the two are safely swappable.
+//  3. Prune from the scheduler, so drainQueue never starts a model load for a
+//     caller that has been answered and left.
+func (b *baseRouter) giveUpParked(w http.ResponseWriter, hr scheduler.HandlerReq, reqCancel context.CancelFunc, stage string, data swaputil.ReqContextData, replayStart time.Time) {
+	reqCancel()
+	b.logger.Infof("park-giveup: tier=%s model=%s stage=%s held=%.0fs",
+		data.Tier.Name, data.ModelID, stage, time.Since(replayStart).Seconds())
+	writePreemptGiveUp(w)
+	b.cancelParked(hr)
 }
 
 // ModelState implements scheduler.Effects.
@@ -673,10 +772,16 @@ func (b *baseRouter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	// parked behind a swap, loading, or mid-prefill get killed by client-side
 	// zero-byte timeouts (~300s). Wrap the writer so silent waits emit legal
 	// SSE ping events; fast requests pass through untouched (see pinging.go).
+	// keepaliveArmed doubles as "this response will have committed a status
+	// line and real bytes long before any park budget expires" - see
+	// armParkGiveUp for why that disqualifies the request from being given up
+	// on.
+	keepaliveArmed := false
 	if data.Streaming && data.SendLoadingState && isAnthropicStreamPath(req.URL.Path) {
 		pw := newPingWriter(b.logger, data.ModelID, w)
 		defer pw.stop()
 		w = pw
+		keepaliveArmed = true
 	}
 
 	// arrivalCtx anchors every attempt below (see the per-attempt context
@@ -828,14 +933,22 @@ func (b *baseRouter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		// than injected into an already-committed SSE body. Our fork does not
 		// reject on concurrency here — over-capacity requests park in the
 		// scheduler queue and wait (see scheduler.FIFO.atCapacity).
+		admitGiveUp, stopAdmitGiveUp := armParkGiveUp(data.Tier, keepaliveArmed, replayStart)
+		defer stopAdmitGiveUp()
+
 		var admissionErr error
 		select {
 		case admissionErr = <-hr.Admit:
+		case <-admitGiveUp:
+			// Bounded for the same reason as the grant wait below. In practice
+			// the scheduler answers this handshake immediately (fifo.go
+			// OnRequest admits before it ever consults capacity, and Admit is
+			// buffered), so this case is a belt-and-braces twin of the real
+			// park rather than the path the incident observed.
+			b.giveUpParked(w, hr, reqCancel, "admission", data, replayStart)
+			return
 		case <-attemptReq.Context().Done():
-			select {
-			case b.cancelCh <- hr:
-			case <-b.shutdownCtx.Done():
-			}
+			b.cancelParked(hr)
 			return
 		case <-b.shutdownCtx.Done():
 			swaputil.SendError(w, attemptReq, fmt.Errorf("%s is shutting down", b.name))
@@ -893,20 +1006,31 @@ func (b *baseRouter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 			}
 		}
 
+		// THE park. Over-capacity requests wait here (fifo.go atCapacity ->
+		// enqueue) until the scheduler grants them a slot; until this fix that
+		// wait had no server-side bound at all and a starved background request
+		// simply returned bare at the client's ~300s abort. lw != nil means the
+		// OpenAI loading stream already committed a status line, which
+		// disqualifies this request from the give-up for the same reason
+		// keepaliveArmed does.
+		grantGiveUp, stopGrantGiveUp := armParkGiveUp(data.Tier, keepaliveArmed || lw != nil, replayStart)
+		defer stopGrantGiveUp()
+
 		var resp scheduler.HandlerResp
 		select {
 		case resp = <-hr.Respond:
 			finishLoading()
+		case <-grantGiveUp:
+			finishLoading()
+			b.giveUpParked(w, hr, reqCancel, "grant", data, replayStart)
+			return
 		case <-attemptReq.Context().Done():
 			finishLoading()
 			// Notify the scheduler so it can prune this request from its queue
 			// and swap waiters. Without this, a queued request whose client left
 			// would sit in the scheduler until drainQueue eventually starts a
 			// wasted model load for it.
-			select {
-			case b.cancelCh <- hr:
-			case <-b.shutdownCtx.Done():
-			}
+			b.cancelParked(hr)
 			return
 		case <-b.shutdownCtx.Done():
 			finishLoading()

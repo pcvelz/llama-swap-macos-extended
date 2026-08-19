@@ -53,6 +53,27 @@ func newPreemptResponseWriter(w http.ResponseWriter, preempted *atomic.Bool, rep
 	return &preemptResponseWriter{ResponseWriter: w, preempted: preempted, replayWanted: replayWanted}
 }
 
+// writePreemptGiveUp writes the canonical "llama-swap gave up on this request"
+// response: 503 + X-LlamaSwap-Preempted + Retry-After. It is the single place
+// that shape is defined, so the two stages that can give up on a request agree
+// byte for byte:
+//
+//   - the SERVE stage, where preemptResponseWriter rewrites a preemption
+//     victim's first WriteHeader (below);
+//   - the PARK stage, where base.go ServeHTTP abandons a request that has been
+//     waiting for a slot past parkGiveUpBudget (llama-cm incident
+//     2026-08-18-cq27-background-admission-park-bare-502-retry-storm).
+//
+// Callers must only invoke this on a response that has NOT committed a status
+// line yet - writing it over a committed response (e.g. one already emitting
+// pingWriter keepalives) would be ignored by net/http and log a superfluous
+// WriteHeader warning.
+func writePreemptGiveUp(w http.ResponseWriter) {
+	w.Header().Set("X-LlamaSwap-Preempted", "1")
+	w.Header().Set("Retry-After", "1")
+	w.WriteHeader(http.StatusServiceUnavailable)
+}
+
 func (p *preemptResponseWriter) WriteHeader(code int) {
 	if p.wroteHeader {
 		p.ResponseWriter.WriteHeader(code)
@@ -64,9 +85,7 @@ func (p *preemptResponseWriter) WriteHeader(code int) {
 			p.replayWanted.Store(true)
 			return
 		}
-		p.Header().Set("X-LlamaSwap-Preempted", "1")
-		p.Header().Set("Retry-After", "1")
-		p.ResponseWriter.WriteHeader(http.StatusServiceUnavailable)
+		writePreemptGiveUp(p.ResponseWriter)
 		return
 	}
 	p.ResponseWriter.WriteHeader(code)
