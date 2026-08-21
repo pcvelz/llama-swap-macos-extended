@@ -39,6 +39,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/mostlygeek/llama-swap/internal/logmon"
@@ -89,14 +90,39 @@ type pingWriter struct {
 	lastBodyWrite time.Time
 	tail          string // trailing bytes (<=2) of the last upstream Write
 
+	// allowed gates whether tryPing may emit anything at all. Default true
+	// (unchanged behaviour for every request that is not replay-eligible); set
+	// false at construction for a request that may still be transparently
+	// replayed, since the first ping commits a 200 and a replay requires a
+	// response with zero committed bytes. base.go flips it back to true at the
+	// eligibility-surrender moment. Atomic rather than mu-guarded so the flip
+	// never has to take the writer lock, and checked INSIDE tryPing so a
+	// suppressed tick simply re-arms and re-evaluates one interval later - a
+	// mid-wait flip needs no wakeup plumbing.
+	allowed atomic.Bool
+
 	stopOnce sync.Once
 	stopCh   chan struct{}
 }
 
-func newPingWriter(logger *logmon.Monitor, model string, w http.ResponseWriter) *pingWriter {
+func newPingWriter(logger *logmon.Monitor, model string, w http.ResponseWriter, allowed bool) *pingWriter {
 	pw := &pingWriter{writer: w, logger: logger, model: model, start: time.Now(), stopCh: make(chan struct{})}
+	pw.allowed.Store(allowed)
 	go pw.loop()
 	return pw
+}
+
+// allowPings unmutes a pinger that was created suppressed. Idempotent, and
+// safe to call from a timer goroutine.
+func (pw *pingWriter) allowPings() { pw.allowed.Store(true) }
+
+// pingsCommitted reports whether this writer has committed the response itself
+// with a ping (status line + at least one ping event). base.go uses it to
+// refuse a replay on an already-committed stream.
+func (pw *pingWriter) pingsCommitted() bool {
+	pw.mu.Lock()
+	defer pw.mu.Unlock()
+	return pw.pingsStarted
 }
 
 // loop wakes at each computed ping deadline for the stream's whole lifetime.
@@ -129,6 +155,14 @@ func (pw *pingWriter) tryPing() (time.Duration, bool) {
 		// WHY: stop() fences the goroutine off the writer before ServeHTTP
 		// returns; an emitted SSE error event semantically ends the stream.
 		return 0, false
+	}
+
+	if !pw.allowed.Load() {
+		// Muted while this request may still be transparently replayed (see
+		// the allowed field). Re-arm rather than terminate: eligibility is
+		// surrendered on a timer/attempt boundary, and this tick is how the
+		// pinger notices.
+		return pingInterval, true
 	}
 
 	now := time.Now()

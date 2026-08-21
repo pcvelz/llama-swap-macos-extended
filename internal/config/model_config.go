@@ -126,6 +126,15 @@ type ModelConfig struct {
 	// Capabilities defines what modalities and features the model supports.
 	Capabilities ModelCapConfig `yaml:"capabilities"`
 
+	// PrefillTokensPerSecond is this model's conservative prompt-prefill
+	// throughput, used by deadline-aware admission (router.baseRouter's
+	// deadlineRefuse) to decide whether a preemptible request's prefill can
+	// still finish inside the client's remaining zero-byte budget. 0 or absent
+	// (the default) means "use the router's built-in conservative default".
+	// Deliberately a per-model number: prefill rate is a property of the model
+	// and its server flags, not of the request.
+	PrefillTokensPerSecond float64 `yaml:"prefillTokensPerSecond"`
+
 	// Copy of HealthCheckTimeout from global config
 	HealthCheckTimeout int `yaml:"healthCheckTimeout"`
 }

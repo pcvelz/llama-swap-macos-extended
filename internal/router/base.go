@@ -39,7 +39,10 @@ const maxReplays = 5
 // request that eventually gives up still has time left to receive and act on
 // the v1 503 before the client's OWN timeout fires first and aborts the
 // connection out from under us.
-const maxReplayHeld = 270 * time.Second
+//
+// A var, not a const, purely so tests can shorten it (the sequenced pinger
+// below keys its eligibility-surrender moment off this same deadline).
+var maxReplayHeld = 270 * time.Second
 
 // parkGiveUpBudget bounds how long a PREEMPTIBLE request may sit parked
 // waiting to be granted a serving slot before llama-swap gives up on it
@@ -298,6 +301,68 @@ func armParkGiveUp(tier swaputil.Tier, responseCommitted bool, replayStart time.
 	}
 	t := time.NewTimer(remaining)
 	return t.C, func() { t.Stop() }
+}
+
+// deadlineBudget is how much of the client's ~300s zero-byte wall a request
+// may actually spend, measured from arrival. Identical construction to
+// maxReplayHeld/parkGiveUpBudget: the wall minus a ~30s safety margin, so a
+// refusal still reaches the client before its own abort fires. Its own var
+// (rather than an alias of parkGiveUpBudget) so a test can shorten the park
+// budget and the deadline budget independently and tell the two give-up
+// classes apart.
+var deadlineBudget = maxReplayHeld
+
+// defaultPrefillRate is the conservative prompt-prefill throughput assumed for
+// a model with no config.ModelConfig.PrefillTokensPerSecond entry, in tokens
+// per second. 75 t/s is the low end of the cq27-class deep-prefill range
+// measured on the production box (75-80 t/s); assuming the LOW end makes the
+// estimated prefill time an OVER-estimate, which is the safe direction for a
+// refusal decision only in the sense that it refuses earlier - it is
+// deliberately paired with the narrow eligibility below so that
+// over-refusal can never touch interactive traffic.
+const defaultPrefillRate = 75.0
+
+// prefillRate resolves the per-model prefill throughput used by
+// deadlineRefuse. Unconfigured (or non-positive) falls back to
+// defaultPrefillRate; there is deliberately NO measured/EMA estimator here.
+func (b *baseRouter) prefillRate(modelID string) float64 {
+	if mc, _, ok := b.config.FindConfig(modelID); ok && mc.PrefillTokensPerSecond > 0 {
+		return mc.PrefillTokensPerSecond
+	}
+	return defaultPrefillRate
+}
+
+// deadlineRefuse answers the GRANTED-BUT-SLOW class: a background request whose
+// prefill demonstrably cannot finish inside the client's remaining zero-byte
+// budget. Serving it (or parking it toward a give-up) burns a slot for minutes
+// and still ends in a client-side abort, so llama-swap refuses it up front with
+// the canonical preempt-503 - the same shape, and the same "make the client
+// back off instead of 0s-retrying" reasoning, as the park give-up above.
+//
+// Eligibility mirrors armParkGiveUp EXACTLY and for the same two reasons:
+//
+//   - tier.Preemptible only. A non-preemptible (interactive) request is NEVER
+//     deadline-refused, however large its context: refusing paid interactive
+//     traffic on an ESTIMATE would be a far worse regression than the
+//     starvation this fixes.
+//   - the response must still be uncommitted (no keepalive pings, no loading
+//     writer). A committed response cannot carry a 503, and a keepalive-armed
+//     request is not racing a zero-byte wall in the first place.
+//
+// Returns true when it has written the refusal and the caller must return.
+func (b *baseRouter) deadlineRefuse(w http.ResponseWriter, data swaputil.ReqContextData, responseCommitted bool, estimatedTokens int, replayStart time.Time) bool {
+	if !data.Tier.Preemptible || responseCommitted {
+		return false
+	}
+	estSeconds := float64(estimatedTokens) / b.prefillRate(data.ModelID)
+	remainingSeconds := (deadlineBudget - time.Since(replayStart)).Seconds()
+	if estSeconds <= remainingSeconds {
+		return false
+	}
+	b.logger.Infof("deadline-refuse: tier=%s model=%s est_tokens=%d est_s=%.0f remaining_s=%.0f",
+		data.Tier.Name, data.ModelID, estimatedTokens, estSeconds, remainingSeconds)
+	writePreemptGiveUp(w)
+	return true
 }
 
 // giveUpParked is the shared body of both park-stage give-ups. Order is
@@ -776,12 +841,35 @@ func (b *baseRouter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	// line and real bytes long before any park budget expires" - see
 	// armParkGiveUp for why that disqualifies the request from being given up
 	// on.
+	//
+	// SEQUENCING (not wiring): pinging and transparent replay are mutually
+	// exclusive by construction - the first ping commits a 200, and a replay
+	// requires a response with zero committed bytes. So a request that is still
+	// replay-ELIGIBLE stays silent, and the pinger is unmuted the moment that
+	// eligibility is surrendered: from then on nothing can replay this request
+	// and keeping it alive past the client's wall is strictly better than
+	// silence. Replay eligibility at arrival is exactly tier.Preemptible (see
+	// replayEligible in the loop: replayCount is 0 and no time has passed yet),
+	// so that is the mute condition here.
 	keepaliveArmed := false
+	var pw *pingWriter
 	if data.Streaming && data.SendLoadingState && isAnthropicStreamPath(req.URL.Path) {
-		pw := newPingWriter(b.logger, data.ModelID, w)
+		pw = newPingWriter(b.logger, data.ModelID, w, !data.Tier.Preemptible)
 		defer pw.stop()
 		w = pw
 		keepaliveArmed = true
+		if data.Tier.Preemptible {
+			// The TIME-based half of the surrender. The count-based half is
+			// re-evaluated at the top of every attempt (see replayEligible
+			// below), but a request parked on attempt 1 never re-enters that
+			// code, so its maxReplayHeld expiry would otherwise be unobservable
+			// and the request would stay silent straight through the client's
+			// wall - a regression on exactly the population the pinger exists
+			// for. The timer fires at the same instant replayEligible would
+			// start reporting false; the pinger picks it up on its next tick.
+			surrender := time.AfterFunc(maxReplayHeld, pw.allowPings)
+			defer surrender.Stop()
+		}
 	}
 
 	// arrivalCtx anchors every attempt below (see the per-attempt context
@@ -802,8 +890,24 @@ func (b *baseRouter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	replayStart := time.Now()
 	replayCount := 0
 
+	// Estimated once from the arrival body (identical on every replay attempt -
+	// origBody is the same bytes) and used both for KV admission and for the
+	// deadline check below. See swaputil.EstimateTokens for the estimation rule.
+	estimatedTokens := swaputil.EstimateTokens(origBody)
+
 	for {
 		attempt := replayCount + 1
+
+		// DEADLINE-AWARE ADMISSION, on the UNCONDITIONAL path: every attempt
+		// passes through here before it is handed to the scheduler at all, so
+		// this cannot hide behind a feature that is off in production. It
+		// deliberately does NOT live in scheduler.FIFO.kvAdmit: that gate is
+		// inert for any model without a kvPoolTokens budget (pool=0 is what the
+		// production cq27 runs with), and a check that only fires for configured
+		// pools is exactly the defect class this is answering.
+		if b.deadlineRefuse(w, data, keepaliveArmed, estimatedTokens, replayStart) {
+			return
+		}
 
 		// A cancellable derivative of the request's own context: once
 		// granted, this becomes the context p.ServeHTTP actually serves
@@ -884,6 +988,13 @@ func (b *baseRouter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		replayEligible := data.Tier.Preemptible && replayCount < maxReplays && time.Since(replayStart) < maxReplayHeld
 		if replayEligible {
 			replayWanted = new(atomic.Bool)
+		} else if pw != nil {
+			// Eligibility surrendered (replay budget or held-time exhausted):
+			// nothing can transparently retry this request any more, so the
+			// keepalive pings that would have blocked a replay are now the only
+			// thing standing between it and the client's zero-byte wall. See
+			// the sequencing note at the pingWriter construction above.
+			pw.allowPings()
 		}
 
 		hr := scheduler.HandlerReq{
@@ -906,7 +1017,7 @@ func (b *baseRouter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 			// Inert unless the target model has a KVPoolTokens budget configured
 			// (see scheduler.FIFO.kvAdmit) — see swaputil.EstimateTokens for the
 			// estimation rule.
-			EstimatedTokens: swaputil.EstimateTokens(origBody),
+			EstimatedTokens: estimatedTokens,
 			// Tier is DefaultTier for every request on the main listener / when no
 			// `tiers:` block is configured (see swaputil.Tier).
 			Tier:         data.Tier,
@@ -1045,6 +1156,24 @@ func (b *baseRouter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		resp.HandleFunc(w, attemptReq)
 
 		if replayWanted != nil && replayWanted.Load() {
+			// GUARD on the pinger/replay interaction. preemptResponseWriter
+			// tracks its OWN wroteHeader, so it will happily swallow a first
+			// WriteHeader for a replay even on a response whose status line the
+			// pinger already committed - and replaying then means the client
+			// gets a second response body on a stream it is already reading.
+			// The sequencing above makes this unreachable in the common case
+			// (an eligible request is muted, so it cannot have pinged); it is
+			// reachable only in the narrow window where eligibility was
+			// surrendered by time AFTER this attempt's replayWanted was
+			// created. End the stream the way a committed stream must be ended -
+			// as an SSE error event (pingWriter.WriteHeader maps it) - instead
+			// of replaying.
+			if pw != nil && pw.pingsCommitted() {
+				b.logger.Warnf("preempt-replay: tier=%s model=%s attempt=%d suppressed - keepalive pings already committed the response",
+					data.Tier.Name, data.ModelID, attempt)
+				w.WriteHeader(http.StatusServiceUnavailable)
+				return
+			}
 			replayCount++
 			b.logger.Infof("preempt-replay: tier=%s model=%s attempt=%d held=%.0fs",
 				data.Tier.Name, data.ModelID, replayCount, time.Since(replayStart).Seconds())

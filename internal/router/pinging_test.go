@@ -96,7 +96,7 @@ func TestPingWriter_PingsContinueAfterEarlyHeaders(t *testing.T) {
 	pingQuietDelay, pingInterval = 100*time.Millisecond, 100*time.Millisecond
 	t.Cleanup(func() { pingQuietDelay, pingInterval = origQuiet, origInterval })
 
-	pw := newPingWriter(logger, "test-model", w)
+	pw := newPingWriter(logger, "test-model", w, true)
 	defer pw.stop()
 
 	// llama-server's httplib sends SSE headers immediately at accept.
@@ -131,7 +131,7 @@ func TestPingWriter_PingsResumeDuringMidStreamSilence(t *testing.T) {
 	pingQuietDelay, pingInterval = 100*time.Millisecond, 100*time.Millisecond
 	t.Cleanup(func() { pingQuietDelay, pingInterval = origQuiet, origInterval })
 
-	pw := newPingWriter(logger, "test-model", w)
+	pw := newPingWriter(logger, "test-model", w, true)
 	defer pw.stop()
 
 	pw.Header().Set("Content-Type", "text/event-stream")
