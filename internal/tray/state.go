@@ -129,6 +129,13 @@ type State struct {
 	// BarValues holds 0..1 readings for the configured bars, in order.
 	BarValues []float64
 
+	// SeenInflight is set once the first inflight event has been decoded, so
+	// one-shot consumers (cmd/llama-swap-status) can tell "queue is genuinely
+	// idle" apart from "no inflight event received yet". The long-running
+	// tray never needs it (its next event arrives within seconds), but a
+	// one-shot snapshot must not print before the queue state is known.
+	SeenInflight bool
+
 	// heldSince tracks when each waiting count ("" = total) last peaked, for
 	// the waitingHold anti-flap display. Now is overridable in tests.
 	heldSince map[string]time.Time
@@ -321,6 +328,7 @@ func (s *State) decodeEvent(payload []byte) bool {
 			return false
 		}
 		now := s.clock()
+		s.SeenInflight = true
 		s.Waiting = s.holdWaiting("", s.Waiting, stats.Total, now)
 		merged := make(map[string]int, len(stats.ByTier))
 		for name := range s.WaitingByTier {

@@ -84,8 +84,10 @@ func TestState_DecodeInflightEvent(t *testing.T) {
 	require.NoError(t, err)
 
 	var s State
+	require.False(t, s.SeenInflight)
 	require.True(t, s.decodeEvent(env))
 	require.Equal(t, 3, s.Waiting)
+	require.True(t, s.SeenInflight)
 }
 
 // TestState_DecodeInflightEvent_ToleratesUpstreamUnionFields decodes the
