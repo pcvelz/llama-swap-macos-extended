@@ -132,6 +132,10 @@ LLAMA_SWAP_PREFLIGHT=skip  git commit ...   # skip the preflight entirely
 
 Two limits worth knowing: it tests the **working tree**, not the staged index (it warns when a file is staged and then further modified), and the Windows-native half of CI cannot run on a non-Windows box — though every failure seen so far reproduced under `-race` on any platform.
 
+`scripts/preflight.sh` also has a fork-specific "workflow hygiene" lane
+(lint, hardcoded-upstream-owner gate, remote workflow state). After pushing,
+`scripts/ci-await.sh <sha>` (or `make ci-await`) polls GitHub Actions until green.
+
 ## Installation
 
 Each installer downloads the llama-swap binary plus the helper for your platform, and writes a starter config if you don't have one. No package manager, no dependencies.

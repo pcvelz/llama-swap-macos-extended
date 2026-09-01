@@ -27,6 +27,18 @@
 #                      macOS: cd macos-menu && swift build -c release
 #   config-schema.yml  go test ./internal/config/ -run TestConfig_ExampleMatchesSchema
 #   ui-tests.yml       make test-ui
+#   workflow hygiene   not a CI mirror — this repo is a fork of
+#                      mostlygeek/llama-swap, so .github/workflows/ and docker/
+#                      changes get: actionlint; a grep for ghcr.io/mostlygeek or
+#                      mostlygeek/llama-swap hardcoded as a push/cache/clone
+#                      target (the only allowed form is one documented
+#                      UPSTREAM_REPO="mostlygeek/llama-swap" fallback line per
+#                      script); a remote check (needs gh) that the workflows
+#                      this repo keeps disabled are actually disabled on
+#                      GitHub and every active workflow's latest run on main is
+#                      green; and, when docker/unified/** or its workflow
+#                      changed, `bash -n` on those scripts plus a --help smoke
+#                      test of build-image.sh
 #
 # SCOPING
 # Each CI workflow has `paths:` filters, so a docs-only commit triggers nothing.
@@ -54,13 +66,17 @@ set -uo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO" || exit 1
 
+# Workflows this fork keeps fully disabled on GitHub rather than fixing up to
+# run here (used by the "workflow hygiene" lane's remote-state check).
+DISABLED_WORKFLOWS=(closeinactive.yml containers.yml release.yml)
+
 MODE_ALL=0
 MODE_QUICK=0
 for arg in "$@"; do
     case "$arg" in
         --all)   MODE_ALL=1 ;;
         --quick) MODE_QUICK=1 ;;
-        -h|--help) sed -n '2,52p' "${BASH_SOURCE[0]}"; exit 0 ;;
+        -h|--help) sed -n '2,63p' "${BASH_SOURCE[0]}"; exit 0 ;;
         *) echo "unknown argument: $arg" >&2; exit 2 ;;
     esac
 done
@@ -264,6 +280,108 @@ if touched '^ui-svelte/'; then
         skip "make test-ui — npm not installed"
     else
         run "make test-ui" make test-ui
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# Lane: workflow hygiene  (not a CI mirror — this repo is a fork)
+# ---------------------------------------------------------------------------
+# Fork-specific class of failure: a workflow or docker script that hardcodes
+# the upstream owner as a push/cache/clone target doesn't work here (permission
+# denied pushing to someone else's ghcr namespace, wrong clone source, etc).
+if touched '^(\.github/workflows/|docker/)'; then
+    hdr "workflow hygiene (fork of mostlygeek/llama-swap)"
+
+    if ! command -v actionlint >/dev/null 2>&1; then
+        skip "actionlint — not installed (brew install actionlint)"
+    else
+        run "actionlint .github/workflows/*.yml" actionlint .github/workflows/*.yml
+    fi
+
+    # Every ghcr.io/mostlygeek or mostlygeek/llama-swap reference under
+    # .github/workflows/ or docker/ must be one of: a comment; a
+    # `github.repository == 'mostlygeek/llama-swap'` comparison (a legitimate
+    # skip-on-fork guard, not a push/clone target); a shell overridable
+    # default (`${VAR:-mostlygeek/llama-swap}` / `${VAR:-ghcr.io/mostlygeek/...}`);
+    # a Dockerfile/Containerfile `ARG NAME=mostlygeek/llama-swap` default; or
+    # the single documented local-build fallback
+    # `UPSTREAM_REPO="mostlygeek/llama-swap"`. Everything else that names the
+    # upstream owner as a push/cache/clone/download target is a FAIL.
+    HARDCODE_HITS=""
+    while IFS= read -r -d '' f; do
+        hits=$(grep -nE 'ghcr\.io/mostlygeek|mostlygeek/llama-swap' "$f" 2>/dev/null \
+            | grep -vE '^[0-9]+:[[:space:]]*#' \
+            | grep -vE "github\.repository[[:space:]]*==" \
+            | grep -vE ':-mostlygeek/llama-swap|:-ghcr\.io/mostlygeek' \
+            | grep -vE '^[0-9]+:[[:space:]]*ARG[[:space:]]+[A-Za-z_][A-Za-z0-9_]*=mostlygeek/llama-swap' \
+            | grep -vE '^[0-9]+:UPSTREAM_REPO="mostlygeek/llama-swap"$')
+        if [[ -n "$hits" ]]; then
+            HARDCODE_HITS+="${f#"$REPO"/}:"$'\n'"$hits"$'\n'
+        fi
+    done < <(find .github/workflows docker -type f \
+        \( -name '*.yml' -o -name '*.yaml' -o -name '*.sh' -o -iname '*containerfile*' -o -iname 'dockerfile*' \) \
+        -print0 2>/dev/null)
+    if [[ -z "$HARDCODE_HITS" ]]; then
+        pass "no hardcoded upstream-owner push/cache/clone targets"
+    else
+        fail "hardcoded upstream-owner (mostlygeek) push/cache/clone target"
+        printf '%s\n' "$HARDCODE_HITS" | sed 's/^/        /'
+        printf '        fix: derive from GITHUB_REPOSITORY / the checked-out source;\n'
+        printf '        allowed forms: github.repository == comparisons, ${VAR:-mostlygeek/...}\n'
+        printf '        defaults, ARG NAME=mostlygeek/llama-swap, and one UPSTREAM_REPO=... fallback line\n'
+    fi
+
+    # Remote workflow state — needs gh + network; SKIP otherwise or under --quick.
+    if [[ $MODE_QUICK -eq 1 ]]; then
+        skip "remote workflow state — --quick given"
+    elif ! command -v gh >/dev/null 2>&1; then
+        skip "remote workflow state — gh not installed"
+    else
+        FORK_REPO="$(git remote get-url origin 2>/dev/null \
+            | sed -E 's#^git@github\.com:##; s#^https?://github\.com/##; s#\.git$##')"
+        WF_JSON=""
+        [[ -n "$FORK_REPO" ]] && WF_JSON="$(gh api "repos/${FORK_REPO}/actions/workflows" 2>/dev/null)"
+        if [[ -z "$FORK_REPO" || -z "$WF_JSON" ]]; then
+            skip "remote workflow state — gh api unavailable (offline?)"
+        else
+            for name in "${DISABLED_WORKFLOWS[@]}"; do
+                state=$(printf '%s' "$WF_JSON" | jq -r --arg p ".github/workflows/${name}" \
+                    '.workflows[] | select(.path == $p) | .state' 2>/dev/null)
+                if [[ -z "$state" ]]; then
+                    skip "$name — not found in remote workflow list"
+                elif [[ "$state" == "disabled_fork" || "$state" == "disabled_manually" ]]; then
+                    pass "$name: remote state is $state"
+                else
+                    fail "$name: expected disabled but remote state is '$state'"
+                fi
+            done
+
+            while IFS=$'\t' read -r wf_name wf_path; do
+                [[ -n "$wf_path" ]] || continue
+                run_json=$(gh run list -R "$FORK_REPO" --workflow "$(basename "$wf_path")" \
+                    --branch main --status completed --limit 1 --json conclusion,url 2>/dev/null) || run_json="[]"
+                conclusion=$(printf '%s' "$run_json" | jq -r '.[0].conclusion // empty' 2>/dev/null)
+                url=$(printf '%s' "$run_json" | jq -r '.[0].url // empty' 2>/dev/null)
+                if [[ -z "$conclusion" ]]; then
+                    pass "$wf_name: active, no completed runs on main yet"
+                elif [[ "$conclusion" == "success" ]]; then
+                    pass "$wf_name: latest run on main is green"
+                else
+                    fail "$wf_name: latest run on main concluded '$conclusion' — $url"
+                fi
+            done < <(printf '%s' "$WF_JSON" | jq -r '.workflows[] | select(.state == "active") | "\(.name)\t\(.path)"' 2>/dev/null)
+        fi
+    fi
+
+    # unified-docker sanity — only when its own scripts/workflow changed.
+    if touched '^(docker/unified/|\.github/workflows/unified-docker.*\.ya?ml)'; then
+        for f in docker/unified/*.sh; do
+            [[ -f "$f" ]] || continue
+            run "bash -n $f" bash -n "$f"
+        done
+        if [[ -x docker/unified/build-image.sh ]]; then
+            run "docker/unified/build-image.sh --help" docker/unified/build-image.sh --help
+        fi
     fi
 fi
 

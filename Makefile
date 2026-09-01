@@ -125,11 +125,20 @@ wol-proxy: $(BUILD_DIR)
 test-ui:
 	cd ui-svelte && npm ci && npm run check && npm test
 
+# run the full local CI mirror + workflow hygiene lane (see scripts/preflight.sh)
+preflight:
+	scripts/preflight.sh --all
+
+GIT_SHA ?= $(shell git rev-parse HEAD)
+# wait for GitHub Actions on GIT_SHA (default HEAD) to go green, fork-only
+ci-await:
+	scripts/ci-await.sh "$(GIT_SHA)"
+
 # macOS menu-bar helper unit tests. The live backend test is skipped unless
 # LLAMA_MENU_LIVE=1 is set, since it swaps models on a running llama-swap.
 test-mac-menu:
 	cd macos-menu && swift test
 
 # Phony targets
-.PHONY: all clean ui mac mac-menu tray windows simple-responder simple-responder-windows ensure-simple-responder test test-all test-dev test-ui test-mac-menu wol-proxy
+.PHONY: all clean ui mac mac-menu tray windows simple-responder simple-responder-windows ensure-simple-responder test test-all test-dev test-ui test-mac-menu wol-proxy preflight ci-await
 .PHONE: linux linux-arm64 linux-amd64
