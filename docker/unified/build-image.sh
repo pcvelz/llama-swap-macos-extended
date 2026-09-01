@@ -257,8 +257,10 @@ base_tag() {
     # The CUDA base bakes CMAKE_CUDA_ARCHITECTURES into its ENV and the
     # CUDA_VERSION into its FROM line, so an override of either must change
     # the tag even though the Dockerfile is unchanged.
+    # Hash the CONTENT via stdin: `sha256sum <path>` prints the path too, which
+    # made the tag depend on where the checkout lives (CI vs a local clone).
     h="$( {
-        sha256sum "${SCRIPT_DIR}/base-${BACKEND}.Dockerfile"
+        sha256sum < "${SCRIPT_DIR}/base-${BACKEND}.Dockerfile"
         if [[ "${BACKEND}" == "cuda" ]]; then
             echo "${CMAKE_CUDA_ARCHITECTURES}"
             echo "${CUDA_VERSION}"

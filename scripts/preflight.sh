@@ -386,6 +386,61 @@ if touched '^(\.github/workflows/|docker/)'; then
         if [[ -x docker/unified/build-image.sh ]]; then
             run "docker/unified/build-image.sh --help" docker/unified/build-image.sh --help
         fi
+
+        # runtime.Dockerfile copies config.example.yaml through a named build
+        # context; the file must exist where build-image.sh looks for it.
+        if [[ -f docs/config.example.yaml || -f config.example.yaml ]]; then
+            pass "config.example.yaml present for the runtime image's repo-docs context"
+        else
+            fail "config.example.yaml missing at docs/ and repo root — runtime.Dockerfile COPY --from=repo-docs will fail"
+        fi
+
+        # Dogfood: assemble the Vulkan runtime image locally from the artifacts
+        # CI already published, with the same script, Dockerfile and registry
+        # owner derivation CI uses. This is the only lane that exercises the
+        # docker build itself. Skipped under --quick, when Docker is not
+        # reachable, or when the artifacts for the current upstream HEADs are
+        # not published yet (not a fault of this tree). Loads into the local
+        # daemon; never pushes.
+        if [[ $MODE_QUICK -eq 1 ]]; then
+            skip "local vulkan assemble — --quick given"
+        elif ! docker info >/dev/null 2>&1; then
+            skip "local vulkan assemble — Docker daemon not reachable"
+        else
+            _fork_slug=$(git remote get-url origin 2>/dev/null | sed -E 's#^(https://github.com/|git@github.com:)##; s#\.git$##')
+            _asm_log=$(mktemp -t preflight-assemble)
+            # Pin the upstream refs to what the last GREEN CI run resolved, so
+            # the published artifacts exist and the local build reproduces
+            # CI's inputs. Without gh (or no green run yet) fall through to
+            # current HEADs, which usually ends in the "never published" skip.
+            _pin=()
+            if command -v gh >/dev/null 2>&1; then
+                _run=$(gh run list -R "$_fork_slug" --workflow unified-docker.yml --status success --limit 1 --json databaseId --jq '.[0].databaseId' 2>/dev/null)
+                _job=$([[ -n "$_run" ]] && gh run view "$_run" -R "$_fork_slug" --json jobs --jq '.jobs[] | select(.name=="setup") | .databaseId' 2>/dev/null)
+                if [[ -n "$_job" ]]; then
+                    while IFS='=' read -r k v; do
+                        case "$k" in
+                            llama_hash)    _pin+=("LLAMA_REF=$v") ;;
+                            whisper_hash)  _pin+=("WHISPER_REF=$v") ;;
+                            sd_hash)       _pin+=("SD_REF=$v") ;;
+                            audio_hash)    _pin+=("AUDIO_REF=$v") ;;
+                            ik_llama_hash) _pin+=("IK_LLAMA_REF=$v") ;;
+                            ls_hash)       _pin+=("LS_VERSION=$v") ;;
+                        esac
+                    done < <(gh api --allow-escape-sequences "repos/$_fork_slug/actions/jobs/$_job/logs" 2>/dev/null \
+                             | grep -aoE '(llama|whisper|sd|audio|ik_llama|ls)_hash=[0-9a-f]{40}' | sort -u)
+                fi
+            fi
+            if env "${_pin[@]+"${_pin[@]}"}" GITHUB_REPOSITORY="${_fork_slug}" DOCKER_IMAGE_TAG="llama-swap:preflight-unified-vulkan" \
+                docker/unified/build-image.sh --vulkan --assemble >"$_asm_log" 2>&1; then
+                pass "local vulkan assemble from published artifacts (runtime + rootless, binaries verified)"
+            elif grep -q "were never published" "$_asm_log"; then
+                skip "local vulkan assemble — artifacts for the current upstream HEADs not published yet (see $_asm_log)"
+            else
+                tail -n 30 "$_asm_log" >&2
+                fail "local vulkan assemble failed (full log: $_asm_log)"
+            fi
+        fi
     fi
 fi
 
