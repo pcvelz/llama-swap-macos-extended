@@ -359,9 +359,10 @@ if touched '^(\.github/workflows/|docker/)'; then
             while IFS=$'\t' read -r wf_name wf_path; do
                 [[ -n "$wf_path" ]] || continue
                 run_json=$(gh run list -R "$FORK_REPO" --workflow "$(basename "$wf_path")" \
-                    --branch main --status completed --limit 1 --json conclusion,url 2>/dev/null) || run_json="[]"
-                conclusion=$(printf '%s' "$run_json" | jq -r '.[0].conclusion // empty' 2>/dev/null)
-                url=$(printf '%s' "$run_json" | jq -r '.[0].url // empty' 2>/dev/null)
+                    --branch main --status completed --limit 5 --json conclusion,url 2>/dev/null) || run_json="[]"
+                # A cancelled run is a human decision, not a verdict: look past it.
+                conclusion=$(printf '%s' "$run_json" | jq -r '[.[] | select(.conclusion != "cancelled")] | .[0].conclusion // empty' 2>/dev/null)
+                url=$(printf '%s' "$run_json" | jq -r '[.[] | select(.conclusion != "cancelled")] | .[0].url // empty' 2>/dev/null)
                 if [[ -z "$conclusion" ]]; then
                     pass "$wf_name: active, no completed runs on main yet"
                 elif [[ "$conclusion" == "success" ]]; then

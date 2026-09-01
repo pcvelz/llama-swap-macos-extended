@@ -181,7 +181,8 @@ print_failures_and_exit() {
   local runs_json="$1"
   local any_red=0
   local ids
-  ids="$(printf '%s' "$runs_json" | "$JQ_BIN" -r '.[] | select((.conclusion != "success") and (.conclusion != "skipped")) | .databaseId')"
+  # cancelled is neutral: someone chose to stop the run, the code was not judged.
+  ids="$(printf '%s' "$runs_json" | "$JQ_BIN" -r '.[] | select((.conclusion != "success") and (.conclusion != "skipped") and (.conclusion != "cancelled")) | .databaseId')"
   if [ -n "$ids" ]; then
     any_red=1
   fi
@@ -221,7 +222,10 @@ if [ "$LATEST_SCHEDULED" -eq 1 ]; then
   all_runs="[]"
   while IFS= read -r wf_id; do
     [ -z "$wf_id" ] && continue
-    run_json="$("$GH_BIN" run list -R "$REPO" --workflow "$wf_id" --status completed --limit 1 --json databaseId,name,workflowName,status,conclusion,url,startedAt,updatedAt 2>/dev/null || echo '[]')"
+    # Latest completed run that was not cancelled: a cancel is a human decision,
+    # not a verdict on the code, so it neither passes nor fails the gate.
+    run_json="$("$GH_BIN" run list -R "$REPO" --workflow "$wf_id" --status completed --limit 5 --json databaseId,name,workflowName,status,conclusion,url,startedAt,updatedAt 2>/dev/null \
+      | "$JQ_BIN" -c '[.[] | select(.conclusion != "cancelled")] | .[0:1]' 2>/dev/null || echo '[]')"
     all_runs="$(printf '%s\n%s' "$all_runs" "$run_json" | "$JQ_BIN" -s 'add')"
   done <<< "$active_ids"
 
