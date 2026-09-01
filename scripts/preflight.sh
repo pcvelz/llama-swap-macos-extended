@@ -366,8 +366,12 @@ if touched '^(\.github/workflows/|docker/)'; then
                     pass "$wf_name: active, no completed runs on main yet"
                 elif [[ "$conclusion" == "success" ]]; then
                     pass "$wf_name: latest run on main is green"
-                else
+                elif [[ $MODE_ALL -eq 1 ]]; then
+                    # Release-time (--all): red CI blocks. Per-commit it must
+                    # not, or the commit that fixes the red run can never land.
                     fail "$wf_name: latest run on main concluded '$conclusion' — $url"
+                else
+                    skip "$wf_name: latest run on main is '$conclusion' (red; blocks under --all) — $url"
                 fi
             done < <(printf '%s' "$WF_JSON" | jq -r '.workflows[] | select(.state == "active") | "\(.name)\t\(.path)"' 2>/dev/null)
         fi

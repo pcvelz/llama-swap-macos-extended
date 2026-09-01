@@ -154,6 +154,16 @@ DOCKER_IMAGE_TAG="${DOCKER_IMAGE_TAG:-llama-swap:unified-${BACKEND}}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
+# Directory holding config.example.yaml: docs/ once it has been moved there,
+# otherwise the repo root.
+config_example_dir() {
+    if [[ -f "${REPO_ROOT}/docs/config.example.yaml" ]]; then
+        echo "${REPO_ROOT}/docs"
+    else
+        echo "${REPO_ROOT}"
+    fi
+}
+
 # Git repository URLs. LLAMA_SWAP_REPO is set above (derived from the running
 # repository); the rest are unrelated upstream projects this image compiles.
 LLAMA_REPO="https://github.com/ggml-org/llama.cpp.git"
@@ -441,9 +451,10 @@ build_runtime() {
         --build-arg "AUDIO_COMMIT_HASH=${AUDIO_HASH}"
         --build-arg "IK_LLAMA_COMMIT_HASH=${IK_LLAMA_HASH}"
         --build-arg "CUDA_VERSION=${CUDA_VERSION}"
-        # config.example.yaml lives at the repo root, outside this build
-        # context, so it comes in as a named context instead.
-        --build-context "repo-docs=${REPO_ROOT}/docs"
+        # config.example.yaml lives outside this build context, so it comes
+        # in as a named context: docs/ where it has been moved there, else
+        # the repo root (older trees and forks that predate the move).
+        --build-context "repo-docs=$(config_example_dir)"
     )
     local project
     while read -r project; do
