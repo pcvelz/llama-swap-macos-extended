@@ -49,6 +49,16 @@ CMAKE_CUDA_ARCHITECTURES="${CMAKE_CUDA_ARCHITECTURES:-60;61;75;86;89}"
 # binaries and their runtime libraries always come from the same CUDA.
 CUDA_VERSION="${CUDA_VERSION:-12.9.1}"
 
+# Single upstream literal this script carries. Everything below derives from
+# GITHUB_REPOSITORY (set automatically on every GitHub Actions runner, and
+# explicitly by unified-docker.yml/unified-docker-backend.yml for the same
+# job) so a fork's images/artifacts/llama-swap source land under the fork's
+# own owner instead of upstream's, without a second hardcoded owner anywhere
+# in this file. On upstream, or when run locally with no GITHUB_REPOSITORY,
+# both still resolve to upstream.
+UPSTREAM_REPO="mostlygeek/llama-swap"
+REPO_SLUG="$(echo "${GITHUB_REPOSITORY:-${UPSTREAM_REPO}}" | tr '[:upper:]' '[:lower:]')"
+
 # Registry holding the base and artifacts images used by --stage/--assemble.
 #
 # Deliberately a different package from the published llama-swap images. These
@@ -56,7 +66,13 @@ CUDA_VERSION="${CUDA_VERSION:-12.9.1}"
 # commit, so sharing the package would bury :unified-cuda under thousands of
 # :art-* tags. It also keeps them out of reach of the delete-untagged cleanup
 # in containers.yml, which is scoped to `package: llama-swap`.
-ARTIFACT_REPO="${ARTIFACT_REPO:-ghcr.io/mostlygeek/llama-swap-build}"
+ARTIFACT_REPO="${ARTIFACT_REPO:-ghcr.io/${REPO_SLUG}-build}"
+
+# Git repo the llama-swap binary and vllm-wrapper are built from (or, when the
+# resolved commit matches an upstream release, the repo that release is
+# resolved against). Defaults to whichever repository this script is running
+# in; override to build a specific fork/branch from elsewhere.
+LLAMA_SWAP_REPO="${LLAMA_SWAP_REPO:-${GITHUB_SERVER_URL:-https://github.com}/${REPO_SLUG}.git}"
 
 # Upstream projects compiled into the image. ik-llama is CUDA only.
 ALL_PROJECTS=(whisper sd audio llama ik-llama)
@@ -102,7 +118,10 @@ for arg in "$@"; do
             echo "  CUDA_VERSION         CUDA toolkit/runtime version as an nvidia/cuda image tag"
             echo "                       (default: 12.9.1, CUDA only)"
             echo "  ARTIFACT_REPO        Registry for base and artifacts images"
-            echo "                       (default: ghcr.io/mostlygeek/llama-swap-build)"
+            echo "                       (default: ghcr.io/<owner>/<repo>-build, derived from"
+            echo "                       GITHUB_REPOSITORY; upstream when that is unset)"
+            echo "  LLAMA_SWAP_REPO      Git repo llama-swap/vllm-wrapper are built from"
+            echo "                       (default: derived the same way as ARTIFACT_REPO)"
             exit 0
             ;;
     esac
@@ -135,12 +154,12 @@ DOCKER_IMAGE_TAG="${DOCKER_IMAGE_TAG:-llama-swap:unified-${BACKEND}}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
-# Git repository URLs
+# Git repository URLs. LLAMA_SWAP_REPO is set above (derived from the running
+# repository); the rest are unrelated upstream projects this image compiles.
 LLAMA_REPO="https://github.com/ggml-org/llama.cpp.git"
 WHISPER_REPO="https://github.com/ggml-org/whisper.cpp.git"
 SD_REPO="https://github.com/leejet/stable-diffusion.cpp.git"
 AUDIO_REPO="https://github.com/0xShug0/audio.cpp.git"
-LLAMA_SWAP_REPO="https://github.com/mostlygeek/llama-swap.git"
 IK_LLAMA_REPO="https://github.com/ikawrakow/ik_llama.cpp.git"
 
 # Resolve a git ref (commit hash, tag, or branch) to a full commit hash.
@@ -415,6 +434,7 @@ build_runtime() {
         --build-arg "BACKEND=${BACKEND}"
         --build-arg "BUILDER_BASE=${BASE_TAG}"
         --build-arg "LS_VERSION=${LS_HASH}"
+        --build-arg "LLAMA_SWAP_REPO=${LLAMA_SWAP_REPO}"
         --build-arg "LLAMA_COMMIT_HASH=${LLAMA_HASH}"
         --build-arg "WHISPER_COMMIT_HASH=${WHISPER_HASH}"
         --build-arg "SD_COMMIT_HASH=${SD_HASH}"

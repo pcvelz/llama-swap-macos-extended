@@ -80,9 +80,28 @@ jobs:
       audio_hash: ${{ steps.refs.outputs.audio_hash }}
       ik_llama_hash: ${{ steps.refs.outputs.ik_llama_hash }}
       ls_hash: ${{ steps.refs.outputs.ls_hash }}
+      image_repo: ${{ steps.registry.outputs.image_repo }}
+      artifact_repo: ${{ steps.registry.outputs.artifact_repo }}
+      llama_swap_repo: ${{ steps.registry.outputs.llama_swap_repo }}
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # 6.0.2
+
+      # Owner-agnostic so this runs green on a fork: on upstream this reduces
+      # to ghcr.io/mostlygeek/llama-swap (unchanged); on a fork it becomes
+      # ghcr.io/<fork-owner>/<fork-repo>, which the fork actually has push
+      # permission for. llama_swap_repo also points the from-source build at
+      # this repo's own code rather than downloading an upstream release that
+      # would not contain the fork's changes.
+      - name: Compute registry owner
+        id: registry
+        run: |
+          repo_lower=$(echo "${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')
+          {
+            echo "image_repo=ghcr.io/${repo_lower}"
+            echo "artifact_repo=ghcr.io/${repo_lower}-build"
+            echo "llama_swap_repo=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+          } | tee -a "$GITHUB_OUTPUT"
 
       # Resolve every ref once, here. The build and assemble jobs are handed
       # full commit hashes, so a branch that moves mid-run cannot leave two
@@ -96,6 +115,8 @@ jobs:
           AUDIO_REF: ${{ inputs.audio_ref || 'main' }}
           IK_LLAMA_REF: ${{ inputs.ik_llama_ref || 'main' }}
           LS_VERSION: ${{ inputs.llama_swap_version || 'main' }}
+          ARTIFACT_REPO: ${{ steps.registry.outputs.artifact_repo }}
+          LLAMA_SWAP_REPO: ${{ steps.registry.outputs.llama_swap_repo }}
         run: |
           chmod +x docker/unified/build-image.sh
           docker/unified/build-image.sh --cuda --resolve | tee -a "$GITHUB_OUTPUT"
@@ -138,6 +159,9 @@ jobs:
       audio_hash: ${{ needs.setup.outputs.audio_hash }}
       ik_llama_hash: ${{ needs.setup.outputs.ik_llama_hash }}
       ls_hash: ${{ needs.setup.outputs.ls_hash }}
+      image_repo: ${{ needs.setup.outputs.image_repo }}
+      artifact_repo: ${{ needs.setup.outputs.artifact_repo }}
+      llama_swap_repo: ${{ needs.setup.outputs.llama_swap_repo }}
 
   vulkan:
     needs: setup
@@ -156,3 +180,6 @@ jobs:
       audio_hash: ${{ needs.setup.outputs.audio_hash }}
       ik_llama_hash: ${{ needs.setup.outputs.ik_llama_hash }}
       ls_hash: ${{ needs.setup.outputs.ls_hash }}
+      image_repo: ${{ needs.setup.outputs.image_repo }}
+      artifact_repo: ${{ needs.setup.outputs.artifact_repo }}
+      llama_swap_repo: ${{ needs.setup.outputs.llama_swap_repo }}

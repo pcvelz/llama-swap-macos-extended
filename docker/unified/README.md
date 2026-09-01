@@ -86,8 +86,9 @@ recompiling anything.
 ```
 
 `--stage` and `--assemble` push to and read from `ARTIFACT_REPO` (default
-`ghcr.io/mostlygeek/llama-swap-build`), so they need registry credentials and a
-buildx container driver.
+`ghcr.io/<owner>/<repo>-build`, derived from `GITHUB_REPOSITORY` -- upstream's
+`ghcr.io/mostlygeek/llama-swap-build` when that is unset), so they need
+registry credentials and a buildx container driver.
 
 That is a separate GHCR package from the published `llama-swap` images on
 purpose. Artifacts are build inputs rather than releases — a new tag per project

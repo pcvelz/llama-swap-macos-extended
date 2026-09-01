@@ -26,24 +26,39 @@ FROM ubuntu:24.04 AS ik-llama-empty
 RUN mkdir -p /install/bin
 FROM ${IK_LLAMA_IMAGE} AS ik-llama-src
 
-# ── llama-swap release binary ─────────────────────────────────────────
+# ── llama-swap binary (with embedded UI) ────────────────────────────────
+#
+# Downloaded from a matching upstream release when the resolved commit has
+# one; otherwise built from source together with its Svelte UI, same recipe
+# as the Makefile's `ui` + `linux-*` targets. The source build path is what a
+# fork needs -- it has no release tags of its own, so every commit takes it.
+# golang:1.26-bookworm is buildpack-deps-scm based (has git/curl already);
+# Node is added only for the UI build the source path needs.
 
-FROM ${BUILDER_BASE} AS llama-swap-download
+FROM golang:1.26-bookworm AS llama-swap-download
 ARG LS_VERSION=latest
+ARG LLAMA_SWAP_REPO=https://github.com/mostlygeek/llama-swap.git
+RUN curl -fsSL https://deb.nodesource.com/setup_24.x | bash - && \
+    apt-get update && apt-get install -y --no-install-recommends nodejs && \
+    rm -rf /var/lib/apt/lists/*
 COPY install-llama-swap.sh /build/
-RUN bash /build/install-llama-swap.sh "${LS_VERSION}"
+RUN --mount=type=cache,id=go-build,target=/root/.cache/go-build \
+    --mount=type=cache,id=go-mod,target=/go/pkg/mod \
+    --mount=type=cache,id=npm,target=/root/.npm \
+    LLAMA_SWAP_REPO="${LLAMA_SWAP_REPO}" bash /build/install-llama-swap.sh "${LS_VERSION}"
 
 # ── vllm-wrapper ──────────────────────────────────────────────────────
 #
 # vllm-wrapper is not shipped in the llama-swap release archives, so it is
-# compiled from the same revision as the llama-swap binary above.
+# always compiled from the same revision as the llama-swap binary above.
 
 FROM golang:1.26-bookworm AS vllm-wrapper-build
 ARG LS_VERSION=latest
+ARG LLAMA_SWAP_REPO=https://github.com/mostlygeek/llama-swap.git
 COPY install-vllm-wrapper.sh /build/
 RUN --mount=type=cache,id=go-build,target=/root/.cache/go-build \
     --mount=type=cache,id=go-mod,target=/go/pkg/mod \
-    bash /build/install-vllm-wrapper.sh "${LS_VERSION}"
+    LLAMA_SWAP_REPO="${LLAMA_SWAP_REPO}" bash /build/install-vllm-wrapper.sh "${LS_VERSION}"
 
 # ── Runtime bases ─────────────────────────────────────────────────────
 
