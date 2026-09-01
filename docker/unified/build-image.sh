@@ -469,7 +469,7 @@ build_runtime() {
     DOCKER_BUILDKIT=1 docker buildx build --load \
         -f "${SCRIPT_DIR}/runtime.Dockerfile" \
         -t "${DOCKER_IMAGE_TAG}" \
-        "${args[@]}" "${CACHE_ARGS[@]}" \
+        "${args[@]}" "${CACHE_ARGS[@]}" "$@" \
         "${SCRIPT_DIR}"
 }
 
@@ -610,16 +610,15 @@ echo "Building rootless image..."
 echo "=========================================="
 echo ""
 
+# Same runtime build with RUN_UID set (runtime.Dockerfile already creates the
+# user and chowns /etc/llama-swap and /models for a non-zero RUN_UID). Every
+# layer up to the user switch is a cache hit, so this is seconds. A
+# `FROM ${DOCKER_IMAGE_TAG}` heredoc cannot be used here: the buildx container
+# builder resolves that tag from the REGISTRY, not from the image just loaded
+# into the daemon, so it either fails (tag never published, e.g. a fork's first
+# run) or silently bases the rootless image on yesterday's publish.
 ROOTLESS_TAG="${DOCKER_IMAGE_TAG}-rootless"
-docker buildx build --load -t "${ROOTLESS_TAG}" - <<EOF
-FROM ${DOCKER_IMAGE_TAG}
-USER root
-RUN groupadd --system --gid 10001 llama-swap && \\
-    useradd --system --uid 10001 --gid 10001 \\
-      --home /app --shell /sbin/nologin llama-swap && \\
-    chown -R 10001:10001 /etc/llama-swap /models
-USER 10001
-EOF
+DOCKER_IMAGE_TAG="${ROOTLESS_TAG}" build_runtime --build-arg "RUN_UID=10001"
 
 echo "Rootless image built: ${ROOTLESS_TAG}"
 
