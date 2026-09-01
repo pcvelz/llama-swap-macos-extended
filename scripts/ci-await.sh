@@ -221,7 +221,7 @@ if [ "$LATEST_SCHEDULED" -eq 1 ]; then
   all_runs="[]"
   while IFS= read -r wf_id; do
     [ -z "$wf_id" ] && continue
-    run_json="$("$GH_BIN" run list -R "$REPO" --workflow "$wf_id" --limit 1 --json databaseId,name,workflowName,status,conclusion,url,startedAt,updatedAt 2>/dev/null || echo '[]')"
+    run_json="$("$GH_BIN" run list -R "$REPO" --workflow "$wf_id" --status completed --limit 1 --json databaseId,name,workflowName,status,conclusion,url,startedAt,updatedAt 2>/dev/null || echo '[]')"
     all_runs="$(printf '%s\n%s' "$all_runs" "$run_json" | "$JQ_BIN" -s 'add')"
   done <<< "$active_ids"
 
