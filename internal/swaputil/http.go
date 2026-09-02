@@ -12,6 +12,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"unicode/utf8"
@@ -469,6 +470,24 @@ func SetReqData(ctx context.Context, key, value string) error {
 	return nil
 }
 
+// sessionUserIDPattern matches the session_<uuid> segment inside Claude
+// Code's metadata.user_id field (e.g.
+// "user_abc123_account_def456_session_<uuid>"). Matching only that segment,
+// rather than the whole field, keeps extraction working even if the
+// surrounding segments' shape drifts.
+var sessionUserIDPattern = regexp.MustCompile(`session_([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})`)
+
+// sessionIDFromUserID extracts the session uuid from a Claude Code
+// metadata.user_id value, returning "" when userID contains no
+// session_<uuid> segment (including when userID itself is empty).
+func sessionIDFromUserID(userID string) string {
+	m := sessionUserIDPattern.FindStringSubmatch(userID)
+	if m == nil {
+		return ""
+	}
+	return m[1]
+}
+
 // extractContext pulls fields from an HTTP request into a ReqContextData,
 // returning whatever is available. For GET requests it reads query parameters.
 // For POST requests it inspects Content-Type and parses JSON,
@@ -501,11 +520,22 @@ func extractContext(r *http.Request) (ReqContextData, error) {
 	contentType := r.Header.Get("Content-Type")
 
 	if strings.Contains(contentType, "application/json") {
+		metadata := make(map[string]string)
+		// Claude Code carries its session identity in metadata.user_id
+		// (e.g. "user_..._account_..._session_<uuid>"). Only stamp both
+		// keys together when a session_<uuid> segment is actually found -
+		// a user_id with no session segment leaves neither key set, same
+		// as a request with no metadata.user_id at all.
+		userID := gjson.GetBytes(bodyBytes, "metadata.user_id").String()
+		if sessionID := sessionIDFromUserID(userID); sessionID != "" {
+			metadata["session_id"] = sessionID
+			metadata["client_user_id"] = userID
+		}
 		return ReqContextData{
 			Model:     gjson.GetBytes(bodyBytes, "model").String(),
 			Streaming: gjson.GetBytes(bodyBytes, "stream").Bool(),
 			ApiKey:    apiKey,
-			Metadata:  make(map[string]string),
+			Metadata:  metadata,
 			Tier:      TierFromContext(r.Context()),
 			Body:      bodyBytes,
 		}, nil

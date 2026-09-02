@@ -94,6 +94,10 @@ type FIFO struct {
 	graceWait map[string]time.Time
 	// now is the clock; overridable in tests.
 	now func() time.Time
+
+	// nextArrivalSeq hands out HandlerReq.arrivalSeq — see its doc comment.
+	// Plain uint64, not atomic: only ever touched on the run loop.
+	nextArrivalSeq uint64
 }
 
 // NewFIFO builds a FIFO scheduler. Both per-model tables are derived from
@@ -144,16 +148,23 @@ func NewFIFO(name string, logger *logmon.Monitor, planner Swapper, cfg config.Fi
 //     1b. Every other request is admitted immediately: the per-model concurrency
 //     cap parks over-capacity requests in the queue rather than rejecting
 //     them with a 429 (see atCapacity).
-//  2. A swap to the same model is already in flight — attach this waiter so
+//  2. Rank barrier: never grant an arrival while a strictly higher-rank
+//     request is still queued. This applies to every remaining branch below
+//     (joining/starting a swap, fast-path serve) so background work only
+//     proceeds once the priority + default queues are empty. Checked BEFORE
+//     the swap-join branch (3) — joining an in-flight swap for the same
+//     model is itself a grant (the joiner is served the moment the swap
+//     completes) and must not skip the barrier either.
+//  3. A swap to the same model is already in flight — attach this waiter so
 //     one swap serves all callers that asked for the same model.
-//  3. Fast path — the target process is already ready, the planner sees
+//  4. Fast path — the target process is already ready, the planner sees
 //     nothing to evict, and no in-flight swap is evicting it. Hand back its
 //     ServeHTTP immediately.
-//  4. Would collide with an in-flight swap (we'd stop their target, or they're
+//  5. Would collide with an in-flight swap (we'd stop their target, or they're
 //     stopping us) — park in the queue for OnSwapDone to drain.
-//  5. Would evict a process that is still handling requests — park in the
+//  6. Would evict a process that is still handling requests — park in the
 //     queue. OnServeDone will retry when the busy process drains.
-//  6. Otherwise — start a new swap. This may run in parallel with other active
+//  7. Otherwise — start a new swap. This may run in parallel with other active
 //     swaps when their evict sets don't intersect.
 func (s *FIFO) OnRequest(req HandlerReq) {
 	// (1) Unknown model.
@@ -170,7 +181,22 @@ func (s *FIFO) OnRequest(req HandlerReq) {
 		return
 	}
 
-	// (2) Join an in-flight swap for the same model.
+	// Stamp this request's arrival order the one time it first enters the
+	// scheduler — see HandlerReq.arrivalSeq. Every later re-enqueue of this
+	// same value (OnSwapDone's cap re-queue, drainQueue) carries this stamp
+	// forward untouched.
+	s.nextArrivalSeq++
+	req.arrivalSeq = s.nextArrivalSeq
+
+	// (2) Rank barrier — see decision-tree doc above. Must run before (3) so
+	// joining an in-flight swap cannot bypass it.
+	if s.blockedByRankBarrier(req) {
+		s.logger.Debugf("%s: queuing request for model %s (rank barrier: higher-rank request queued)", s.name, req.Model)
+		s.enqueue(req)
+		return
+	}
+
+	// (3) Join an in-flight swap for the same model.
 	if sw, ok := s.active[req.Model]; ok {
 		s.logger.Debugf("%s: joining in-flight swap for model %s (%d waiters)", s.name, req.Model, len(sw.waiters)+1)
 		sw.waiters = append(sw.waiters, req)
@@ -180,23 +206,13 @@ func (s *FIFO) OnRequest(req HandlerReq) {
 	running := s.runningSet(req.Model)
 	evict := s.planner.EvictionFor(req.Model, running)
 
-	// (2b) Rank barrier: never grant an arrival while a strictly higher-rank
-	// request is still queued. This applies to every remaining branch below
-	// (fast-path serve, joining/starting a swap) so background work only
-	// proceeds once the priority + default queues are empty.
-	if s.blockedByRankBarrier(req) {
-		s.logger.Debugf("%s: queuing request for model %s (rank barrier: higher-rank request queued)", s.name, req.Model)
-		s.enqueue(req)
-		return
-	}
-
-	// (2c) Per-model concurrency cap: the model is already serving as many
+	// (3c) Per-model concurrency cap: the model is already serving as many
 	// requests as it is allowed to. Park in the queue and wait instead of
 	// bouncing the caller with a 429 (see atCapacity), booting an eligible
 	// lower-rank holder first if this arrival outranks one — the same
 	// same-model preemption the deleted semaphore layer performed.
 	if s.atCapacity(req) {
-		if s.tryPreempt(req, []string{req.Model}) {
+		if s.tryPreempt(req, []string{req.Model}, 1) {
 			s.logger.Debugf("%s: preempting same-model in-flight request(s) on %s for higher-rank arrival at concurrency cap", s.name, req.Model)
 		}
 		s.logger.Debugf("%s: queuing request for model %s (concurrency limit %d reached)", s.name, req.Model, s.limit(req.Model))
@@ -204,14 +220,14 @@ func (s *FIFO) OnRequest(req HandlerReq) {
 		return
 	}
 
-	// (3) Fast path: ready, nothing to evict, and nobody is evicting us.
+	// (4) Fast path: ready, nothing to evict, and nobody is evicting us.
 	if state == process.StateReady && len(evict) == 0 && !collidesWith(req.Model, evict, s.active) {
 		if !s.kvAdmit(req.Model, req.EstimatedTokens) {
 			// SAME-model preemption: the pool is held by in-flight requests on
 			// req's own model, so those are the victims — without this, a
 			// higher-rank arrival could never boot a lower-rank request of the
 			// same model (the evict set is empty on this branch).
-			if s.tryPreempt(req, []string{req.Model}) {
+			if s.tryPreempt(req, []string{req.Model}, 1) {
 				s.logger.Debugf("%s: preempting same-model in-flight request(s) on %s for higher-rank arrival", s.name, req.Model)
 			}
 			s.logKVParked(req.Model, req.EstimatedTokens)
@@ -223,19 +239,19 @@ func (s *FIFO) OnRequest(req HandlerReq) {
 		return
 	}
 
-	// (4) Collision with an in-flight swap — queue.
+	// (5) Collision with an in-flight swap — queue.
 	if collidesWith(req.Model, evict, s.active) {
 		s.logger.Debugf("%s: queuing request for model %s (collides with in-flight swap)", s.name, req.Model)
 		s.enqueue(req)
 		return
 	}
 
-	// (5) Would evict a busy process — try to preempt it (see tryPreempt),
+	// (6) Would evict a busy process — try to preempt it (see tryPreempt),
 	// then queue either way: preemption is a server-side cancel, not a
 	// synchronous release, so req must wait for the victim's own OnServeDone
 	// to arrive before drainQueue can grant it.
 	if conflictsWithInFlight(evict, s.inFlight) {
-		if s.tryPreempt(req, evict) {
+		if s.tryPreempt(req, evict, 0) {
 			s.logger.Debugf("%s: preempting in-flight request(s) blocking model %s for higher-rank arrival", s.name, req.Model)
 		}
 		s.logger.Debugf("%s: queuing request for model %s (would evict in-flight process)", s.name, req.Model)
@@ -243,7 +259,7 @@ func (s *FIFO) OnRequest(req HandlerReq) {
 		return
 	}
 
-	// (5b) Would evict a model still inside its swap-grace window — keep it
+	// (6b) Would evict a model still inside its swap-grace window — keep it
 	// resident and queue the request. The grace lets a recently-hot model ride
 	// out brief request gaps (an agent pausing to run a tool) instead of being
 	// evicted the instant it drains. OnServeDone (new traffic) or OnTick (pure
@@ -255,7 +271,7 @@ func (s *FIFO) OnRequest(req HandlerReq) {
 		return
 	}
 
-	// (6) Start a new (possibly parallel) swap.
+	// (7) Start a new (possibly parallel) swap.
 	s.logger.Debugf("%s: starting swap for model %s, evicting %v", s.name, req.Model, evict)
 	s.startSwap(req, evict, running)
 }
@@ -611,24 +627,36 @@ func (s *FIFO) limit(modelID string) int {
 // trackedServe) — not synchronous — so this only fires the cancels; the
 // caller must still queue req and wait for the victims' OnServeDone to arrive
 // before a retry can succeed. Returns whether anything was booted.
-func (s *FIFO) tryPreempt(req HandlerReq, evict []string) bool {
-	booted := false
+//
+// limit bounds how many victims may be booted; 0 means every eligible one.
+// A same-model arrival blocked by the concurrency cap or the KV pool needs
+// exactly ONE slot, so those callers pass 1: booting every eligible holder
+// on a --parallel 2 box cancelled two interactive prefills to seat one
+// request (llama-cm incident 2026-07-05-cq27-toolgap-eviction-reprefill-storm,
+// 2026-09-01 follow-up). The swap path (a different model must be evicted)
+// keeps 0: the swap cannot start until that model's in-flight count is zero,
+// so every holder has to go.
+func (s *FIFO) tryPreempt(req HandlerReq, evict []string, limit int) bool {
+	booted := 0
 	for _, m := range evict {
 		victims := s.granted[m]
 		if len(victims) == 0 {
 			continue
 		}
 		for _, v := range victims {
+			if limit > 0 && booted >= limit {
+				return true
+			}
 			if !swaputil.CanPreempt(v.tier, req.Tier) {
 				continue // rank(victim) >= rank(arrival), or victim isn't eligible
 			}
 			if v.preempt != nil {
 				v.preempt()
-				booted = true
+				booted++
 			}
 		}
 	}
-	return booted
+	return booted > 0
 }
 
 // kvAdmit reports whether a request estimated at `estimate` tokens for model
@@ -697,11 +725,15 @@ func (s *FIFO) startSwap(initial HandlerReq, evict, running []string) {
 
 // enqueue inserts req into the queue in order: tier rank DESC first (see
 // swaputil.Tier / docs/intent/llama-swap-tiers.md), then the existing per-model
-// priority (also DESC), then arrival (FIFO) order for ties on both keys. It
-// goes just before the first queued item whose (rank, priority) key is
-// strictly lower than req's, so higher-rank/higher-priority requests are
-// serviced first while equal-key requests keep their arrival order.
-// Priorities come from the FifoConfig; unlisted models default to 0.
+// priority (also DESC), then arrival (FIFO) order — by req.arrivalSeq, NOT by
+// call order — for ties on both keys. It goes just before the first queued
+// item whose (rank, priority) key is strictly lower than req's, OR whose key
+// is tied but which arrived later (a higher arrivalSeq), so higher-rank/
+// higher-priority requests are serviced first while equal-key requests keep
+// their TRUE arrival order even when one of them is a re-enqueue (OnSwapDone's
+// cap re-queue, drainQueue) that lands here well after a later arrival was
+// already queued — see fifo_arrival_order_test.go. Priorities come from the
+// FifoConfig; unlisted models default to 0.
 func (s *FIFO) enqueue(req HandlerReq) {
 	rank := req.Tier.Rank
 	p := s.cfg.Priority[req.Model]
@@ -711,9 +743,16 @@ func (s *FIFO) enqueue(req HandlerReq) {
 			i = j
 			break
 		}
-		if q.Tier.Rank == rank && s.cfg.Priority[q.Model] < p {
-			i = j
-			break
+		if q.Tier.Rank == rank {
+			qp := s.cfg.Priority[q.Model]
+			if qp < p {
+				i = j
+				break
+			}
+			if qp == p && q.arrivalSeq > req.arrivalSeq {
+				i = j
+				break
+			}
 		}
 	}
 	s.queued = append(s.queued, HandlerReq{})
@@ -790,7 +829,7 @@ func (s *FIFO) drainQueue() {
 		// Concurrency cap, mirroring the OnRequest branch: the model is still
 		// serving its full allowance, so this request keeps waiting.
 		if s.atCapacity(req) {
-			if s.tryPreempt(req, []string{req.Model}) {
+			if s.tryPreempt(req, []string{req.Model}, 1) {
 				s.logger.Debugf("%s: preempting same-model in-flight request(s) on %s for queued higher-rank request at concurrency cap", s.name, req.Model)
 			}
 			stick(req)
@@ -801,7 +840,7 @@ func (s *FIFO) drainQueue() {
 				// Same-model preemption, mirroring the OnRequest fast-path
 				// branch (tryPreempt is idempotent per victim — a repeat
 				// drain pass re-cancels an already-cancelled context, a no-op).
-				if s.tryPreempt(req, []string{req.Model}) {
+				if s.tryPreempt(req, []string{req.Model}, 1) {
 					s.logger.Debugf("%s: preempting same-model in-flight request(s) on %s for queued higher-rank request", s.name, req.Model)
 				}
 				s.logKVParked(req.Model, req.EstimatedTokens)
@@ -817,7 +856,7 @@ func (s *FIFO) drainQueue() {
 			continue
 		}
 		if conflictsWithInFlight(evict, s.inFlight) {
-			if s.tryPreempt(req, evict) {
+			if s.tryPreempt(req, evict, 0) {
 				s.logger.Debugf("%s: preempting in-flight request(s) blocking queued model %s", s.name, req.Model)
 			}
 			stick(req)

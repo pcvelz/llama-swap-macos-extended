@@ -19,7 +19,7 @@ import (
 func TestServer_ParseMetrics_ChatCompletions(t *testing.T) {
 	body := `{"usage":{"prompt_tokens":12,"completion_tokens":7,"prompt_tokens_details":{"cached_tokens":4}}}`
 	parsed := gjson.Parse(body)
-	entry, err := parseMetrics("m", time.Now(), parsed.Get("usage"), parsed.Get("timings"), parsed.Get("metrics"))
+	entry, err := parseMetrics("m", time.Now(), parsed.Get("usage"), parsed.Get("timings"), parsed.Get("metrics"), parsed.Get("id_slot"))
 	if err != nil {
 		t.Fatalf("parseMetrics: %v", err)
 	}
@@ -31,7 +31,7 @@ func TestServer_ParseMetrics_ChatCompletions(t *testing.T) {
 func TestServer_ParseMetrics_Timings(t *testing.T) {
 	body := `{"timings":{"prompt_n":20,"predicted_n":50,"prompt_per_second":100.0,"predicted_per_second":40.0,"prompt_ms":200,"predicted_ms":1250,"cache_n":8}}`
 	parsed := gjson.Parse(body)
-	entry, err := parseMetrics("m", time.Now(), parsed.Get("usage"), parsed.Get("timings"), parsed.Get("metrics"))
+	entry, err := parseMetrics("m", time.Now(), parsed.Get("usage"), parsed.Get("timings"), parsed.Get("metrics"), parsed.Get("id_slot"))
 	if err != nil {
 		t.Fatalf("parseMetrics: %v", err)
 	}
@@ -85,7 +85,7 @@ data: [DONE]
 func TestServer_ParseMetrics_VLLMMetrics(t *testing.T) {
 	body := `{"id":"chatcmpl-abc123","object":"chat.completion","usage":{"prompt_tokens":42,"completion_tokens":128,"total_tokens":170,"prompt_tokens_details":{"cached_tokens":20}},"metrics":{"time_to_first_token_ms":85.2,"generation_time_ms":1240.5,"queue_time_ms":12.3,"mean_itl_ms":9.1,"tokens_per_second":103.2}}`
 	parsed := gjson.Parse(body)
-	entry, err := parseMetrics("m", time.Now(), parsed.Get("usage"), parsed.Get("timings"), parsed.Get("metrics"))
+	entry, err := parseMetrics("m", time.Now(), parsed.Get("usage"), parsed.Get("timings"), parsed.Get("metrics"), parsed.Get("id_slot"))
 	if err != nil {
 		t.Fatalf("parseMetrics: %v", err)
 	}
@@ -103,6 +103,52 @@ func TestServer_ParseMetrics_VLLMMetrics(t *testing.T) {
 func TestServer_ProcessStreamingResponse_NoData(t *testing.T) {
 	if _, err := processStreamingResponse("m", time.Now(), []byte("data: [DONE]\n\n")); err == nil {
 		t.Fatal("expected error for stream with no usage data")
+	}
+}
+
+// TestServer_ParseMetrics_SlotID covers stamping slot_id onto the parsed
+// entry's Metadata when the child llama-server response carries a top-level
+// id_slot, so a reader can tell which slot served a given request.
+func TestServer_ParseMetrics_SlotID(t *testing.T) {
+	body := `{"id_slot":3,"timings":{"prompt_n":1,"predicted_n":1}}`
+	parsed := gjson.Parse(body)
+	entry, err := parseMetrics("m", time.Now(), parsed.Get("usage"), parsed.Get("timings"), parsed.Get("metrics"), parsed.Get("id_slot"))
+	if err != nil {
+		t.Fatalf("parseMetrics: %v", err)
+	}
+	if entry.Metadata["slot_id"] != "3" {
+		t.Errorf("slot_id = %q, want %q", entry.Metadata["slot_id"], "3")
+	}
+}
+
+// TestServer_ParseMetrics_NoSlotID covers a response with no id_slot: the
+// key must stay absent, not an empty string, so downstream callers can tell
+// "unknown slot" apart from "slot 0".
+func TestServer_ParseMetrics_NoSlotID(t *testing.T) {
+	body := `{"timings":{"prompt_n":1,"predicted_n":1}}`
+	parsed := gjson.Parse(body)
+	entry, err := parseMetrics("m", time.Now(), parsed.Get("usage"), parsed.Get("timings"), parsed.Get("metrics"), parsed.Get("id_slot"))
+	if err != nil {
+		t.Fatalf("parseMetrics: %v", err)
+	}
+	if _, ok := entry.Metadata["slot_id"]; ok {
+		t.Errorf("slot_id key should be absent, got %q", entry.Metadata["slot_id"])
+	}
+}
+
+// TestServer_ProcessStreamingResponse_SlotID covers extracting id_slot from a
+// streamed response's final chunk, mirroring how llama.cpp repeats id_slot on
+// every SSE chunk.
+func TestServer_ProcessStreamingResponse_SlotID(t *testing.T) {
+	body := []byte("data: {\"choices\":[{}],\"id_slot\":2}\n\n" +
+		"data: {\"usage\":{\"prompt_tokens\":15,\"completion_tokens\":33},\"id_slot\":2}\n\n" +
+		"data: [DONE]\n\n")
+	entry, err := processStreamingResponse("m", time.Now(), body)
+	if err != nil {
+		t.Fatalf("processStreamingResponse: %v", err)
+	}
+	if entry.Metadata["slot_id"] != "2" {
+		t.Errorf("slot_id = %q, want %q", entry.Metadata["slot_id"], "2")
 	}
 }
 
@@ -130,6 +176,36 @@ func TestMetricsMonitor_RecordMetadata(t *testing.T) {
 	}
 	if entries[0].Metadata["trace"] != "abc" {
 		t.Errorf("trace = %q, want abc", entries[0].Metadata["trace"])
+	}
+}
+
+// TestMetricsMonitor_RecordSlotID covers record() merging the slot_id parsed
+// out of the child response body into the stored entry's Metadata, alongside
+// (not clobbering) the request-context keys like tier/selector.
+func TestMetricsMonitor_RecordSlotID(t *testing.T) {
+	mm := newTestMetricsMonitor(t, nil, 10, 0)
+	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"usage":{}}`))
+	r = r.WithContext(swaputil.SetContext(r.Context(), swaputil.ReqContextData{
+		ModelID:  "m",
+		Metadata: map[string]string{"client": "web"},
+	}))
+
+	w := httptest.NewRecorder()
+	copier := newBodyCopier(w)
+	copier.WriteHeader(http.StatusOK)
+	copier.Write([]byte(`{"id_slot":5,"usage":{"prompt_tokens":1,"completion_tokens":2}}`))
+
+	mm.record("m", r, copier, 0, nil)
+
+	entries := metricsEntries(t, mm)
+	if len(entries) != 1 {
+		t.Fatalf("want 1 entry, got %d", len(entries))
+	}
+	if entries[0].Metadata["slot_id"] != "5" {
+		t.Errorf("slot_id = %q, want %q", entries[0].Metadata["slot_id"], "5")
+	}
+	if entries[0].Metadata["client"] != "web" {
+		t.Errorf("client = %q, want web (slot_id merge must not clobber context metadata)", entries[0].Metadata["client"])
 	}
 }
 
@@ -307,7 +383,7 @@ func TestServer_ParseMetrics_Infill(t *testing.T) {
 	if arr := parsed.Array(); len(arr) > 0 {
 		timings = arr[len(arr)-1].Get("timings")
 	}
-	entry, err := parseMetrics("m", time.Now(), parsed.Get("usage"), timings, parsed.Get("metrics"))
+	entry, err := parseMetrics("m", time.Now(), parsed.Get("usage"), timings, parsed.Get("metrics"), parsed.Get("id_slot"))
 	if err != nil {
 		t.Fatalf("parseMetrics: %v", err)
 	}

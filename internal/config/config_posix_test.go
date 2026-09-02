@@ -289,6 +289,18 @@ groups:
 		Upstream: UpstreamConfig{
 			IgnorePaths: DefaultUpstreamIgnorePaths(),
 		},
+		// Seeded by LoadConfigFromReader when the peerStall block is absent;
+		// see Config.PeerStall.
+		PeerStall: PeerStallConfig{
+			Enabled:        true,
+			TimeoutSeconds: 120,
+		},
+		// Likewise seeded when the slotStall block is absent; see
+		// Config.SlotStall.
+		SlotStall: SlotStallConfig{
+			Enabled:        true,
+			TimeoutSeconds: 180,
+		},
 		Routing: RoutingConfig{
 			Router: RouterConfig{
 				Use: "group",

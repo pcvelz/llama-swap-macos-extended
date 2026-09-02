@@ -157,12 +157,32 @@ type statusRecorder struct {
 	http.ResponseWriter
 	status int
 	size   int
+	// termination is set only when the PROXY itself cut the stream (a stalled
+	// peer, a flat slot, or the zero-output budget - see MarkTermination). A
+	// request that finished normally or whose client disconnected leaves this
+	// empty, so the access-log `cut=` field never fires on those.
+	termination string
 }
+
+// Unwrap exposes the wrapped writer to http.ResponseController. Embedding an
+// http.ResponseWriter does NOT supply this - the interface has no Unwrap method
+// to promote - so without it every controller call stops at this wrapper and
+// reports ErrNotSupported. The router's dead-peer slot reclaim needs
+// SetWriteDeadline to reach the real connection through this chain.
+func (sr *statusRecorder) Unwrap() http.ResponseWriter { return sr.ResponseWriter }
 
 func (sr *statusRecorder) WriteHeader(code int) {
 	sr.status = code
 	sr.ResponseWriter.WriteHeader(code)
 }
+
+// MarkTermination records WHY the proxy itself ended this stream (a stalled
+// peer, a flat slot, or the zero-output budget - see
+// internal/router/peerstall.go peerStallGuard.fire), for the `cut=` field on
+// the access-log line below. Nothing is written to the client: a
+// recorded-only contract, reached via the same findTerminationMarker Unwrap
+// walk that call site uses rather than through per-wrapper forwarding.
+func (sr *statusRecorder) MarkTermination(reason string) { sr.termination = reason }
 
 func (sr *statusRecorder) Write(b []byte) (int, error) {
 	n, err := sr.ResponseWriter.Write(b)
@@ -231,8 +251,17 @@ func CreateRequestLogMiddleware(proxylog *logmon.Monitor) chain.Middleware {
 			// field is always populated, never blank.
 			tier := swaputil.TierFromContext(r.Context()).Name
 
-			proxylog.Infof("Request %s \"%s %s %s\" %d %d \"%s\" %v tier=%s",
-				ip, method, path, proto, rec.status, rec.size, ua, time.Since(start), tier)
+			// cut= appears only when the proxy itself ended the stream (see
+			// MarkTermination); a request that finished normally or whose
+			// client disconnected leaves the line exactly as it was before
+			// this field existed.
+			cut := ""
+			if rec.termination != "" {
+				cut = " cut=" + rec.termination
+			}
+
+			proxylog.Infof("Request %s \"%s %s %s\" %d %d \"%s\" %v tier=%s%s",
+				ip, method, path, proto, rec.status, rec.size, ua, time.Since(start), tier, cut)
 		})
 	}
 }

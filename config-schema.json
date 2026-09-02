@@ -328,6 +328,40 @@
                 }
             ]
         },
+        "peerStall": {
+            "type": "object",
+            "additionalProperties": false,
+            "description": "Reclaim a serving slot from a client that has STOPPED READING its response (e.g. a SIGSTOPped Claude Code session). NOT a request timeout: a request may park or stream for hours untouched. The only signal acted on is a single write to the client that cannot make progress for the whole budget.",
+            "properties": {
+                "enabled": {
+                    "type": "boolean",
+                    "default": true,
+                    "description": "Arm the dead-peer guard. False gives byte-identical pre-feature behavior: no write deadline is ever installed."
+                },
+                "timeoutSeconds": {
+                    "type": "integer",
+                    "default": 120,
+                    "description": "How long one write to the client may stay blocked before the request is cancelled and its slot released. 0 or negative disables the guard. A healthy slow reader never blocks a write this long - kernel socket buffers absorb keepalive pings and token deltas."
+                }
+            }
+        },
+        "slotStall": {
+            "type": "object",
+            "additionalProperties": false,
+            "description": "Reclaim a serving slot whose request has stopped making forward progress, whatever the cause (frozen client, wedged child, or a stall neither end notices). The signal is a FLAT progress counter, never an absence of output: prefill is progress, so the clock only starts after the first body byte. Never turn this into a tokens-per-second threshold - a slow session is a working session.",
+            "properties": {
+                "enabled": {
+                    "type": "boolean",
+                    "default": true,
+                    "description": "Arm the no-forward-progress guard. False gives byte-identical pre-feature behavior."
+                },
+                "timeoutSeconds": {
+                    "type": "integer",
+                    "default": 180,
+                    "description": "How long the progress counter may stay completely flat, after the first body byte, before the request is cancelled and its slot released. 0 or negative disables the guard. At 5-10 tok/s the gap between writes is 100-200 ms, so this default is three orders of magnitude past 'slow'."
+                }
+            }
+        },
         "tiers": {
             "type": "object",
             "default": {},

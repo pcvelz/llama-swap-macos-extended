@@ -170,6 +170,15 @@ type HandlerReq struct {
 	// v1 503 if preempted" — the default, byte-identical to pre-replay
 	// behavior.
 	ReplayWanted *atomic.Bool
+
+	// arrivalSeq is a monotonically increasing sequence number FIFO.OnRequest
+	// assigns to a request the one time it first enters the scheduler — never
+	// reassigned on a later re-enqueue (OnSwapDone's cap re-queue, drainQueue),
+	// since those calls pass along the SAME HandlerReq value. enqueue uses it
+	// to break ties within a (tier rank, priority) group by true arrival
+	// order, which no other field can reliably do (there is no wall-clock
+	// arrival timestamp on this struct) — see fifo_arrival_order_test.go.
+	arrivalSeq uint64
 }
 
 // HandlerResp is the routing decision returned to a HandlerReq's caller: either

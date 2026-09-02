@@ -53,6 +53,18 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 		}}},
 		// menu-bar/tray helper is on by default in this fork; set `menu_bar: false` to opt out.
 		MenuBar: DefaultMenuBarConfig(),
+		// Dead-peer slot reclaim is on by default; see PeerStallConfig for why
+		// 120s is safe against a merely-slow reader.
+		PeerStall: PeerStallConfig{
+			Enabled:        true,
+			TimeoutSeconds: 120,
+		},
+		// No-forward-progress reclaim is likewise on by default; see
+		// SlotStallConfig for why 180s cannot catch a merely slow request.
+		SlotStall: SlotStallConfig{
+			Enabled:        true,
+			TimeoutSeconds: 180,
+		},
 	}
 	if err = node.Decode(&config); err != nil {
 		return Config{}, err

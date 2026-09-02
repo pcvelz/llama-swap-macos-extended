@@ -323,6 +323,64 @@ func TestExtractContext_JSON(t *testing.T) {
 	}
 }
 
+// TestExtractContext_SessionID covers extracting Claude Code's session
+// identity out of metadata.user_id: a session_<uuid> segment gives both the
+// bare uuid (session_id) and the raw field (client_user_id), so a reader can
+// answer "are tokens flowing for Claude Code session X" without re-parsing
+// the raw field downstream.
+func TestExtractContext_SessionID(t *testing.T) {
+	tests := []struct {
+		name           string
+		body           string
+		wantSessionID  string
+		wantClientUser string
+	}{
+		{
+			name:           "user_id with session uuid",
+			body:           `{"model":"m","metadata":{"user_id":"user_abc123_account_def456_session_cf006070-1234-4abc-9def-0123456789ab"}}`,
+			wantSessionID:  "cf006070-1234-4abc-9def-0123456789ab",
+			wantClientUser: "user_abc123_account_def456_session_cf006070-1234-4abc-9def-0123456789ab",
+		},
+		{
+			name:           "no metadata.user_id field",
+			body:           `{"model":"m"}`,
+			wantSessionID:  "",
+			wantClientUser: "",
+		},
+		{
+			name:           "user_id present without a session segment",
+			body:           `{"model":"m","metadata":{"user_id":"user_abc123_account_def456"}}`,
+			wantSessionID:  "",
+			wantClientUser: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r, _ := http.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(tt.body))
+			r.Header.Set("Content-Type", "application/json")
+			got, err := extractContext(r)
+			if err != nil {
+				t.Fatalf("extractContext: %v", err)
+			}
+			if got.Metadata["session_id"] != tt.wantSessionID {
+				t.Errorf("session_id = %q, want %q", got.Metadata["session_id"], tt.wantSessionID)
+			}
+			if got.Metadata["client_user_id"] != tt.wantClientUser {
+				t.Errorf("client_user_id = %q, want %q", got.Metadata["client_user_id"], tt.wantClientUser)
+			}
+			if tt.wantSessionID == "" {
+				if _, ok := got.Metadata["session_id"]; ok {
+					t.Error("session_id key should be absent, not empty")
+				}
+				if _, ok := got.Metadata["client_user_id"]; ok {
+					t.Error("client_user_id key should be absent, not empty")
+				}
+			}
+		})
+	}
+}
+
 func TestExtractContext_URLEncodedForm(t *testing.T) {
 	tests := []struct {
 		name      string

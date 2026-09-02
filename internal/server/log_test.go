@@ -141,6 +141,43 @@ func TestServer_RequestLogMiddleware(t *testing.T) {
 	}
 }
 
+// TestServer_RequestLogMiddleware_Termination covers the `cut=` field: when a
+// proxy-side verdict (peerStallGuard.fire, via findTerminationMarker) marks
+// WHY it ended a stream that already committed a plain 200, the access-log
+// line must say so - and must stay byte-identical to before when nothing
+// marked it, so #1029 and every other existing assertion on this line keep
+// holding.
+func TestServer_RequestLogMiddleware_Termination(t *testing.T) {
+	t.Run("marked termination reason appears as cut=", func(t *testing.T) {
+		proxylog := logmon.NewWriter(io.Discard)
+		final := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			marker, ok := w.(interface{ MarkTermination(string) })
+			if !ok {
+				t.Fatal("statusRecorder does not implement MarkTermination")
+			}
+			marker.MarkTermination("slot-stalled")
+		})
+		CreateRequestLogMiddleware(proxylog)(final).ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/messages", nil))
+
+		if line := string(proxylog.GetHistory()); !strings.Contains(line, "cut=slot-stalled") {
+			t.Errorf("log line %q missing cut=slot-stalled", line)
+		}
+	})
+
+	t.Run("no termination reason leaves the line unchanged", func(t *testing.T) {
+		final := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		})
+		proxylog := logmon.NewWriter(io.Discard)
+		CreateRequestLogMiddleware(proxylog)(final).ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/messages", nil))
+
+		if line := string(proxylog.GetHistory()); strings.Contains(line, "cut=") {
+			t.Errorf("log line %q should not contain cut= when termination was never marked", line)
+		}
+	})
+}
+
 // TestServer_RequestLogMiddleware_WebSocketUpgrade verifies that the access-log
 // middleware (which wraps responses in statusRecorder) does not break websocket
 // upgrades proxied through httputil.ReverseProxy. ReverseProxy requires the

@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -207,12 +208,14 @@ func (mp *metricsMonitor) record(modelID string, r *http.Request, recorder *resp
 		} else {
 			tm.Tokens = parsed.Tokens
 			tm.DurationMs = parsed.DurationMs
+			mergeSlotID(&tm, parsed)
 		}
 	} else if gjson.ValidBytes(body) {
 		parsed := gjson.ParseBytes(body)
 		usage := parsed.Get("usage")
 		timings := parsed.Get("timings")
 		responseMetrics := parsed.Get("metrics")
+		slotID := parsed.Get("id_slot")
 
 		// /infill responses are arrays; timings live in the last element (#463).
 		if strings.HasPrefix(r.URL.Path, "/infill") {
@@ -222,11 +225,12 @@ func (mp *metricsMonitor) record(modelID string, r *http.Request, recorder *resp
 		}
 
 		if usage.Exists() || timings.Exists() || responseMetrics.Exists() {
-			if parsedMetrics, err := parseMetrics(modelID, recorder.StartTime(), usage, timings, responseMetrics); err != nil {
+			if parsedMetrics, err := parseMetrics(modelID, recorder.StartTime(), usage, timings, responseMetrics, slotID); err != nil {
 				mp.logger.Warnf("error parsing metrics: %v, path=%s, recording minimal metrics", err, r.URL.Path)
 			} else {
 				tm.Tokens = parsedMetrics.Tokens
 				tm.DurationMs = parsedMetrics.DurationMs
+				mergeSlotID(&tm, parsedMetrics)
 			}
 		}
 	} else {
@@ -392,6 +396,7 @@ func processStreamingResponse(modelID string, start time.Time, body []byte) (Act
 		hasAny                    bool
 		timings                   gjson.Result
 		responseMetrics           gjson.Result
+		slotID                    gjson.Result
 	)
 
 	prefix := []byte("data:")
@@ -447,24 +452,34 @@ func processStreamingResponse(modelID string, start time.Time, body []byte) (Act
 			responseMetrics = m
 			hasAny = true
 		}
+		// id_slot identifies which llama-server slot is serving the request.
+		// llama.cpp repeats it on every SSE chunk, so this loop (which runs
+		// forward through the stream) keeps overwriting slotID and the last
+		// occurrence wins - it can only legitimately change if the upstream
+		// itself reassigned the request mid-stream. Kept separate from hasAny:
+		// a slot id with no accompanying token data still isn't parseable as a
+		// metrics entry.
+		if s := parsed.Get("id_slot"); s.Exists() {
+			slotID = s
+		}
 	}
 
 	if !hasAny {
 		return ActivityLogEntry{}, fmt.Errorf("no valid JSON data found in stream")
 	}
 
-	return buildMetrics(modelID, start, inputTokens, outputTokens, cachedTokens, timings, responseMetrics), nil
+	return buildMetrics(modelID, start, inputTokens, outputTokens, cachedTokens, timings, responseMetrics, slotID), nil
 }
 
-func parseMetrics(modelID string, start time.Time, usage, timings, responseMetrics gjson.Result) (ActivityLogEntry, error) {
+func parseMetrics(modelID string, start time.Time, usage, timings, responseMetrics, slotID gjson.Result) (ActivityLogEntry, error) {
 	input, output, cached, _ := extractUsageTokens(usage)
-	return buildMetrics(modelID, start, input, output, cached, timings, responseMetrics), nil
+	return buildMetrics(modelID, start, input, output, cached, timings, responseMetrics, slotID), nil
 }
 
 // buildMetrics composes an ActivityLogEntry from accumulated token counts and
 // optional llama-server timings (which override input/output and provide rates)
 // or vLLM response metrics.
-func buildMetrics(modelID string, start time.Time, inputTokens, outputTokens, cachedTokens int64, timings, responseMetrics gjson.Result) ActivityLogEntry {
+func buildMetrics(modelID string, start time.Time, inputTokens, outputTokens, cachedTokens int64, timings, responseMetrics, slotID gjson.Result) ActivityLogEntry {
 	wallDurationMs := int(time.Since(start).Milliseconds())
 	durationMs := wallDurationMs
 	tokensPerSecond := -1.0
@@ -500,7 +515,7 @@ func buildMetrics(modelID string, start time.Time, inputTokens, outputTokens, ca
 		tokensPerSecond = 1000 / meanInterTokenLatency.Float()
 	}
 
-	return ActivityLogEntry{
+	entry := ActivityLogEntry{
 		Timestamp: time.Now(),
 		Model:     modelID,
 		Tokens: TokenMetrics{
@@ -514,6 +529,33 @@ func buildMetrics(modelID string, start time.Time, inputTokens, outputTokens, ca
 		},
 		DurationMs: durationMs,
 	}
+	// slot_id identifies which llama-server slot served the request, so a
+	// reader can answer "are tokens flowing for slot N" without cross-
+	// referencing raw child logs. record() merges this key into the stored
+	// entry's own Metadata (which already carries request-context keys like
+	// session_id, tier, selector); it is carried here rather than added
+	// directly there because it comes from the child's *response* body, not
+	// the request context. Absent id_slot leaves the key unset, same as the
+	// other optional keys.
+	if slotID.Exists() {
+		entry.Metadata = map[string]string{"slot_id": strconv.FormatInt(slotID.Int(), 10)}
+	}
+	return entry
+}
+
+// mergeSlotID copies the slot_id key (set by buildMetrics when the child
+// response carried id_slot) from a parsed metrics entry into tm's own
+// Metadata, using the same lazy-init pattern as the tier/selector keys set
+// earlier in record(). A no-op when the response carried no id_slot.
+func mergeSlotID(tm *ActivityLogEntry, parsed ActivityLogEntry) {
+	slotID, ok := parsed.Metadata["slot_id"]
+	if !ok {
+		return
+	}
+	if tm.Metadata == nil {
+		tm.Metadata = make(map[string]string, 1)
+	}
+	tm.Metadata["slot_id"] = slotID
 }
 
 // decompressBody decompresses the body based on the Content-Encoding header.
@@ -708,6 +750,10 @@ func newBodyCopier(w http.ResponseWriter) *responseBodyCopier {
 		start:  time.Now(),
 	}
 }
+
+// Unwrap exposes the wrapped writer to http.ResponseController; see the same
+// method on statusRecorder for why embedding alone is not enough.
+func (w *responseBodyCopier) Unwrap() http.ResponseWriter { return w.ResponseWriter }
 
 // selectBuffer picks the buffer implementation once response headers are
 // final (called from WriteHeader, before it forwards to the underlying

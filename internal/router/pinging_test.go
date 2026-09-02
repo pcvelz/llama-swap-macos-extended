@@ -96,7 +96,7 @@ func TestPingWriter_PingsContinueAfterEarlyHeaders(t *testing.T) {
 	pingQuietDelay, pingInterval = 100*time.Millisecond, 100*time.Millisecond
 	t.Cleanup(func() { pingQuietDelay, pingInterval = origQuiet, origInterval })
 
-	pw := newPingWriter(logger, "test-model", w, true)
+	pw := newPingWriter(logger, "test-model", w, true, nil)
 	defer pw.stop()
 
 	// llama-server's httplib sends SSE headers immediately at accept.
@@ -131,7 +131,7 @@ func TestPingWriter_PingsResumeDuringMidStreamSilence(t *testing.T) {
 	pingQuietDelay, pingInterval = 100*time.Millisecond, 100*time.Millisecond
 	t.Cleanup(func() { pingQuietDelay, pingInterval = origQuiet, origInterval })
 
-	pw := newPingWriter(logger, "test-model", w, true)
+	pw := newPingWriter(logger, "test-model", w, true, nil)
 	defer pw.stop()
 
 	pw.Header().Set("Content-Type", "text/event-stream")
@@ -146,5 +146,199 @@ func TestPingWriter_PingsResumeDuringMidStreamSilence(t *testing.T) {
 	body := w.bodyString()[before:]
 	if !strings.Contains(body, `"type": "ping"`) && !strings.Contains(body, `"type":"ping"`) {
 		t.Errorf("expected ping events during mid-stream silence, got %d new bytes: %q", len(body), body)
+	}
+}
+
+// TestPingWriter_ZeroBudgetEndsStreamReadably covers the hole armParkGiveUp
+// leaves open (llama-cm task #11): that give-up returns early when
+// responseCommitted is true, and the FIRST PING IS THE COMMIT. So a request
+// the pinger has taken over never gets a park-stage give-up, and before this
+// budget existed it was held open indefinitely on content-free pings.
+//
+// The contract: a stream with ZERO upstream body bytes must END with a body
+// the client can read, not stay open forever and not return bare. A bare
+// return is the `200 0` / `502 0` signature from llama-cm incident
+// 2026-08-18-cq27-background-admission-park-bare-502-retry-storm, which
+// Claude Code 0s-retried into a self-sustaining storm.
+func TestPingWriter_ZeroBudgetEndsStreamReadably(t *testing.T) {
+	if testing.Short() {
+		t.Skip("waits >pingQuietDelay of real time")
+	}
+	logger := logmon.NewWriter(io.Discard)
+	w := newSyncRecorder()
+
+	origQuiet, origInterval, origBudget := pingQuietDelay, pingInterval, pingZeroBudget
+	pingQuietDelay, pingInterval = 50*time.Millisecond, 50*time.Millisecond
+	pingZeroBudget = 400 * time.Millisecond
+	t.Cleanup(func() {
+		pingQuietDelay, pingInterval, pingZeroBudget = origQuiet, origInterval, origBudget
+	})
+
+	pw := newPingWriter(logger, "test-model", w, true, nil)
+	defer pw.stop()
+	// The budget is scoped to a request that HOLDS A SLOT (see slotGranted);
+	// a still-parked request is held, not ended.
+	pw.slotGranted()
+
+	// Never write a body byte: this is the granted-but-produces-nothing case.
+	time.Sleep(pingZeroBudget + 6*pingInterval)
+
+	body := w.bodyString()
+	if !strings.Contains(body, `"type":"error"`) {
+		t.Errorf("zero-output stream did not end with a readable SSE error event; body=%q", body)
+	}
+	// overloaded_error is the one Anthropic error type that means "this was
+	// never started, retrying is safe" - the client keys on it to back off
+	// rather than fail the turn.
+	if !strings.Contains(body, "overloaded_error") {
+		t.Errorf("error event should carry overloaded_error so the client knows a retry is safe; body=%q", body)
+	}
+}
+
+// TestPingWriter_ZeroBudgetDisarmedByOneByte is the @user-gated half: ZERO is
+// the bar. One body byte means the stream is working, however slowly, and the
+// budget must never fire again. A slow session is a working session - the user
+// has accepted 40-minute turns - so this must not become a rate threshold.
+func TestPingWriter_ZeroBudgetDisarmedByOneByte(t *testing.T) {
+	if testing.Short() {
+		t.Skip("waits >pingQuietDelay of real time")
+	}
+	logger := logmon.NewWriter(io.Discard)
+	w := newSyncRecorder()
+
+	origQuiet, origInterval, origBudget := pingQuietDelay, pingInterval, pingZeroBudget
+	pingQuietDelay, pingInterval = 50*time.Millisecond, 50*time.Millisecond
+	pingZeroBudget = 300 * time.Millisecond
+	t.Cleanup(func() {
+		pingQuietDelay, pingInterval, pingZeroBudget = origQuiet, origInterval, origBudget
+	})
+
+	pw := newPingWriter(logger, "test-model", w, true, nil)
+	defer pw.stop()
+	pw.slotGranted()
+
+	// One real body byte, closing an SSE event, then silence far beyond the
+	// budget. This is a slow turn, not a stuck one.
+	_, _ = pw.Write([]byte("data: {}\n\n"))
+	time.Sleep(pingZeroBudget + 8*pingInterval)
+
+	body := w.bodyString()
+	if strings.Contains(body, `"type":"error"`) {
+		t.Errorf("budget fired on a stream that HAD produced output - zero is the bar, not a rate; body=%q", body)
+	}
+	if !strings.Contains(body, "ping") {
+		t.Errorf("expected pings to keep bridging silence on a working stream; body=%q", body)
+	}
+}
+
+// TestPingWriter_ParkedStreamIsHeldNotRefused is the @user-approved promise
+// made mechanical (llama-cm docs/intent/llama-swap-backend.md, "You are held,
+// not refused"): a request that is still PARKED in the scheduler queue is
+// pinged through its whole wait, however long that wait is.
+//
+// The defect it locks out: pingZeroBudget used to measure from request
+// arrival, so a session that was simply third in an honest queue - two serving
+// slots, three sessions, measured ~374s to a slot - was handed an SSE error at
+// 270s and started a retry ladder. A queue holding is the mechanism working,
+// not a stream to end.
+func TestPingWriter_ParkedStreamIsHeldNotRefused(t *testing.T) {
+	if testing.Short() {
+		t.Skip("waits >pingQuietDelay of real time")
+	}
+	logger := logmon.NewWriter(io.Discard)
+	w := newSyncRecorder()
+
+	origQuiet, origInterval, origBudget := pingQuietDelay, pingInterval, pingZeroBudget
+	pingQuietDelay, pingInterval = 50*time.Millisecond, 50*time.Millisecond
+	pingZeroBudget = 300 * time.Millisecond
+	t.Cleanup(func() {
+		pingQuietDelay, pingInterval, pingZeroBudget = origQuiet, origInterval, origBudget
+	})
+
+	pw := newPingWriter(logger, "test-model", w, true, nil)
+	defer pw.stop()
+
+	// No slotGranted: this request never left the queue. Wait far past the
+	// budget it would have blown under the arrival-keyed clock.
+	time.Sleep(pingZeroBudget + 8*pingInterval)
+
+	body := w.bodyString()
+	if strings.Contains(body, `"type":"error"`) {
+		t.Errorf("a parked request was REFUSED after %s of waiting - it must be held and pinged for as long as the queue holds it; body=%q", pingZeroBudget, body)
+	}
+	if !strings.Contains(body, "ping") {
+		t.Errorf("a parked request must be pinged through its wait, not left silent; body=%q", body)
+	}
+}
+
+// TestPingWriter_ZeroBudgetStartsAtSlotGrant pins the clock the budget runs
+// on. Time spent parked must not be charged against it: only the stretch after
+// the scheduler granted a slot counts, which is the condition the budget's own
+// error message states ("it held a slot without emitting a token").
+func TestPingWriter_ZeroBudgetStartsAtSlotGrant(t *testing.T) {
+	if testing.Short() {
+		t.Skip("waits >pingQuietDelay of real time")
+	}
+	logger := logmon.NewWriter(io.Discard)
+	w := newSyncRecorder()
+
+	origQuiet, origInterval, origBudget := pingQuietDelay, pingInterval, pingZeroBudget
+	pingQuietDelay, pingInterval = 50*time.Millisecond, 50*time.Millisecond
+	pingZeroBudget = 400 * time.Millisecond
+	t.Cleanup(func() {
+		pingQuietDelay, pingInterval, pingZeroBudget = origQuiet, origInterval, origBudget
+	})
+
+	pw := newPingWriter(logger, "test-model", w, true, nil)
+	defer pw.stop()
+
+	// A long park, then the grant. Under an arrival-keyed clock the budget is
+	// already spent at this point.
+	time.Sleep(pingZeroBudget + 4*pingInterval)
+	pw.slotGranted()
+
+	// Immediately after the grant the stream must still be alive: the budget
+	// restarts here.
+	time.Sleep(2 * pingInterval)
+	if body := w.bodyString(); strings.Contains(body, `"type":"error"`) {
+		t.Errorf("the budget charged the parked stretch against the grant - stream ended %s after being granted a slot; body=%q", 2*pingInterval, body)
+	}
+
+	// And a slot genuinely held without output still ends readably.
+	time.Sleep(pingZeroBudget + 6*pingInterval)
+	if body := w.bodyString(); !strings.Contains(body, `"type":"error"`) {
+		t.Errorf("a granted slot that produced nothing for %s must end with a readable SSE error; body=%q", pingZeroBudget, body)
+	}
+}
+
+// TestPingWriter_AllowPingsWakesImmediately covers the unmute latency. A
+// replay-eligible request is muted until maxReplayHeld (270s), already close
+// to the client's ~300s zero-byte abort, so noticing the unmute only at the
+// next scheduled tick spends most of the remaining margin on silence.
+func TestPingWriter_AllowPingsWakesImmediately(t *testing.T) {
+	if testing.Short() {
+		t.Skip("waits >pingQuietDelay of real time")
+	}
+	logger := logmon.NewWriter(io.Discard)
+	w := newSyncRecorder()
+
+	origQuiet, origInterval := pingQuietDelay, pingInterval
+	pingQuietDelay = 20 * time.Millisecond
+	pingInterval = 2 * time.Second
+	t.Cleanup(func() { pingQuietDelay, pingInterval = origQuiet, origInterval })
+
+	pw := newPingWriter(logger, "test-model", w, false, nil)
+	defer pw.stop()
+
+	// Let the muted loop park on its next tick, a full pingInterval away.
+	time.Sleep(200 * time.Millisecond)
+	if w.bodyLen() != 0 {
+		t.Fatalf("a muted pinger wrote before being unmuted; body=%q", w.bodyString())
+	}
+
+	pw.allowPings()
+	time.Sleep(300 * time.Millisecond)
+	if body := w.bodyString(); !strings.Contains(body, "ping") {
+		t.Errorf("unmute was not picked up promptly - the pinger waited for its next %s tick while the client's abort ceiling approached; body=%q", pingInterval, body)
 	}
 }

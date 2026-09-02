@@ -5,6 +5,7 @@ import (
 	"os"
 	"path"
 	"sort"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -206,6 +207,15 @@ type Config struct {
 	// upstream controls behaviour of the /upstream passthrough endpoint
 	Upstream UpstreamConfig `yaml:"upstream"`
 
+	// PeerStall configures server-side reclaim of a serving slot held by a
+	// client that has stopped reading its response. See PeerStallConfig.
+	PeerStall PeerStallConfig `yaml:"peerStall"`
+
+	// SlotStall configures server-side reclaim of a serving slot whose request
+	// has stopped making forward progress, whatever the cause. See
+	// SlotStallConfig.
+	SlotStall SlotStallConfig `yaml:"slotStall"`
+
 	// Tiers declares extra HTTP entry points into the one shared FIFO queue,
 	// each pre-tagging every request that arrives through it with a rank
 	// before it joins the queue. The main `-listen` port is always the
@@ -231,6 +241,114 @@ type TierConfig struct {
 	// Preemptible, when true, lets a running request on this tier be booted
 	// by any higher-rank arrival, even one without Preempts set.
 	Preemptible bool `yaml:"preemptible"`
+}
+
+// PeerStallConfig bounds how long a SINGLE write to the client may stay
+// BLOCKED before llama-swap concludes the peer has stopped reading, cancels
+// the request, and lets its serving slot go back to the scheduler.
+//
+// This is emphatically NOT a request timeout, and must never become one. A
+// request on this proxy may sit parked or stream slowly for HOURS and that is
+// the product working (llama-cm docs/intent/llama-swap-backend.md, "What a
+// Claude Code session is promised": waiting is normal, slow is not broken).
+// The only thing measured here is whether the CLIENT IS STILL CONSUMING - a
+// write that cannot make a single byte of progress for the whole budget means
+// the peer's receive window has been shut that entire time. A healthy slow
+// reader never produces that: kernel socket buffers absorb keepalive pings and
+// token deltas long before a write can block. A SIGSTOPped process (cm-menu's
+// session-freeze) does produce it, and today pins the slot for as long as it
+// stays frozen.
+type PeerStallConfig struct {
+	// Enabled turns the guard on. Default true. False gives byte-identical
+	// pre-feature behaviour: no write deadline is ever installed.
+	Enabled bool `yaml:"enabled"`
+	// TimeoutSeconds is how long one write may stay blocked before the slot is
+	// reclaimed. Default 120. Zero or negative disables the guard as surely as
+	// enabled:false. Generous on purpose - the cost of a false positive is a
+	// killed live session, the cost of a slow true positive is a few extra
+	// minutes of a slot held by a process that is not reading anyway.
+	TimeoutSeconds int `yaml:"timeoutSeconds"`
+}
+
+// StallTimeout is the effective budget: zero when the guard is off, so callers
+// have one thing to check instead of two.
+func (c PeerStallConfig) StallTimeout() time.Duration {
+	if !c.Enabled || c.TimeoutSeconds <= 0 {
+		return 0
+	}
+	return time.Duration(c.TimeoutSeconds) * time.Second
+}
+
+// UnmarshalYAML sets default values for PeerStallConfig
+func (c *PeerStallConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	type rawPeerStallConfig PeerStallConfig
+	defaults := rawPeerStallConfig{
+		Enabled:        true,
+		TimeoutSeconds: 120,
+	}
+
+	if err := unmarshal(&defaults); err != nil {
+		return err
+	}
+
+	*c = PeerStallConfig(defaults)
+	return nil
+}
+
+// SlotStallConfig bounds how long a request that HOLDS A SERVING SLOT may go
+// with no forward progress before the slot is reclaimed.
+//
+// User ruling (llama-cm llama/incidents/2026-08-28-idle-cc-sessions-pin-ram-no-
+// freeze.md, "USER RULING (2026-09-01)"): a slot that is not generating tokens
+// is the prime candidate for eviction, above every other layer. This is the
+// cause-agnostic half of the reclaim: a frozen client, a wedged child, or a
+// stall neither end notices all look the same from here, and all end the same
+// way.
+//
+// THE SIGNAL IS A FLAT COUNTER, NOT AN ABSENCE OF OUTPUT. Progress is measured
+// as upstream body bytes delivered, which only move when the child produces
+// tokens. It must never be turned into a rate ("too few tokens per second"): a
+// thermally throttled box decoding at 5-10 tok/s is a working session, and
+// reaping it would be a refusal dressed as a safety net. PREFILL IS PROGRESS
+// too, and since the proxy cannot see the prefill counter in-process, the clock
+// only starts after the first body byte - a request still prefilling is never
+// this guard's business. See internal/router/peerstall.go for the full
+// reasoning, including why polling the child's /slots for a prefill counter is
+// a trap.
+type SlotStallConfig struct {
+	// Enabled turns the guard on. Default true. False gives byte-identical
+	// pre-feature behaviour.
+	Enabled bool `yaml:"enabled"`
+	// TimeoutSeconds is how long the progress counter may stay completely flat,
+	// after the first byte, before the slot is reclaimed. Default 180. Zero or
+	// negative disables the guard as surely as enabled:false. Generous by
+	// design: at 5-10 tok/s the gap between writes is 100-200 ms, so 180 s of
+	// silence is three orders of magnitude past "slow" and can only mean stuck.
+	TimeoutSeconds int `yaml:"timeoutSeconds"`
+}
+
+// StallTimeout is the effective budget: zero when the guard is off.
+func (c SlotStallConfig) StallTimeout() time.Duration {
+	if !c.Enabled || c.TimeoutSeconds <= 0 {
+		return 0
+	}
+	return time.Duration(c.TimeoutSeconds) * time.Second
+}
+
+// UnmarshalYAML sets default values for SlotStallConfig
+func (c *SlotStallConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	type rawSlotStallConfig SlotStallConfig
+	defaults := rawSlotStallConfig{
+		Enabled:        true,
+		TimeoutSeconds: 180,
+	}
+
+	if err := unmarshal(&defaults); err != nil {
+		return err
+	}
+
+	*c = SlotStallConfig(defaults)
+	return nil
 }
 
 // RoutingConfig is the canonical, normalized routing/scheduling configuration.

@@ -145,6 +145,49 @@ unloadTimeout: 10
 #   value, 0 disables the grace for that model only)
 swapGraceSeconds: 60
 
+# peerStall: reclaim a serving slot from a client that has STOPPED READING its
+# response, e.g. a session the OS has suspended (SIGSTOP) mid-stream.
+# - optional, default: enabled with a 120 second budget
+# - THIS IS NOT A REQUEST TIMEOUT. A request may sit parked in the queue or
+#   stream slowly for hours and is never touched by this. The only signal acted
+#   on is a single write to the client that cannot make one byte of progress for
+#   the whole budget, which means the peer's receive window has been shut that
+#   entire time. A healthy slow reader never produces that - kernel socket
+#   buffers absorb keepalive pings and token deltas.
+# - on detection the request is cancelled exactly as a real client disconnect
+#   is, so the scheduler releases the slot and the upstream generation aborts.
+#   Nothing about status codes, bodies or retry behaviour changes for healthy
+#   clients. The reclaim logs one greppable line:
+#     peer-stalled: reclaimed slot model=<id> after=<duration>
+# - set enabled: false (or timeoutSeconds: 0) to restore byte-identical
+#   pre-feature behaviour - no write deadline is ever installed
+peerStall:
+  enabled: true
+  timeoutSeconds: 120
+
+# slotStall: reclaim a serving slot whose request has stopped making FORWARD
+# PROGRESS, whatever the cause - a frozen client, a wedged child, or a stall
+# neither end notices.
+# - optional, default: enabled with a 180 second budget
+# - THE SIGNAL IS A FLAT COUNTER, NOT AN ABSENCE OF OUTPUT. Progress is measured
+#   as upstream body bytes delivered, which only move when the child produces
+#   tokens. This must never become a tokens-per-second threshold: a thermally
+#   throttled box decoding at 5-10 tok/s writes every 100-200 ms and is a
+#   WORKING session. Slow is not stuck.
+# - PREFILL IS PROGRESS. A request that has not produced its first byte may be
+#   legitimately prefilling (at 40 tok/s a large context takes minutes with the
+#   byte counter honestly flat), so the clock only starts AFTER the first body
+#   byte. The pre-first-byte window is governed separately, by the keepalive
+#   pinger's own zero-output budget.
+# - on detection the request is cancelled exactly as a real client disconnect
+#   is, the same path peerStall uses. One greppable line:
+#     slot-stalled: reclaimed slot model=<id> after=<duration>
+# - set enabled: false (or timeoutSeconds: 0) to restore byte-identical
+#   pre-feature behaviour
+slotStall:
+  enabled: true
+  timeoutSeconds: 180
+
 # macros: a dictionary of string substitutions
 # - optional, default: empty dictionary
 # - macros are reusable snippets

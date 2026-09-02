@@ -801,6 +801,30 @@ func isCountTokensPath(p string) bool {
 	return strings.HasSuffix(p, "/count_tokens")
 }
 
+// isSlotFreeRequest reports whether r can be served without occupying a
+// model serving slot, which is exactly the population that must bypass the
+// per-model concurrency cap (HandlerReq.ConcurrencyExempt).
+//
+// Two classes qualify:
+//   - count_tokens (see isCountTokensPath);
+//   - any GET/HEAD. llama-server runs inference only on POST; its GET
+//     surface (/slots, /props, /metrics, /health, /models, the UI) is
+//     read-only status, which is what /upstream/<model>/... polls forward.
+//
+// WHY this matters beyond queueing: at capacity a non-exempt arrival takes
+// the scheduler's preemption branch (scheduler.FIFO.tryPreempt), and a
+// main-listener poll carries the default tier, rank 0 — strictly above the
+// background tier every interactive cq* session rides. Without this rule a
+// status poll cancelled live prefills for a request that never needed a
+// slot (llama-cm incident 2026-07-05-cq27-toolgap-eviction-reprefill-storm,
+// 2026-09-01 follow-up).
+func isSlotFreeRequest(r *http.Request) bool {
+	if r.Method == http.MethodGet || r.Method == http.MethodHead {
+		return true
+	}
+	return isCountTokensPath(r.URL.Path)
+}
+
 func (b *baseRouter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	if b.shuttingDown.Load() {
 		swaputil.SendError(w, req, fmt.Errorf("%s is shutting down", b.name))
@@ -853,8 +877,18 @@ func (b *baseRouter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	// so that is the mute condition here.
 	keepaliveArmed := false
 	var pw *pingWriter
+	var stall *peerStallGuard
 	if data.Streaming && data.SendLoadingState && isAnthropicStreamPath(req.URL.Path) {
-		pw = newPingWriter(b.logger, data.ModelID, w, !data.Tier.Preemptible)
+		// Dead-peer slot reclaim rides on the pingWriter because that is the
+		// wrapper that already owns every byte going to the client on this
+		// path - and because /v1/messages streams ARE the population that can
+		// be frozen mid-turn while holding a slot. config.PeerStallConfig
+		// decides whether it is armed at all (see peerstall.go). The same guard
+		// carries the no-forward-progress verdict (config.SlotStallConfig), so
+		// both reclaim reasons share one latch and one cancel.
+		stall = newPeerStallGuard(b.logger, data.ModelID,
+			b.config.PeerStall.StallTimeout(), b.config.SlotStall.StallTimeout())
+		pw = newPingWriter(b.logger, data.ModelID, w, !data.Tier.Preemptible, stall)
 		defer pw.stop()
 		w = pw
 		keepaliveArmed = true
@@ -960,6 +994,9 @@ func (b *baseRouter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 			preempted = new(atomic.Bool)
 		}
 		defer reqCancel()
+		// Hand the stall guard THIS attempt's cancel: each replay attempt runs
+		// under a fresh context, and cancelling a spent one would free nothing.
+		stall.setCancel(reqCancel)
 
 		attemptReq := req.WithContext(reqCtx)
 		if attempt > 1 {
@@ -1013,7 +1050,7 @@ func (b *baseRouter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 			// starved the pool and bounced real turns (2026-07-05). Re-homed here
 			// from the deleted internal/server concurrency middleware, which
 			// exempted the same path from its semaphore.
-			ConcurrencyExempt: isCountTokensPath(attemptReq.URL.Path),
+			ConcurrencyExempt: isSlotFreeRequest(attemptReq),
 			// Inert unless the target model has a KVPoolTokens budget configured
 			// (see scheduler.FIFO.kvAdmit) — see swaputil.EstimateTokens for the
 			// estimation rule.
@@ -1152,6 +1189,14 @@ func (b *baseRouter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		if resp.Err != nil {
 			swaputil.SendError(w, attemptReq, resp.Err)
 			return
+		}
+		if pw != nil {
+			// The park is over: this request holds a serving slot. That starts
+			// pingZeroBudget, which is deliberately inert for the parked
+			// stretch so a session that is merely third in the queue is held
+			// and pinged rather than ended with an error it must retry. See
+			// pingWriter.slotGranted.
+			pw.slotGranted()
 		}
 		resp.HandleFunc(w, attemptReq)
 
