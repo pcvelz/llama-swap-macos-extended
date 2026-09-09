@@ -6,6 +6,16 @@ public final class BackendClient: ObservableObject {
     public let bars: [BarMetric]
     private var cancellables = Set<AnyCancellable>()
     private var eventSession: URLSession?
+    /// Requests currently tracked in flight, keyed by id, kept in sync with
+    /// llama-swap's own inflightTracker via the "inflight" SSE stream's
+    /// snapshot/upsert/remove operations (see applyInflightEntries).
+    private var inflightEntries: [String: InflightRequestEntry] = [:]
+    /// Per-request throughput classification, shared vocabulary with
+    /// llama-cm's cm-menu (see SessionThroughput.swift).
+    private let throughputTracker = SessionThroughputTracker()
+    /// Session titles cm-menu publishes; the proxy cannot know them (see
+    /// SessionTitleStore).
+    private let titleStore: SessionTitleStore
 
     @Published public var menuState = MenuState() {
         didSet { writeDebugSnapshot() }
@@ -29,8 +39,12 @@ public final class BackendClient: ObservableObject {
         return URL(string: "http://127.0.0.1:8080")!
     }
 
-    public init(baseURL: URL? = nil) {
+    /// sessionTitlesPath overrides where cm-menu's published titles are read
+    /// from; the default is the one path cm-menu writes. Tests point it at a
+    /// temporary file.
+    public init(baseURL: URL? = nil, sessionTitlesPath: String? = nil) {
         self.baseURL = baseURL ?? Self.defaultBaseURL()
+        self.titleStore = SessionTitleStore(path: sessionTitlesPath)
         self.bars = BarMetric.parseList(ProcessInfo.processInfo.environment["LLAMA_SWAP_MENU_BARS"])
         // Size the initial bar values to the configured bar count so the icon
         // renders the right number of (empty) bars before the first poll.
@@ -127,6 +141,82 @@ public final class BackendClient: ObservableObject {
         session.dataTask(with: request).resume()
     }
 
+    /// Latest llama-server slot snapshots by model id, plus the last token
+    /// counter sampled per request id. Main-thread only, like `menuState`.
+    private var slotCache: [String: [SlotInfo]] = [:]
+    private var slotSamples: [String: SlotSample] = [:]
+    private var slotTimer: Timer?
+
+    private struct SlotInfo: Decodable {
+        // llama-server's /slots wraps next_token in a single-element array,
+        // not a bare object; decoding it as an object throws on every
+        // response and silently drops the whole payload upstream (`try?`).
+        struct NextToken: Decodable { let n_decoded: Int? }
+        let id: Int
+        let is_processing: Bool
+        let n_prompt_tokens: Int?
+        let n_prompt_tokens_processed: Int?
+        let next_token: [NextToken]?
+
+        var nextTokenInfo: NextToken? { next_token?.first }
+    }
+
+    /// Tracks BOTH slot counters independently rather than a single `value`
+    /// keyed to the byte-heuristic word - see slotDetail's header comment for
+    /// why trusting only one of them prints a false "0.0 t/s".
+    private struct SlotSample {
+        var prefillProcessed: Int
+        var decoded: Int
+        var at: Date
+        /// When either counter last MOVED. The rate is measured over this
+        /// span, not over the poll gap: llama-server advances
+        /// n_prompt_tokens_processed once per ubatch (2048 tokens, ~10s at
+        /// 240 tok/s on cq35h, measured 2026-09-08), so a 2s poll that lands
+        /// on the step used to print 2048/2s = ~1000 t/s for one tick and
+        /// nothing for the next four.
+        var lastChangeAt: Date
+    }
+
+    /// How long the last real rate keeps showing while the slot still
+    /// reports is_processing and its counters have not moved. Sized for the
+    /// prefill step cadence above (one step per ubatch, 10s+ on a slow
+    /// prefill) with headroom; a slot that has genuinely stopped drops
+    /// is_processing and never reaches this hold at all, so the only reading
+    /// this can prolong is a wedged slot's, and 30s is a fair time to keep
+    /// calling that "still going".
+    private static let processingRateHoldSeconds: TimeInterval = 30.0
+
+    /// The last rate text actually computed from a moving counter, plus when
+    /// it was computed - lets a brief poll-to-poll gap with no delta (a
+    /// single stalled tick, not a real stop) keep showing the last real
+    /// number instead of flickering to a bare total and back (user report
+    /// 2026-09-08: "if token/sec is not there for a few 100ms, it's
+    /// flickering gone, then back"). Kept separate from `slotSamples`, which
+    /// must keep updating every tick regardless so the NEXT delta is correct.
+    private struct SlotRateHold {
+        var text: String
+        var at: Date
+    }
+    private var slotRateHolds: [String: SlotRateHold] = [:]
+    /// The last WHOLE readout ("98.9k · 12.4 t/s") a lane rendered, and when.
+    /// The rate hold above only runs once a /slots row was joined to the
+    /// lane; when the join itself fails the entire readout used to drop in
+    /// one go (user report 2026-09-08, second round: the token total and the
+    /// rate flicker off together). Two live producers of a failed join: the
+    /// fallback join needs exactly one processing slot, so every small
+    /// background request on the other slot (pii-detect curls, ~3s each)
+    /// blanks the row; and at a turn boundary the slot cache is wiped and the
+    /// next poll takes 5-13s against a prefilling child. A reading a few
+    /// seconds stale is allowed; a blank is not.
+    private var slotReadoutHolds: [String: SlotRateHold] = [:]
+    /// How long a stale readout (the rate, or the whole "total · rate" line)
+    /// keeps showing across quiet or failed ticks before it is finally
+    /// dropped - long enough to ride out one missed 2s poll tick or one ~3s
+    /// background request on the peer slot, short enough that a genuinely
+    /// stopped slot doesn't show a fake reading forever. One window for both
+    /// holds on purpose: the user sees one readout, not two fields.
+    private static let rateHoldSeconds: TimeInterval = 5.0
+
     private final class EventSourceDelegate: NSObject, URLSessionDataDelegate {
         var onEvent: (String) -> Void
         var reconnect: (() -> Void)?
@@ -184,17 +274,398 @@ public final class BackendClient: ObservableObject {
         case "inflight":
             if let inner = envelope.data.data(using: .utf8),
                let stats = try? JSONDecoder().decode(InFlightStats.self, from: inner) {
+                applyInflightEntries(stats)
                 menuState.applyInflight(total: stats.total, byTier: stats.byTier ?? [:])
+            }
+        case "swapGrace":
+            if let inner = envelope.data.data(using: .utf8),
+               let payload = try? JSONDecoder().decode(SwapGracePayload.self, from: inner) {
+                menuState.graceHolds = payload.holds
             }
         default:
             break
         }
     }
 
+    /// Keeps `inflightEntries` in sync with one "inflight" event's operation
+    /// (snapshot replaces the whole set; upsert/remove touch one id - mirrors
+    /// internal/server/inflight.go's own tracker), then rederives the two
+    /// presentation lists every event carries: sessionRows (one per in-flight
+    /// request, with a throughput word) and queueRows (the scheduler's own
+    /// wait list, always re-stamped fresh on every event regardless of
+    /// operation - internal/server/inflight.go withCountsLocked).
+    private func applyInflightEntries(_ stats: InFlightStats) {
+        switch stats.operation {
+        case "snapshot":
+            inflightEntries = Dictionary(uniqueKeysWithValues: (stats.requests ?? []).map { ($0.id, $0) })
+        case "upsert":
+            if let req = stats.request { inflightEntries[req.id] = req }
+        case "remove":
+            if let rid = stats.id { inflightEntries.removeValue(forKey: rid) }
+        default:
+            break
+        }
+
+        let now = Date()
+        throughputTracker.prune(keeping: Set(inflightEntries.keys))
+        // One stat (and at most one read) per event, not per row - see
+        // SessionTitleStore.refresh.
+        titleStore.refresh()
+        // ONE ROW PER LANE, in first-seen order. A Claude Code client keeps
+        // two requests open on the proxy around every turn boundary (the
+        // finished one is removed a beat after the next arrives), so a
+        // per-request list shows two rows per lane and re-sorts on every
+        // arrival and removal - the list read as flickering with a parent
+        // and two subagents. The lane's newest request is what the row shows;
+        // a lane drops out only when it has no request left.
+        var newestByLane: [String: InflightRequestEntry] = [:]
+        var oldestIDByLane: [String: Int] = [:]
+        for entry in inflightEntries.values {
+            let lane = Self.laneKey(for: entry)
+            let id = Int(entry.id) ?? 0
+            oldestIDByLane[lane] = min(oldestIDByLane[lane] ?? id, id)
+            if let current = newestByLane[lane], (Int(current.id) ?? 0) >= id { continue }
+            newestByLane[lane] = entry
+        }
+        laneOrder.removeAll { newestByLane[$0] == nil }
+        // A lane new to the list joins in the order it first APPEARED (its
+        // oldest open request), not by its newest request - otherwise a
+        // parent whose next turn arrived after its subagent's would jump
+        // below that subagent.
+        for lane in newestByLane.keys.sorted(by: { oldestIDByLane[$0]! < oldestIDByLane[$1]! })
+        where !laneOrder.contains(lane) {
+            laneOrder.append(lane)
+        }
+        menuState.sessionRows = laneOrder
+            .compactMap { newestByLane[$0] }
+            .map { entry in
+                let meta = entry.metadata ?? [:]
+                let sessionID = meta["session_id"]
+                let origin = SessionOrigin.label(
+                    sessionID: sessionID, client: meta["client"],
+                    userAgent: entry.reqHeaders?["User-Agent"])
+                // model_alias is the operator-facing name for the model that
+                // actually serves; the raw model id is the fallback for an
+                // entry from a proxy that predates the key.
+                let model = meta["model_alias"] ?? entry.model
+                let row = { (word: String, detail: String?) in
+                    SessionRow(
+                        id: entry.id, origin: origin, model: model,
+                        tier: meta["tier"] ?? "-", word: word, detail: detail,
+                        hasSession: !(sessionID ?? "").isEmpty,
+                        title: self.titleStore.title(forSessionID: sessionID),
+                        parent: meta["parent_session_id"].map { String($0.prefix(8)) },
+                        agent: meta["agent_id"].map { String($0.prefix(8)) })
+                }
+                // PARKED WINS BEFORE ANY BYTE HEURISTIC. Two things park a
+                // request: kv-admission holding it (metadata.kv_parked), and
+                // the scheduler not having granted it a slot yet (no
+                // metadata.slot_granted - a granted request carries "1"). A
+                // parked request emits no output bytes, and on the Anthropic
+                // path may still emit keepalives, so a byte heuristic reads
+                // it as FLAT, i.e. stalled, when it is merely waiting. These
+                // rows also skip the byte-sample tracker, so a still-parked
+                // request never seeds a stale sample that would misclassify
+                // it the moment it is granted and starts producing bytes.
+                guard meta["kv_parked"] != "1", meta["slot_granted"] == "1" else {
+                    return row(ThroughputWord.parked.rawValue, nil)
+                }
+                let word = throughputTracker.word(
+                    forRequestID: entry.id, respBytes: entry.respBytes, elapsedMs: entry.elapsedMs, now: now)
+                return row(word.rawValue, nil)
+            }
+        menuState.queueRows = (stats.queue ?? []).map {
+            QueueRow(position: $0.position, tier: $0.tier, model: $0.model)
+        }
+        // Rows are built with a nil detail above; fill them from the slot
+        // cache / readout holds right away so a turn boundary (new request
+        // id, same lane) re-shows the lane's last readout instead of a blank
+        // until the next /slots poll answers.
+        refreshSlotDetails(now: now)
+        syncSlotPolling()
+    }
+
+    /// Poll `/slots` only while there is inflight work; one GET per distinct
+    /// model per tick. Everything lands back on main before touching state.
+    private func syncSlotPolling() {
+        guard !inflightEntries.isEmpty else {
+            DispatchQueue.main.async {
+                self.slotTimer?.invalidate()
+                self.slotTimer = nil
+                self.slotCache.removeAll()
+                self.slotSamples.removeAll()
+                self.slotRateHolds.removeAll()
+                // slotReadoutHolds is deliberately NOT cleared here: the
+                // inflight set is empty for an instant at every turn
+                // boundary, and the hold is what carries the lane's readout
+                // across that gap until the next turn's first poll answers.
+                // Entries age out through the hold window on their own.
+            }
+            return
+        }
+        guard slotTimer == nil else { return }
+        // NOT Timer.scheduledTimer: that schedules on the run loop's .default
+        // mode only, which an open NSStatusItem menu's tracking loop does not
+        // run (.eventTracking instead) - the exact moment someone is looking
+        // at the menu to see the rate, its ticks stop firing. .common covers
+        // both.
+        let timer = Timer(timeInterval: 2.0, repeats: true) { [weak self] _ in
+            self?.pollSlots()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        slotTimer = timer
+        pollSlots()
+    }
+
+    /// First-seen order of the lanes currently rendered; see applyInflightEntries.
+    private var laneOrder: [String] = []
+
+    /// The identity a menu row stands for: a Claude Code session, or one of
+    /// its Agent-tool subagents (same session_id, own agent_id). A request
+    /// without a session is its own lane, so anonymous rows still render.
+    static func laneKey(for entry: InflightRequestEntry) -> String {
+        let meta = entry.metadata ?? [:]
+        guard let session = meta["session_id"], !session.isEmpty else { return "req:" + entry.id }
+        if let agent = meta["agent_id"], !agent.isEmpty { return session + "/" + agent }
+        return session
+    }
+
+    /// The model whose /slots answer for this entry. A resident-alias request
+    /// (claude-haiku-*, default) keeps the alias as entry.model, and an alias
+    /// has no /upstream route - polling it 404s every tick and the row's slot
+    /// readout vanishes. The proxy stamps metadata.resolved_model with the
+    /// model that serves; follow it when present.
+    static func slotModel(for entry: InflightRequestEntry) -> String {
+        entry.metadata?["resolved_model"] ?? entry.model
+    }
+
+    private func pollSlots() {
+        let models = Set(inflightEntries.values.map { Self.slotModel(for: $0) })
+        for model in models {
+            let escaped = model.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? model
+            let url = baseURL.appendingPathComponent("/upstream/\(escaped)/slots")
+            URLSession.shared.dataTask(with: url) { [weak self] data, _, _ in
+                guard let self, let data,
+                      let slots = try? JSONDecoder().decode([SlotInfo].self, from: data) else { return }
+                DispatchQueue.main.async {
+                    self.slotCache[model] = slots
+                    self.refreshSlotDetails()
+                }
+            }.resume()
+        }
+    }
+
+    /// Which slot counter last MOVED for a lane: .decode when n_decoded
+    /// advanced, .prefill when n_prompt_tokens_processed did. Set by
+    /// freshSlotDetail on the tick it measures a rate, cleared with the other
+    /// per-lane state when the lane parks. This is the slot's own account of
+    /// the phase, and it outranks the byte heuristic's PREFILL/DECODE guess:
+    /// on the Anthropic streaming path resp_bytes can sit at 0 for a while
+    /// after decode has begun (user report 2026-09-08 19:40, "PREFILL · 110k ·
+    /// 38 t/s" while the decode counter climbed), and a keepalive byte can
+    /// flip it to DECODE while the slot still prefills (the earlier report).
+    /// Either way the word contradicted the rate next to it, which is
+    /// measured from the counter that actually moved.
+    private var slotPhases: [String: ThroughputWord] = [:]
+
+    /// Rewrites the trailing numbers on already-classified rows and lets the
+    /// slot's own phase (slotPhases) correct a PREFILL/DECODE word. PARKED and
+    /// FLAT are never touched: a parked row has no slot, and FLAT is a stall
+    /// verdict from the byte clock that a moving counter would have
+    /// prevented anyway. Tracker samples are left exactly as events made them.
+    private func refreshSlotDetails(now: Date = Date()) {
+        menuState.sessionRows = menuState.sessionRows.map { row in
+            guard let entry = inflightEntries[row.id] else { return row }
+            let detail = slotDetail(for: entry, word: row.word, now: now)
+            var word = row.word
+            if word == ThroughputWord.prefill.rawValue || word == ThroughputWord.decode.rawValue,
+               let phase = slotPhases[Self.laneKey(for: entry)] {
+                word = phase.rawValue
+            }
+            return SessionRow(id: row.id, origin: row.origin, model: row.model,
+                              tier: row.tier, word: word,
+                              detail: detail,
+                              hasSession: row.hasSession, title: row.title, parent: row.parent,
+                              agent: row.agent)
+        }
+    }
+
+    /// The one definition of "this request holds no slot": kv-admission is
+    /// holding it, or the scheduler has not granted it yet. Same flags the
+    /// PARKED classification in applyInflightEntries uses; the slot join and
+    /// the readout hold must agree with the word or a row contradicts itself.
+    static func isParked(_ entry: InflightRequestEntry) -> Bool {
+        let meta = entry.metadata ?? [:]
+        return meta["kv_parked"] == "1" || meta["slot_granted"] != "1"
+    }
+
+    private func joinedSlot(for entry: InflightRequestEntry) -> SlotInfo? {
+        guard let slots = slotCache[Self.slotModel(for: entry)] else { return nil }
+        let meta = entry.metadata ?? [:]
+        // A parked request holds no slot, so there is nothing truthful to
+        // join. The proxy stamps slot_affinity on EVERY request of a lane at
+        // admission, parked or granted, and a parked subagent turn shares its
+        // lane's affinity with the parent's granted turn - so without this
+        // guard the affinity branch below joins the parked row to the busy
+        // slot and prints the OTHER request's total and rate (user report
+        // 2026-09-08, fourth round: three rows all reading "97.6k · 36.9 t/s"
+        // with one slot processing and one idle). The fallback branch has the
+        // same hole whenever exactly one slot is processing. Same flags as
+        // the PARKED classification in applyInflightEntries.
+        guard !Self.isParked(entry) else { return nil }
+        if let affinity = meta["slot_affinity"], let id = Int(affinity),
+           let slot = slots.first(where: { $0.id == id }) { return slot }
+        if let sid = meta["slot_id"], let id = Int(sid),
+           let slot = slots.first(where: { $0.id == id }) { return slot }
+        let processing = slots.filter { $0.is_processing }
+        return processing.count == 1 ? processing[0] : nil
+    }
+
+    /// Renders the trailing "context · rate" readout for one row's slot.
+    ///
+    /// Two corrections here, both against real evidence (user report
+    /// 2026-09-08, "... · DECODE · 15.5k · 0.0 t/s" with the total visibly
+    /// rising between ticks):
+    ///
+    /// 1. Which /slots counter feeds the rate used to be picked solely from
+    ///    `word`, the byte-heuristic classification from SessionThroughput
+    ///    (SessionThroughput.swift). On the Anthropic path a keepalive byte
+    ///    can flip that heuristic to DECODE while the slot itself is still
+    ///    PREFILLING (n_prompt_tokens/n_prompt_tokens_processed climbing,
+    ///    n_decoded pinned at 0) - the rate then sampled the flat counter
+    ///    (decoded) while the displayed total (built from BOTH counters) kept
+    ///    rising from the other one, printing a literal "0.0 t/s" next to a
+    ///    rising total: a contradiction. Fix: track both counters every tick
+    ///    and report whichever one actually advanced, ignoring `word` for
+    ///    this choice - `word` still drives which KEYWORD the row shows, just
+    ///    not which counter backs its rate.
+    /// 2. Samples used to be keyed by `entry.id`, but a row now shows one LANE
+    ///    (applyInflightEntries' one-row-per-lane), whose id is the lane's
+    ///    NEWEST request and therefore changes at every turn boundary -
+    ///    every boundary reset the sample and printed a bare total with no
+    ///    rate for one tick. Fix: key by lane instead, so the sample survives
+    ///    a request handoff within the same lane.
+    private func slotDetail(for entry: InflightRequestEntry, word: String, now: Date) -> String? {
+        let lane = Self.laneKey(for: entry)
+        // A PARKED entry is a KNOWN absence from the slot, not a failed join,
+        // so the lane's last-good readout must not ride the hold here: with
+        // turns rotating every 6-12 s the hold kept a stale "109.6k · 37.5
+        // t/s" on a PARKED row for 5 s of every park (user report 2026-09-08
+        // 19:25). Dropping the hold (and the rate sample, whose counters
+        // restart on the next grant anyway) makes the row go bare the moment
+        // the lane parks; the next grant rebuilds both from a real join.
+        if Self.isParked(entry) {
+            slotReadoutHolds[lane] = nil
+            slotRateHolds[lane] = nil
+            slotSamples[lane] = nil
+            slotPhases[lane] = nil
+            return nil
+        }
+        guard let fresh = freshSlotDetail(for: entry, lane: lane, now: now) else {
+            // Failed join: keep the last good readout inside the hold window
+            // rather than blanking the row - see slotReadoutHolds.
+            guard let held = slotReadoutHolds[lane],
+                  now.timeIntervalSince(held.at) <= Self.rateHoldSeconds else { return nil }
+            return held.text
+        }
+        slotReadoutHolds[lane] = SlotRateHold(text: fresh, at: now)
+        return fresh
+    }
+
+    private func freshSlotDetail(for entry: InflightRequestEntry, lane: String, now: Date) -> String? {
+        guard let slot = joinedSlot(for: entry) else { return nil }
+        let prompt = slot.n_prompt_tokens ?? 0
+        let decoded = slot.nextTokenInfo?.n_decoded ?? 0
+        let context = CompactFormatter.tokens(prompt + decoded)
+        guard slot.is_processing else { return context }
+        let prefillProcessed = slot.n_prompt_tokens_processed ?? prompt
+        guard let previous = slotSamples[lane] else {
+            slotSamples[lane] = SlotSample(prefillProcessed: prefillProcessed, decoded: decoded,
+                                           at: now, lastChangeAt: now)
+            return context
+        }
+        let decodedDelta = decoded - previous.decoded
+        let prefillDelta = prefillProcessed - previous.prefillProcessed
+        // A negative delta means the slot was reused by a fresh request
+        // (counters restarted): re-baseline, show no rate until it moves.
+        if decodedDelta < 0 || prefillDelta < 0 {
+            slotSamples[lane] = SlotSample(prefillProcessed: prefillProcessed, decoded: decoded,
+                                           at: now, lastChangeAt: now)
+            // The new request's phase is unknown until a counter moves; do
+            // not let the previous request's phase label it.
+            slotPhases[lane] = nil
+            return context
+        }
+        // Decode motion wins when both counters move in one tick: a slot that
+        // has produced a token is past prefill, whatever the prefill counter's
+        // final catch-up step says.
+        if decodedDelta > 0 {
+            slotPhases[lane] = .decode
+        } else if prefillDelta > 0 {
+            slotPhases[lane] = .prefill
+        }
+        let moved = decodedDelta > 0 || prefillDelta > 0
+        let span = now.timeIntervalSince(previous.lastChangeAt)
+        slotSamples[lane] = SlotSample(prefillProcessed: prefillProcessed, decoded: decoded,
+                                       at: now, lastChangeAt: moved ? now : previous.lastChangeAt)
+        // No motion this tick (or a poll landed within the same instant as the
+        // step): the slot is still processing, so keep the last real rate.
+        guard moved, span > 0.25 else { return heldRateDetail(lane: lane, context: context, now: now) }
+        // Prefer whichever counter actually moved, measured over the time
+        // since it LAST moved - see SlotSample.lastChangeAt.
+        let delta = decodedDelta > 0 ? decodedDelta : prefillDelta
+        let freshRate = CompactFormatter.rate(Double(delta) / span)
+        slotRateHolds[lane] = SlotRateHold(text: freshRate, at: now)
+        return "\(context) · \(freshRate)"
+    }
+
+    /// Falls back to the last real rate for `lane` while it is still within
+    /// the hold window, rather than dropping straight to a bare total the
+    /// moment one tick shows no delta - see slotRateHolds' header comment.
+    private func heldRateDetail(lane: String, context: String, now: Date) -> String {
+        // Only reached while the slot reports is_processing, so the longer
+        // processing hold applies - see processingRateHoldSeconds.
+        guard let held = slotRateHolds[lane],
+              now.timeIntervalSince(held.at) <= Self.processingRateHoldSeconds else {
+            return context
+        }
+        return "\(context) · \(held.text)"
+    }
+
     public func unloadAll() {
         var request = URLRequest(url: baseURL.appendingPathComponent("/api/models/unload"))
         request.httpMethod = "POST"
         URLSession.shared.dataTask(with: request) { _, _, _ in }.resume()
+    }
+
+    /// Ends `reqModel`'s current swap-grace hold immediately - the menu's
+    /// cooldown row click. The row clears optimistically the moment the click
+    /// lands (the click IS the operator unarming the hold; waiting for the
+    /// next swapGrace SSE tick reads as a dead click), and SSE re-adds it
+    /// within ~1s if the hold genuinely persists. A failed POST restores the
+    /// row and surfaces the error: a dead click and a successful one must
+    /// never look identical (witnessed 2026-09-09).
+    public func finishGrace(reqModel: String) {
+        let removed = menuState.graceHolds.filter { $0.requestedModel == reqModel }
+        menuState.graceHolds.removeAll { $0.requestedModel == reqModel }
+
+        let escaped = reqModel.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? reqModel
+        var request = URLRequest(url: baseURL.appendingPathComponent("/api/swap-grace/finish/\(escaped)"))
+        request.httpMethod = "POST"
+        URLSession.shared.dataTask(with: request) { [weak self] _, response, error in
+            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+            let failed = error != nil || status < 200 || status >= 300
+            guard failed, let self else { return }
+            DispatchQueue.main.async {
+                // Restore only what this click removed and only if SSE has not
+                // already re-published the hold in the meantime.
+                let stillMissing = removed.filter { gone in
+                    !self.menuState.graceHolds.contains { $0.id == gone.id }
+                }
+                self.menuState.graceHolds.append(contentsOf: stillMissing)
+                self.menuState.lastSwitchError = "unarm cooldown for \(reqModel) failed"
+            }
+        }.resume()
     }
 
     /// Switches the backend to `modelID`. This is the menu's click handler:

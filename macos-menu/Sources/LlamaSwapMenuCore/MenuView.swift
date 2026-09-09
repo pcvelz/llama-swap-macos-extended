@@ -21,6 +21,14 @@ public struct MenuView: View {
         return client.menuState.activeModelID == model.id ? "● " : "○ "
     }
 
+    /// A model's alias/display label, the same one `bullet`'s rows use, so a
+    /// cooldown row names models the same way the model list does. Falls
+    /// back to the raw id when the model isn't in the current models list
+    /// (a transient gap between the swapGrace and modelStatus events).
+    private func modelLabel(for id: String, in models: [ModelRow]) -> String {
+        models.first(where: { $0.id == id })?.displayLabel ?? id
+    }
+
     public var body: some View {
         let state = client.menuState
 
@@ -33,6 +41,20 @@ public struct MenuView: View {
         Text("\(state.completed) completed")
 
         Text(state.waitingSummary)
+
+        // One row per in-flight request, in the grammar llama-cm's
+        // session-identity contract fixes for both renderers - the row text
+        // itself lives on SessionRow.displayLine, so cm-menu and this menu
+        // can never disagree about how a request is described.
+        ForEach(state.sessionRows) { row in
+            Text(row.displayLine)
+        }
+
+        // The scheduler's own wait list - "Queue: idle" when nothing is
+        // parked, one summary line otherwise (never inferred per-row; see
+        // SessionThroughput.swift's header on why PARKED isn't a per-request
+        // word here).
+        Text(MenuState.queueSummary(state.queueRows))
 
         Text("Load")
             .foregroundStyle(.secondary)
@@ -67,6 +89,23 @@ public struct MenuView: View {
             Text("Switch failed: \(error)")
                 .foregroundStyle(.secondary)
                 .disabled(true)
+        }
+
+        // One row per active swap-grace hold (llama-cm llama-swap.yaml
+        // swapGraceSeconds) - a request parked waiting for a resident model
+        // to finish its grace window before it can be evicted. Clicking ends
+        // the hold immediately (BackendClient.finishGrace) instead of making
+        // the operator wait it out or guess why a model switch is stuck.
+        // Hidden entirely when nothing is held - state.graceHolds is empty
+        // the overwhelming majority of the time.
+        ForEach(state.graceHolds) { hold in
+            Button {
+                client.finishGrace(reqModel: hold.requestedModel)
+            } label: {
+                Text("Cooldown: \(modelLabel(for: hold.requestedModel, in: state.models))"
+                    + " waiting for \(modelLabel(for: hold.evicteeModel, in: state.models))"
+                    + "  (\(CompactFormatter.countdown(hold.remainingSeconds)))")
+            }
         }
 
         Divider()

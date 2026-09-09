@@ -28,6 +28,35 @@ public struct MenuState: Encodable {
     /// Values 0...1 for the configured bar metrics, in configuration order.
     public var barValues: [Double] = [0, 0]
 
+    /// One row per currently in-flight request, derived from the /api/events
+    /// "inflight" snapshot/upsert/remove stream by BackendClient - the same
+    /// per-session throughput vocabulary as llama-cm's cm-menu (see
+    /// SessionThroughput.swift), so the two can never disagree.
+    public var sessionRows: [SessionRow] = []
+    /// The scheduler's ordered wait list (llama-swap's own authoritative
+    /// "no slot granted yet" data, internal/swaputil/events.go QueueEntry) -
+    /// never inferred, since the live inflight entry carries no per-request
+    /// slot signal (see SessionThroughput.swift's header).
+    public var queueRows: [QueueRow] = []
+
+    /// Currently active swap-grace holds (llama-cm llama-swap.yaml
+    /// swapGraceSeconds; see fifo.go's grace/idleSince/graceWait/withinGrace)
+    /// - one entry per (requested model, evictee) pair with a request queued
+    /// behind the evictee's grace window. Pushed by the "swapGrace" SSE
+    /// event/GET /api/swap-grace (BackendClient.handleEvent); empty when
+    /// nothing is currently held.
+    public var graceHolds: [GraceHoldRow] = []
+
+    /// The "Queue: idle" line the design calls for when nothing is parked,
+    /// else one summary per queued entry.
+    public static func queueSummary(_ rows: [QueueRow]) -> String {
+        guard !rows.isEmpty else { return "Queue: idle" }
+        return rows
+            .sorted { $0.position < $1.position }
+            .map { "\($0.position). \($0.tier)/\($0.model)" }
+            .joined(separator: ", ")
+    }
+
     /// Derived, never stored: storing it meant recomputing at three call sites
     /// with inputs that drifted apart.
     public var activeModelID: String? {
@@ -83,6 +112,7 @@ public struct MenuState: Encodable {
     private enum CodingKeys: String, CodingKey {
         case backendOnline, completed, waiting, waitingByTier, models, chosenModelID
         case pendingModelID, lastSwitchError, barValues, activeModelID
+        case sessionRows, queueRows, graceHolds
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -97,6 +127,136 @@ public struct MenuState: Encodable {
         try c.encodeIfPresent(pendingModelID, forKey: .pendingModelID)
         try c.encodeIfPresent(lastSwitchError, forKey: .lastSwitchError)
         try c.encodeIfPresent(activeModelID, forKey: .activeModelID)
+        try c.encode(sessionRows, forKey: .sessionRows)
+        try c.encode(queueRows, forKey: .queueRows)
+        try c.encode(graceHolds, forKey: .graceHolds)
+    }
+}
+
+/// One active swap-grace hold - mirrors internal/swaputil/events.go
+/// GraceHold exactly (field names match, so the default synthesized
+/// Codable decodes it with no CodingKeys needed). `id` is computed, not
+/// stored, so it plays no part in (de)coding - see QueueRow for the same
+/// pattern with a stored id.
+public struct GraceHoldRow: Identifiable, Codable, Equatable {
+    public var id: String { "\(requestedModel)->\(evicteeModel)" }
+    public let requestedModel: String
+    public let evicteeModel: String
+    public let waiting: Int
+    public let remainingSeconds: Int
+}
+
+/// One in-flight request rendered as a menu row: who it belongs to, which
+/// model it hit, and its throughput classification (SessionThroughput.swift).
+public struct SessionRow: Identifiable, Encodable, Equatable {
+    public let id: String
+    public let origin: String
+    public let model: String
+    /// "-" when the live entry carries no per-request tier (the common case
+    /// today - see SessionThroughput.swift's header on why tier isn't
+    /// threaded onto the live inflight entry's metadata).
+    public let tier: String
+    public let word: String
+    /// Optional trailing readout, e.g. "98.9k · 12.4 t/s"; nil when no slot can
+    /// be joined confidently for this request.
+    public let detail: String?
+    /// True when the proxy identified a Claude Code session behind this
+    /// request (metadata.session_id). Decides whether `origin` renders as a
+    /// bracketed session id or as a bare client-family name - the two cases
+    /// the row grammar distinguishes.
+    public let hasSession: Bool
+    /// What that session is working on, from cm-menu's published titles
+    /// (SessionTitleStore); nil when no title is known.
+    public let title: String?
+    /// Short id of the session that DISPATCHED this one, when the request is
+    /// a headless child (metadata.parent_session_id).
+    public let parent: String?
+    /// Short id of the Agent-tool SUBAGENT making this turn
+    /// (metadata.agent_id); nil for the session's own turns. A subagent
+    /// reuses its parent's session id, so without this the parent's turn and
+    /// its subagent's render as identical rows.
+    public let agent: String?
+
+    public init(id: String, origin: String, model: String, tier: String, word: String,
+                detail: String? = nil, hasSession: Bool = false, title: String? = nil,
+                parent: String? = nil, agent: String? = nil) {
+        self.id = id
+        self.origin = origin
+        self.model = model
+        self.tier = tier
+        self.word = word
+        self.detail = detail
+        self.hasSession = hasSession
+        self.title = title
+        self.parent = parent
+        self.agent = agent
+    }
+
+    /// The row as the menu shows it, per llama-cm's session-identity contract
+    /// (docs/intent/session-identity-contract.md):
+    ///
+    ///   `[<sid8>] <model_alias> · <title20> · <WORD>`
+    ///   `[<sid8> > <agent8>] <model_alias> · ...` for a subagent's turn
+    ///   `<client> · <model_alias> · <WORD>` when no session is identified
+    ///   ... ` (child of <parent8>)` when the request was dispatched
+    ///
+    /// The trailing token/rate readout, when one could be joined, follows the
+    /// word as its own segment. Segments the request cannot supply (no title,
+    /// no slot join) are dropped rather than shown empty, so a sparse row
+    /// stays readable instead of collapsing into separators.
+    public var displayLine: String {
+        var segments: [String] = []
+        if hasSession {
+            let bracket = agent.map { "\(origin) > \($0)" } ?? origin
+            segments.append("[\(bracket)] \(model)")
+        } else {
+            segments.append("\(origin) · \(model)")
+        }
+        if let title, !title.isEmpty { segments.append(title) }
+        segments.append(word)
+        if let detail, !detail.isEmpty { segments.append(detail) }
+        var line = segments.joined(separator: " · ")
+        if let parent, !parent.isEmpty {
+            line += " (child of \(parent))"
+        }
+        return line
+    }
+}
+
+/// Compact menu numbers: 98.9k / 1.2M for token counts, one decimal for t/s.
+public enum CompactFormatter {
+    public static func tokens(_ n: Int) -> String {
+        if n >= 1_000_000 { return String(format: "%.1fM", Double(n) / 1_000_000) }
+        if n >= 1_000 { return String(format: "%.1fk", Double(n) / 1_000) }
+        return "\(n)"
+    }
+
+    public static func rate(_ tokensPerSecond: Double) -> String {
+        String(format: "%.1f t/s", tokensPerSecond)
+    }
+
+    /// "4:12" style countdown for a swap-grace hold's remaining seconds.
+    /// Clamped at 0 so a stale/negative reading (the hold ending between the
+    /// last SSE tick and render) never prints a negative countdown.
+    public static func countdown(_ seconds: Int) -> String {
+        let s = max(0, seconds)
+        return String(format: "%d:%02d", s / 60, s % 60)
+    }
+}
+
+/// One parked entry from the scheduler's own wait list (llama-swap's
+/// QueueEntry), 1-indexed by grant order.
+public struct QueueRow: Identifiable, Encodable, Equatable {
+    public let id: String
+    public let position: Int
+    public let tier: String
+    public let model: String
+
+    public init(position: Int, tier: String, model: String) {
+        self.id = "\(position)-\(tier)-\(model)"
+        self.position = position
+        self.tier = tier
+        self.model = model
     }
 }
 
@@ -163,4 +323,55 @@ struct EventEnvelope: Codable {
 struct InFlightStats: Codable {
     let total: Int
     let byTier: [String: Int]?
+    /// "snapshot" | "upsert" | "remove" (internal/server/inflight.go
+    /// inflightOperation*). Optional so the pre-merge minimal payload this
+    /// struct originally decoded still parses.
+    let operation: String?
+    /// Present on a "snapshot" event: every currently tracked request.
+    let requests: [InflightRequestEntry]?
+    /// Present on an "upsert" event: the one request that changed.
+    let request: InflightRequestEntry?
+    /// Present on a "remove" event: the id of the request that finished.
+    let id: String?
+    /// The scheduler's ordered wait list, first-in-line first; nil when no
+    /// tier reporter is wired (single-tier deployments).
+    let queue: [QueueEntry]?
+}
+
+/// Mirrors internal/swaputil/events.go InflightRequestEntry - only the
+/// fields the menu bar's session rows need (id, model, req_path, resp_bytes,
+/// elapsed_ms, metadata, and req_headers for the User-Agent origin fallback).
+/// Unmodeled fields (timestamp, method, resp_headers, remote_ip) are ignored
+/// by Codable, not decoded.
+struct InflightRequestEntry: Codable {
+    let id: String
+    let model: String
+    let reqPath: String
+    let respBytes: Int64
+    let elapsedMs: Int64
+    let metadata: [String: String]?
+    let reqHeaders: [String: String]?
+
+    enum CodingKeys: String, CodingKey {
+        case id, model, metadata
+        case reqPath = "req_path"
+        case respBytes = "resp_bytes"
+        case elapsedMs = "elapsed_ms"
+        case reqHeaders = "req_headers"
+    }
+}
+
+/// Mirrors internal/swaputil/events.go QueueEntry. `arrived` is intentionally
+/// left undecoded - the menu only needs position/tier/model.
+struct QueueEntry: Codable {
+    let position: Int
+    let tier: String
+    let model: String
+}
+
+/// The "swapGrace" SSE event's payload / GET /api/swap-grace's body -
+/// internal/server/apigroup.go handleAPISwapGrace and the SSE sibling event
+/// in handleAPIEvents both wrap the list in a "holds" key.
+struct SwapGracePayload: Codable {
+    let holds: [GraceHoldRow]
 }
