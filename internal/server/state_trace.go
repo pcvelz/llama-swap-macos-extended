@@ -76,11 +76,12 @@ func (t *stateTrace) Observe(snap traceSnapshot) {
 	}
 }
 
-// Lines returns the trace oldest first.
+// Lines returns the trace oldest first; never nil, so an empty trace
+// serialises as [] rather than null.
 func (t *stateTrace) Lines() []string {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	return append([]string(nil), t.lines...)
+	return append([]string{}, t.lines...)
 }
 
 func short(session string) string {

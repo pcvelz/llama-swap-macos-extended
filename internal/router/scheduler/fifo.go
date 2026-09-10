@@ -465,6 +465,11 @@ func (s *FIFO) OnSwapDone(ev SwapDone) {
 // coming free under the per-model concurrency cap (atCapacity) — the last of
 // which is true of every serve-done, so a non-empty queue is always re-walked.
 func (s *FIFO) OnServeDone(ev ServeDoneEvent) {
+	// The mirror of grantHandler's early return: a status read was never
+	// counted, so its completion changes nothing - above all not idleSince.
+	if ev.StatusRead {
+		return
+	}
 	s.inFlight[ev.ModelID]--
 	// Drop one granted-tracking entry for this model, mirroring the inFlight
 	// decrement above. Which specific entry is immaterial — only the count of
@@ -694,6 +699,13 @@ func (s *FIFO) grantHandler(req HandlerReq, modelID string) {
 	}
 
 	if s.effects.GrantServe(req, modelID) {
+		// A status read holds no slot: it is neither in-flight work for the
+		// concurrency cap and the swap-grace idle clock, nor a KV reservation,
+		// nor a preemption victim. Tracking it as any of those let a /slots
+		// poller pin the resident inside its grace forever (ledger O16).
+		if req.StatusRead {
+			return
+		}
 		s.inFlight[modelID]++
 		if req.EstimatedTokens > 0 {
 			s.kvInFlight[modelID] += req.EstimatedTokens

@@ -309,6 +309,15 @@ public final class BackendClient: ObservableObject {
         case "swapGrace":
             if let inner = envelope.data.data(using: .utf8),
                let payload = try? JSONDecoder().decode(CooldownPayload.self, from: inner) {
+                // A countdown that went UP is a restart (the resident finished
+                // a turn inside its grace); remember when, so the row can say
+                // "restarted 0:31 ago" instead of silently showing a bigger
+                // number than a moment ago.
+                if let cd = payload.cooldown,
+                   MenuState.cooldownRestarted(previous: menuState.cooldown?.remainingSeconds, current: cd.remainingSeconds) {
+                    menuState.cooldownRestartedAt = Date()
+                }
+                if payload.cooldown == nil { menuState.cooldownRestartedAt = nil }
                 menuState.cooldown = payload.cooldown
             }
         default:

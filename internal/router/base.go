@@ -465,7 +465,7 @@ func (b *baseRouter) GrantError(req scheduler.HandlerReq, err error) {
 // the router would never again be willing to evict this model.
 func (b *baseRouter) GrantServe(req scheduler.HandlerReq, modelID string) bool {
 	p := b.processes[modelID]
-	return b.grant(req, scheduler.HandlerResp{HandleFunc: b.trackedServe(modelID, p, req.EstimatedTokens, req.Preempted, req.ReplayWanted)})
+	return b.grant(req, scheduler.HandlerResp{HandleFunc: b.trackedServe(modelID, p, req.EstimatedTokens, req.StatusRead, req.Preempted, req.ReplayWanted)})
 }
 
 // StopProcesses implements scheduler.Effects, stopping the named processes in
@@ -509,11 +509,11 @@ func (b *baseRouter) StopProcesses(timeout time.Duration, ids []string) {
 // whatever the upstream reverse proxy would otherwise write. replayWanted,
 // when non-nil, is the same flag scheduler.HandlerReq.ReplayWanted carries —
 // see preemptResponseWriter's type doc for the v2 replay behavior it enables.
-func (b *baseRouter) trackedServe(modelID string, p process.Process, estimatedTokens int, preempted *atomic.Bool, replayWanted *atomic.Bool) http.HandlerFunc {
+func (b *baseRouter) trackedServe(modelID string, p process.Process, estimatedTokens int, statusRead bool, preempted *atomic.Bool, replayWanted *atomic.Bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		defer func() {
 			select {
-			case b.serveDoneCh <- scheduler.ServeDoneEvent{ModelID: modelID, EstimatedTokens: estimatedTokens}:
+			case b.serveDoneCh <- scheduler.ServeDoneEvent{ModelID: modelID, EstimatedTokens: estimatedTokens, StatusRead: statusRead}:
 			case <-b.shutdownCtx.Done():
 			}
 		}()

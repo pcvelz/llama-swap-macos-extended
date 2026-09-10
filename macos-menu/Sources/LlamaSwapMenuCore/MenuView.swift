@@ -73,14 +73,41 @@ public struct MenuView: View {
 
         // One clickable item per model; clicking switches the backend
         // (see BackendClient.load).
+        // The cooldown is a state of the RESIDENT model, so it is rendered on
+        // that model's own row ("● cq27 · cooldown 9:41 for [17426df4], then
+        // cq35 · 5 waiting") with the slots it protects beneath it, and the
+        // row's click ends the cooldown (BackendClient.finishCooldown) rather
+        // than reloading a model that is already there. Every other row keeps
+        // its load action. No separate cooldown section: the PARKED rows above
+        // already say "cooldown", and a block of its own read as a second
+        // thing happening (2026-09-10).
         ForEach(state.models) { model in
-            Button {
-                client.load(modelID: model.id)
-            } label: {
-                Label {
-                    Text(bullet(for: model) + model.displayLabel)
-                } icon: {
-                    Image(systemName: ModelIcon.sfSymbolName(capabilities: model.capabilities))
+            if let cd = state.cooldown, cd.evicteeModel == model.id {
+                Button {
+                    client.finishCooldown()
+                } label: {
+                    Label {
+                        Text(bullet(for: model) + model.displayLabel + " · "
+                             + MenuState.cooldownLabel(cd,
+                                                       next: modelLabel(for: cd.nextModel, in: state.models),
+                                                       restartedAgo: state.cooldownRestartedAt.map { Int(Date().timeIntervalSince($0)) }))
+                    } icon: {
+                        Image(systemName: ModelIcon.sfSymbolName(capabilities: model.capabilities))
+                    }
+                }
+                ForEach(MenuState.hotSlots(cd)) { slot in
+                    Text(MenuState.hotSlotLabel(slot))
+                        .disabled(true)
+                }
+            } else {
+                Button {
+                    client.load(modelID: model.id)
+                } label: {
+                    Label {
+                        Text(bullet(for: model) + model.displayLabel)
+                    } icon: {
+                        Image(systemName: ModelIcon.sfSymbolName(capabilities: model.capabilities))
+                    }
                 }
             }
         }
@@ -89,30 +116,6 @@ public struct MenuView: View {
             Text("Switch failed: \(error)")
                 .foregroundStyle(.secondary)
                 .disabled(true)
-        }
-
-        // The cooldown (llama-cm llama-swap.yaml swapGraceSeconds): the
-        // resident is idle inside its grace, and the swap to the next model
-        // waits for it. ONE row, naming the model that is cooling down and
-        // the one that loads next. Clicking ends the cooldown immediately
-        // (BackendClient.finishCooldown) instead of making the operator wait
-        // it out or guess why a model switch is stuck. Beneath it, the
-        // resident's slots with the session each is kept warm for - the
-        // cooldown exists to protect exactly those, so they must stay visible
-        // like an active slot would be. Hidden entirely when nothing is held.
-        if let cd = state.cooldown {
-            Button {
-                client.finishCooldown()
-            } label: {
-                Text(MenuState.cooldownLabel(cd,
-                                             resident: modelLabel(for: cd.evicteeModel, in: state.models),
-                                             next: modelLabel(for: cd.nextModel, in: state.models)))
-            }
-            ForEach(cd.slots) { slot in
-                Text(MenuState.hotSlotLabel(slot))
-                    .foregroundStyle(slot.sessionId.isEmpty ? .secondary : .primary)
-                    .disabled(true)
-            }
         }
 
         Divider()

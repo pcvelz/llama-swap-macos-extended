@@ -237,6 +237,11 @@ type SwapDone struct {
 // request ended.
 type ServeDoneEvent struct {
 	ModelID string
+	// StatusRead echoes HandlerReq.StatusRead: the request was a GET status
+	// read, which held no slot and must not restart the model's swap-grace
+	// on completion (a /slots poller kept a resident inside its grace for as
+	// long as it was watched, 2026-09-10).
+	StatusRead bool
 	// EstimatedTokens is the same estimate the originating HandlerReq carried
 	// at grant time, echoed back so the scheduler can release exactly what it
 	// reserved. 0 when KV admission wasn't in play for this request.

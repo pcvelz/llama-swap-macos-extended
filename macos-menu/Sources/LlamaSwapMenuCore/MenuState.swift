@@ -48,12 +48,38 @@ public struct MenuState: Encodable {
     /// nil when nothing is held.
     public var cooldown: CooldownRow? = nil
 
-    /// The cooldown row's text. Names the model that IS loaded as the one
-    /// cooling down, then what loads next - never "X waiting for <loaded
-    /// model>", which reads as waiting for a model that is already there.
-    public static func cooldownLabel(_ cd: CooldownRow, resident: String, next: String) -> String {
-        "Cooldown: \(resident) (\(CompactFormatter.countdown(cd.remainingSeconds))), then \(next)"
-            + " · \(cd.waiting) waiting"
+    /// Seconds since the cooldown last RESTARTED (a completed turn of the
+    /// resident restarts its grace; between two screenshots on 2026-09-10 the
+    /// countdown went 8:52 -> 9:41). Set by BackendClient when a swapGrace
+    /// event's remaining goes UP; nil until that has happened once.
+    public var cooldownRestartedAt: Date? = nil
+
+    /// A restart is a countdown that went up: the resident finished a turn
+    /// inside its own grace. A one-second wobble from tick alignment is not.
+    public static func cooldownRestarted(previous: Int?, current: Int) -> Bool {
+        guard let previous else { return false }
+        return current > previous + 1
+    }
+
+    /// The resident's own row while it cools down - the cooldown is a state
+    /// of the loaded model, so it is rendered ON that model's line, not as a
+    /// separate section: "cooldown 9:41 for [17426df4], then cq35 · 5 waiting",
+    /// with "(restarted 0:31 ago)" after the countdown once a turn of the
+    /// resident has restarted it. Never "X waiting for <loaded model>".
+    public static func cooldownLabel(_ cd: CooldownRow, next: String, restartedAgo: Int? = nil) -> String {
+        var s = "cooldown \(CompactFormatter.countdown(cd.remainingSeconds))"
+        if let restartedAgo { s += " (restarted \(CompactFormatter.countdown(restartedAgo)) ago)" }
+        let owners = hotSlots(cd).map { "[\(String($0.sessionId.prefix(8)))]" }
+        if !owners.isEmpty { s += " for " + owners.joined(separator: " ") }
+        s += ", then \(next) · \(cd.waiting) waiting"
+        return s
+    }
+
+    /// The slots the cooldown is actually protecting: only those a session
+    /// owns. A free slot is protected by nothing and is not shown (a "slot 1 ·
+    /// free" line under a cooldown read as two slots in cooldown, 2026-09-10).
+    public static func hotSlots(_ cd: CooldownRow) -> [HotSlotRow] {
+        cd.slots.filter { !$0.sessionId.isEmpty }
     }
 
     /// The phrase a PARKED row shows after the word: the scheduler's
@@ -79,8 +105,7 @@ public struct MenuState: Encodable {
     /// like an active slot would be. Session ids are shown by their first 8
     /// characters, the same short form the session rows use.
     public static func hotSlotLabel(_ s: HotSlotRow) -> String {
-        guard !s.sessionId.isEmpty else { return "  slot \(s.slot) · free" }
-        return "  slot \(s.slot) · [\(String(s.sessionId.prefix(8)))] · hot, idle \(CompactFormatter.countdown(s.idleSeconds))"
+        "  slot \(s.slot) · [\(String(s.sessionId.prefix(8)))] · hot, idle \(CompactFormatter.countdown(s.idleSeconds))"
     }
 
     /// The "Queue: idle" line the design calls for when nothing is parked,

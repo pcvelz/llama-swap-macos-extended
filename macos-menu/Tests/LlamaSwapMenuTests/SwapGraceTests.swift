@@ -38,24 +38,40 @@ final class SwapGraceTests: XCTestCase {
         XCTAssertEqual(some.cooldown?.nextModel, "cq27")
     }
 
-    func testCooldownLabelNamesTheCoolingModelThenTheNextOne() {
-        let cd = CooldownRow(evicteeModel: "cq35", nextModel: "cq35h", waiting: 2, remainingSeconds: 265, slots: [])
-        // The model that IS loaded is the one cooling down; the row must never
-        // read as "waiting for <loaded model>".
-        XCTAssertEqual(MenuState.cooldownLabel(cd, resident: "cq35", next: "cq35h"),
-                       "Cooldown: cq35 (4:25), then cq35h · 2 waiting")
-        let one = CooldownRow(evicteeModel: "cq35", nextModel: "cq27", waiting: 1, remainingSeconds: 9, slots: [])
-        XCTAssertEqual(MenuState.cooldownLabel(one, resident: "cq35", next: "cq27"),
-                       "Cooldown: cq35 (0:09), then cq27 · 1 waiting")
+    func testCooldownLabelRendersOnTheResidentRow() {
+        // The cooldown is the loaded model's own state: its row reads
+        // "cooldown m:ss for [owner], then <next> · N waiting" - never
+        // "X waiting for <loaded model>", and never a separate section.
+        let cd = CooldownRow(evicteeModel: "cq27", nextModel: "cq35", waiting: 5, remainingSeconds: 581,
+                             slots: [HotSlotRow(slot: 0, sessionId: "17426df4-aaaa", idleSeconds: 31),
+                                     HotSlotRow(slot: 1, sessionId: "", idleSeconds: 0)])
+        XCTAssertEqual(MenuState.cooldownLabel(cd, next: "cq35"),
+                       "cooldown 9:41 for [17426df4], then cq35 · 5 waiting")
+        XCTAssertEqual(MenuState.cooldownLabel(cd, next: "cq35", restartedAgo: 31),
+                       "cooldown 9:41 (restarted 0:31 ago) for [17426df4], then cq35 · 5 waiting")
+        let nobody = CooldownRow(evicteeModel: "cq35", nextModel: "cq27", waiting: 1, remainingSeconds: 9, slots: [])
+        XCTAssertEqual(MenuState.cooldownLabel(nobody, next: "cq27"),
+                       "cooldown 0:09, then cq27 · 1 waiting")
     }
 
-    func testHotSlotLabelShowsOwningSessionAndIdleTime() {
-        // A slot kept warm for a session across a tool call / AskUserQuestion
-        // pause must stay visible like an active slot, with its owner.
-        let owned = HotSlotRow(slot: 0, sessionId: "725558cb-1234-5678", idleSeconds: 35)
-        XCTAssertEqual(MenuState.hotSlotLabel(owned), "  slot 0 · [725558cb] · hot, idle 0:35")
-        let free = HotSlotRow(slot: 1, sessionId: "", idleSeconds: 0)
-        XCTAssertEqual(MenuState.hotSlotLabel(free), "  slot 1 · free")
+    func testOnlyOwnedSlotsAreListedUnderTheCooldown() {
+        // A free slot is protected by nothing; listing it read as two slots
+        // in cooldown (2026-09-10 screenshot: "slot 0 hot", "slot 1 free").
+        let cd = CooldownRow(evicteeModel: "cq27", nextModel: "cq35", waiting: 1, remainingSeconds: 60,
+                             slots: [HotSlotRow(slot: 0, sessionId: "17426df4-aaaa", idleSeconds: 31),
+                                     HotSlotRow(slot: 1, sessionId: "", idleSeconds: 0)])
+        let hot = MenuState.hotSlots(cd)
+        XCTAssertEqual(hot.map(\.slot), [0])
+        XCTAssertEqual(MenuState.hotSlotLabel(hot[0]), "  slot 0 · [17426df4] · hot, idle 0:31")
+    }
+
+    func testRestartIsACountdownThatWentUp() {
+        // 8:52 -> 9:41 between two screenshots: the resident finished a turn
+        // inside its grace. A one-second wobble is not a restart.
+        XCTAssertTrue(MenuState.cooldownRestarted(previous: 532, current: 581))
+        XCTAssertFalse(MenuState.cooldownRestarted(previous: 532, current: 531))
+        XCTAssertFalse(MenuState.cooldownRestarted(previous: 532, current: 533))
+        XCTAssertFalse(MenuState.cooldownRestarted(previous: nil, current: 600))
     }
 
     func testCountdownFormatsMinutesAndSeconds() {
