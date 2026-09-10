@@ -2,6 +2,7 @@ package router
 
 import (
 	"bufio"
+	"encoding/json"
 	"io"
 	"net"
 	"net/http"
@@ -68,11 +69,32 @@ func newPreemptResponseWriter(w http.ResponseWriter, preempted *atomic.Bool, rep
 // line yet - writing it over a committed response (e.g. one already emitting
 // pingWriter keepalives) would be ignored by net/http and log a superfluous
 // WriteHeader warning.
+//
+// The BODY is part of the contract. A status-only 503 reaches an Anthropic SDK
+// client as "503 status code (no body)", which tells its user nothing about
+// which of the many possible failures happened and gives the SDK no error type
+// to key on. The payload below is the Anthropic error envelope, which every
+// /v1/messages client already parses, carrying an overloaded_error - the one
+// type that means "this was never started, sending it again is reasonable".
 func writePreemptGiveUp(w http.ResponseWriter) {
 	w.Header().Set("X-LlamaSwap-Preempted", "1")
 	w.Header().Set("Retry-After", "1")
+	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusServiceUnavailable)
+	_, _ = w.Write(preemptGiveUpBody)
 }
+
+var preemptGiveUpBody = func() []byte {
+	b, _ := json.Marshal(map[string]any{
+		"type": "error",
+		"error": map[string]string{
+			"type": "overloaded_error",
+			"message": "llama-swap: the model is busy and this request was never started. " +
+				"It held a queue position and was given up on before any work was done, so retrying it is safe.",
+		},
+	})
+	return b
+}()
 
 func (p *preemptResponseWriter) WriteHeader(code int) {
 	if p.wroteHeader {

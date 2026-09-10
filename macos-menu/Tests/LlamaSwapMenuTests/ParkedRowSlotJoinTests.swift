@@ -100,8 +100,12 @@ final class ParkedRowSlotJoinTests: XCTestCase {
         for id in ["926", "927"] {
             let row = client.menuState.sessionRows.first(where: { $0.id == id })
             XCTAssertEqual(row?.word, ThroughputWord.parked.rawValue, "row \(id) must classify PARKED")
-            XCTAssertNil(row?.detail,
-                         "parked row \(id) holds no slot and must print no readout, got '\(row?.detail ?? "<nil>")'")
+            // The invariant: a parked row never borrows the granted slot's
+            // readout. Its detail is its park reason (a phrase), never a
+            // token total or a rate.
+            let detail = row?.detail ?? ""
+            XCTAssertFalse(detail.contains("97.6k") || detail.contains("t/s"),
+                           "parked row \(id) holds no slot and must print no readout, got '\(detail)'")
         }
     }
 
@@ -150,6 +154,10 @@ final class ParkedRowSlotJoinTests: XCTestCase {
         RunLoop.main.run(until: Date().addingTimeInterval(0.3))
         let row = client.menuState.sessionRows.first
         XCTAssertEqual(row?.word, ThroughputWord.parked.rawValue)
-        XCTAssertNil(row?.detail, "a parked lane must not keep showing its previous request's readout, got '\(row?.detail ?? "<nil>")'")
+        // The invariant: the previous request's readout (a token total, a
+        // rate) is gone. The park reason ("kv pool") is the row's own detail.
+        let detail = row?.detail ?? ""
+        XCTAssertFalse(detail.contains("k ·") || detail.contains("t/s"),
+                       "a parked lane must not keep showing its previous request's readout, got '\(detail)'")
     }
 }

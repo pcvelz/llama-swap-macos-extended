@@ -2,6 +2,7 @@ package server
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"fmt"
 	"net"
@@ -74,6 +75,13 @@ type inflightRequest struct {
 	// tier is the entry-point tier this request arrived through, captured at
 	// Add() time so the per-tier breakdown survives context rewrites.
 	tier string
+	// respCarry holds the trailing partial SSE line left over from the
+	// previous AddResponseBytes chunk. Response bytes arrive in arbitrary
+	// chunks NOT aligned to SSE event boundaries, so a `content_block_delta`
+	// event line can straddle two writes; carrying the unterminated tail lets
+	// the next chunk complete and count it. Bounded by respCarryMax so a
+	// pathological unterminated line can never buffer the whole stream.
+	respCarry []byte
 }
 
 // newInflightTracker builds a tracker. tierNames are the configured tier names
@@ -150,13 +158,25 @@ func (t *inflightTracker) Add(r *http.Request, cancel context.CancelFunc) string
 		entry.Model = data.ModelID
 		entry.Metadata = copyMetadata(data.Metadata)
 	}
+	// Stamp the same tier tierSnapshotLocked's ByTier breakdown counts by
+	// (req.tier below) onto the live entry's own Metadata, so a subscriber
+	// reading entry.Metadata directly (rather than cross-referencing
+	// ByTier) can see which tier a request arrived on without waiting for
+	// the request to complete.
+	tier := swaputil.TierFromContext(r.Context()).Name
+	if tier != "" {
+		if entry.Metadata == nil {
+			entry.Metadata = map[string]string{}
+		}
+		entry.Metadata["tier"] = tier
+	}
 
 	t.mu.Lock()
 	req := &inflightRequest{
 		entry:       entry,
 		cancel:      cancel,
 		lastEmitted: time.Now(),
-		tier:        swaputil.TierFromContext(r.Context()).Name,
+		tier:        tier,
 	}
 	t.requests[id] = req
 	t.enqueueLocked(upsertInflightEvent(req.entry))
@@ -177,6 +197,44 @@ func (t *inflightTracker) Remove(id string) {
 	t.mu.Unlock()
 }
 
+// SetMetadata stamps a single key/value pair onto the LIVE in-flight entry
+// for id, if it is still tracked, and re-emits an upsert so subscribers see
+// it before the request completes. This is the update-by-id path a request
+// mid-flight uses to record something that only becomes known partway
+// through - e.g. slot_granted, stamped by the scheduler's grant (see
+// swaputil.InflightMetadataSetter / internal/router/base.go's
+// pw.slotGranted() call site) - as distinct from entry.Metadata's initial
+// contents, which are frozen from the request context's bag at Add() time.
+// A no-op once the request has already been Remove()d.
+//
+// An EMPTY value DELETES the key. A renderer reads these keys as flags
+// (kv_parked, slot_granted) and treats presence as the signal, so a state
+// that has ended must leave no key behind rather than an empty string a
+// consumer would have to special-case.
+func (t *inflightTracker) SetMetadata(id, key, value string) {
+	t.mu.Lock()
+	req, ok := t.requests[id]
+	if !ok {
+		t.mu.Unlock()
+		return
+	}
+	if req.entry.Metadata == nil {
+		if value == "" {
+			t.mu.Unlock()
+			return
+		}
+		req.entry.Metadata = map[string]string{}
+	}
+	if value == "" {
+		delete(req.entry.Metadata, key)
+	} else {
+		req.entry.Metadata[key] = value
+	}
+	req.lastEmitted = time.Now()
+	t.enqueueLocked(upsertInflightEvent(req.entry))
+	t.mu.Unlock()
+}
+
 func (t *inflightTracker) SetResponseHeaders(id string, headers http.Header) {
 	values := headerMap(headers)
 	redactHeaders(values)
@@ -191,7 +249,27 @@ func (t *inflightTracker) SetResponseHeaders(id string, headers http.Header) {
 	t.mu.Unlock()
 }
 
-func (t *inflightTracker) AddResponseBytes(id string, total int) {
+// respCarryMax bounds the split-frame carry buffer. A real Anthropic SSE line
+// (a ping, a content_block_delta event line, or its data line) is far smaller;
+// the cap only exists so a pathological unterminated line cannot grow the
+// carry without limit - it never buffers the whole stream.
+const respCarryMax = 64 * 1024
+
+// contentBlockDeltaEvent is the SSE event name that carries REAL Anthropic
+// model output. Keepalive events are `event: ping`; matching the event line
+// exactly (not a substring of the whole chunk) keeps the count ping-immune and
+// avoids double-counting the "content_block_delta" that also appears in the
+// event's own data line.
+var contentBlockDeltaEvent = []byte("content_block_delta")
+
+// AddResponseBytes records the bytes just written to the client for id. data
+// is exactly what reached the socket (data[:n] from the ResponseWriter), so
+// len(data) is the byte delta for RespBytes AND the payload scanned for real
+// output tokens. Scanning happens on the serving hot path: it is a single
+// forward pass over the chunk (plus a small carry) and never blocks or buffers
+// the whole stream.
+func (t *inflightTracker) AddResponseBytes(id string, data []byte) {
+	total := len(data)
 	if total <= 0 {
 		return
 	}
@@ -203,6 +281,12 @@ func (t *inflightTracker) AddResponseBytes(id string, total int) {
 		return
 	}
 	req.entry.RespBytes += int64(total)
+	// Count REAL output (content_block_delta events) separately from RespBytes,
+	// which still counts EVERYTHING including keepalive pings - the two fields
+	// are what let a reader tell a producing slot from an only-pinged one.
+	deltas, carry := scanRealOutputDeltas(req.respCarry, data)
+	req.respCarry = carry
+	req.entry.RespTokens += deltas
 
 	now := time.Now()
 	remaining := inflightUpdateInterval - now.Sub(req.lastEmitted)
@@ -219,6 +303,50 @@ func (t *inflightTracker) AddResponseBytes(id string, total int) {
 		req.timer = time.AfterFunc(remaining, func() { t.emitPending(id) })
 	}
 	t.mu.Unlock()
+}
+
+// scanRealOutputDeltas counts complete `event: content_block_delta` SSE lines
+// across carry (the unterminated tail from the previous chunk) followed by
+// data (this chunk), and returns that count plus the new unterminated tail to
+// carry forward. It makes ONE forward pass, never buffers more than one
+// partial line, and treats every non-delta line (pings, message_start,
+// content_block_start/stop, message_delta, message_stop, data lines) as
+// nothing - so the count is immune to keepalive ping bytes.
+func scanRealOutputDeltas(carry, data []byte) (deltas int64, newCarry []byte) {
+	buf := append(carry, data...) // carry's backing array is ours; data is copied in, not aliased
+	start := 0
+	for {
+		nl := bytes.IndexByte(buf[start:], '\n')
+		if nl < 0 {
+			break
+		}
+		if isContentBlockDeltaEventLine(buf[start : start+nl]) {
+			deltas++
+		}
+		start += nl + 1
+	}
+	remaining := buf[start:]
+	if len(remaining) > respCarryMax {
+		// An unterminated line has outgrown any real SSE frame; keep only the
+		// tail so a delta event straddling the drop boundary can still match,
+		// and never let the carry pin the whole stream.
+		remaining = remaining[len(remaining)-respCarryMax:]
+	}
+	return deltas, append([]byte(nil), remaining...)
+}
+
+// isContentBlockDeltaEventLine reports whether one SSE line (no trailing
+// newline) is the event line `event: content_block_delta`. It tolerates an
+// optional trailing CR and the space-optional `event:` form, and matches the
+// event name EXACTLY so the "content_block_delta" substring inside the event's
+// own data line is not miscounted.
+func isContentBlockDeltaEventLine(line []byte) bool {
+	line = bytes.TrimSuffix(line, []byte("\r"))
+	rest, ok := bytes.CutPrefix(line, []byte("event:"))
+	if !ok {
+		return false
+	}
+	return bytes.Equal(bytes.TrimSpace(rest), contentBlockDeltaEvent)
 }
 
 func (t *inflightTracker) emitPending(id string) {
@@ -398,7 +526,9 @@ func (w *inflightResponseWriter) Write(data []byte) (int, error) {
 		w.WriteHeader(http.StatusOK)
 	}
 	n, err := w.ResponseWriter.Write(data)
-	w.tracker.AddResponseBytes(w.id, n)
+	// Pass the bytes actually written (data[:n]) so the tracker counts the same
+	// n toward RespBytes as before AND can scan them for real output tokens.
+	w.tracker.AddResponseBytes(w.id, data[:n])
 	return n, err
 }
 
@@ -434,6 +564,14 @@ func CreateInflightMiddleware(t *inflightTracker, cfg config.Config) chain.Middl
 			r = r.WithContext(ctx)
 			id := t.Add(r, cancel)
 			defer t.Remove(id)
+			// Carry an update-by-id callback bound to this request's id so
+			// code deep in the router (which cannot import inflightTracker -
+			// see swaputil.InflightMetadataSetter) can stamp things onto the
+			// LIVE entry that only become known partway through, e.g.
+			// slot_granted at the scheduler's grant.
+			r = r.WithContext(swaputil.WithInflightMetadataSetter(r.Context(), func(key, value string) {
+				t.SetMetadata(id, key, value)
+			}))
 
 			next.ServeHTTP(&inflightResponseWriter{ResponseWriter: w, tracker: t, id: id}, r)
 		})
@@ -475,6 +613,10 @@ func CreateUpstreamInflightMiddleware(t *inflightTracker, cfg config.Config) cha
 			tracked.URL.Path = remainingPath
 			id := t.Add(tracked, cancel)
 			defer t.Remove(id)
+			// See the matching comment in CreateInflightMiddleware above.
+			r = r.WithContext(swaputil.WithInflightMetadataSetter(r.Context(), func(key, value string) {
+				t.SetMetadata(id, key, value)
+			}))
 
 			next.ServeHTTP(&inflightResponseWriter{ResponseWriter: w, tracker: t, id: id}, r)
 		})

@@ -57,6 +57,15 @@ type LocalRouter interface {
 	// ProcessLastUse returns the last-use time for the named model's process.
 	ProcessLastUse(modelID string) (time.Time, bool)
 
+	// Capacity returns per-model serving-slot occupancy: how many requests
+	// hold a slot, the ceiling, and how many are parked. Nil when the
+	// scheduler does not report capacity. Safe to call from any goroutine.
+	//
+	// This is the honest counterpart to the tracked in-flight count, which
+	// counts parked and running requests alike and so reads high while
+	// nothing is being served.
+	Capacity() []swaputil.ModelCapacity
+
 	// Pin marks a model as permanently pinned so the TTL goroutine will not
 	// idle-evict it. Equivalent to PinWithTTL(modelID, 0).
 	Pin(modelID string)
@@ -75,4 +84,16 @@ type LocalRouter interface {
 	// PinExpiry reports the pin state and lease deadline for modelID. The
 	// deadline is the zero time.Time for a permanent pin.
 	PinExpiry(modelID string) (deadline time.Time, pinned bool)
+
+	// Cooldown returns the current swap-grace cooldown: the resident model
+	// idle inside its grace while queued requests for another model wait.
+	// Nil when the scheduler does not report cooldowns or nothing is held.
+	// Safe to call from any goroutine.
+	Cooldown() *swaputil.Cooldown
+
+	// FinishCooldown manually ends the current cooldown, letting the queued
+	// swap proceed at the next scheduling pass instead of waiting out the
+	// resident's remaining grace. A no-op if nothing is held. Safe to call
+	// from any goroutine.
+	FinishCooldown()
 }

@@ -303,6 +303,27 @@ func armParkGiveUp(tier swaputil.Tier, responseCommitted bool, replayStart time.
 	return t.C, func() { t.Stop() }
 }
 
+// sessionExemptID8 reports whether data carries a live Claude Code session id
+// (swaputil.ReqContextData.Metadata["session_id"], stamped from the
+// X-Claude-Code-Session-Id header - see swaputil.sessionMetadata), returning
+// it truncated to 8 chars for log lines. Used by the park-stage give-ups
+// below to honour the same user ruling deadlineRefuse already enforces
+// up-front (docs/intent/llama-swap-backend.md "What a Claude Code session is
+// promised": a session always gets a turn, waiting is normal, only zero
+// output is a real failure) — a session-carrying request must never be
+// bare-503'd just because it waited past parkGiveUpBudget.
+func sessionExemptID8(data swaputil.ReqContextData) (string, bool) {
+	sessionID := data.Metadata["session_id"]
+	if sessionID == "" {
+		return "", false
+	}
+	id8 := sessionID
+	if len(id8) > 8 {
+		id8 = id8[:8]
+	}
+	return id8, true
+}
+
 // deadlineBudget is how much of the client's ~300s zero-byte wall a request
 // may actually spend, measured from arrival. Identical construction to
 // maxReplayHeld/parkGiveUpBudget: the wall minus a ~30s safety margin, so a
@@ -348,6 +369,17 @@ func (b *baseRouter) prefillRate(modelID string) float64 {
 //   - the response must still be uncommitted (no keepalive pings, no loading
 //     writer). A committed response cannot carry a 503, and a keepalive-armed
 //     request is not racing a zero-byte wall in the first place.
+//   - a request carrying a live Claude Code session id (ReqContextData.
+//     Metadata["session_id"], populated from the X-Claude-Code-Session-Id
+//     header - see swaputil.sessionMetadata) is NEVER deadline-refused
+//     either, whatever its estimate: the user ruling (docs/intent/
+//     llama-swap-backend.md "What a Claude Code session is promised") is
+//     that a session always gets a turn - waiting is normal, slow is not
+//     broken, only zero output is a real failure. A 503 here would break
+//     that promise mid-session. It still queues/parks like any other
+//     admitted request; only the estimate-driven up-front refusal is
+//     skipped. Traffic with no session id (curl/dispatch probes) keeps the
+//     existing refusal behaviour.
 //
 // Returns true when it has written the refusal and the caller must return.
 func (b *baseRouter) deadlineRefuse(w http.ResponseWriter, data swaputil.ReqContextData, responseCommitted bool, estimatedTokens int, replayStart time.Time) bool {
@@ -357,6 +389,14 @@ func (b *baseRouter) deadlineRefuse(w http.ResponseWriter, data swaputil.ReqCont
 	estSeconds := float64(estimatedTokens) / b.prefillRate(data.ModelID)
 	remainingSeconds := (deadlineBudget - time.Since(replayStart)).Seconds()
 	if estSeconds <= remainingSeconds {
+		return false
+	}
+	if sessionID := data.Metadata["session_id"]; sessionID != "" {
+		id8 := sessionID
+		if len(id8) > 8 {
+			id8 = id8[:8]
+		}
+		b.logger.Infof("deadline-exempt: session=%s tier=%s est_s=%.0f", id8, data.Tier.Name, estSeconds)
 		return false
 	}
 	b.logger.Infof("deadline-refuse: tier=%s model=%s est_tokens=%d est_s=%.0f remaining_s=%.0f",
@@ -943,6 +983,24 @@ func (b *baseRouter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 			return
 		}
 
+		// sessionID8Exempt/sessionExempt are captured ONCE per attempt, HERE -
+		// before this attempt is ever handed to the scheduler (b.handlerCh <-
+		// hr below) - and reused by both park-stage give-ups' exemption check
+		// instead of re-reading data.Metadata from inside the select cases.
+		//
+		// WHY: scheduler.FIFO.grantHandler mutates data.Metadata concurrently
+		// from the run loop (via swaputil.SetReqData) the instant this exact
+		// request is granted a slot, and the grant-vs-give-up select races
+		// deliberately land at the same instant when a request's budget
+		// expires right as its slot frees (see
+		// TestBaseRouter_ParkGiveUp_GrantRendezvousRace). Reading
+		// data.Metadata again inside that window is an unsynchronized
+		// concurrent map read against that concurrent write - a real data
+		// race, not merely a theoretical one. This read, taken before the
+		// request is admitted, cannot race: the scheduler has no visibility
+		// into this attempt yet.
+		sessionID8Exempt, sessionExempt := sessionExemptID8(data)
+
 		// A cancellable derivative of the request's own context: once
 		// granted, this becomes the context p.ServeHTTP actually serves
 		// under (req is rebound to it below), so the FIFO scheduler's
@@ -1051,6 +1109,14 @@ func (b *baseRouter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 			// from the deleted internal/server concurrency middleware, which
 			// exempted the same path from its semaphore.
 			ConcurrencyExempt: isSlotFreeRequest(attemptReq),
+			// GET/HEAD only, not count_tokens: a count_tokens on a model that
+			// is not resident is part of a real turn that will load it, while
+			// a GET status read on a non-resident model has nothing to read
+			// and must never queue a swap (2026-09-10).
+			// A websocket upgrade is a GET but is a real session that may
+			// start a model (TestBaseRouter_WebsocketStartsModelWhenCompatDisabled).
+			StatusRead: (attemptReq.Method == http.MethodGet || attemptReq.Method == http.MethodHead) &&
+				!swaputil.IsWebSocketUpgrade(attemptReq),
 			// Inert unless the target model has a KVPoolTokens budget configured
 			// (see scheduler.FIFO.kvAdmit) — see swaputil.EstimateTokens for the
 			// estimation rule.
@@ -1085,22 +1151,44 @@ func (b *baseRouter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		defer stopAdmitGiveUp()
 
 		var admissionErr error
-		select {
-		case admissionErr = <-hr.Admit:
-		case <-admitGiveUp:
-			// Bounded for the same reason as the grant wait below. In practice
-			// the scheduler answers this handshake immediately (fifo.go
-			// OnRequest admits before it ever consults capacity, and Admit is
-			// buffered), so this case is a belt-and-braces twin of the real
-			// park rather than the path the incident observed.
-			b.giveUpParked(w, hr, reqCancel, "admission", data, replayStart)
-			return
-		case <-attemptReq.Context().Done():
-			b.cancelParked(hr)
-			return
-		case <-b.shutdownCtx.Done():
-			swaputil.SendError(w, attemptReq, fmt.Errorf("%s is shutting down", b.name))
-			return
+		admitExemptLogged := false
+	admitWait:
+		for {
+			select {
+			case admissionErr = <-hr.Admit:
+				break admitWait
+			case <-admitGiveUp:
+				// Bounded for the same reason as the grant wait below. In practice
+				// the scheduler answers this handshake immediately (fifo.go
+				// OnRequest admits before it ever consults capacity, and Admit is
+				// buffered), so this case is a belt-and-braces twin of the real
+				// park rather than the path the incident observed.
+				//
+				// A session-carrying request is exempt (sessionExempt/
+				// sessionID8Exempt captured once, above, before admission -
+				// see the WHY-comment there for why this must NOT re-read
+				// data.Metadata here): log once, then nil the give-up channel
+				// so this case can never fire again for this request - a nil
+				// channel blocks forever in select, so the loop just keeps
+				// parking without busy-looping or re-arming a timer.
+				if sessionExempt {
+					if !admitExemptLogged {
+						admitExemptLogged = true
+						b.logger.Infof("park-exempt: session=%s tier=%s waited_s=%.0f",
+							sessionID8Exempt, data.Tier.Name, time.Since(replayStart).Seconds())
+					}
+					admitGiveUp = nil
+					continue
+				}
+				b.giveUpParked(w, hr, reqCancel, "admission", data, replayStart)
+				return
+			case <-attemptReq.Context().Done():
+				b.cancelParked(hr)
+				return
+			case <-b.shutdownCtx.Done():
+				swaputil.SendError(w, attemptReq, fmt.Errorf("%s is shutting down", b.name))
+				return
+			}
 		}
 		if admissionErr != nil {
 			swaputil.SendError(w, attemptReq, admissionErr)
@@ -1165,25 +1253,49 @@ func (b *baseRouter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		defer stopGrantGiveUp()
 
 		var resp scheduler.HandlerResp
-		select {
-		case resp = <-hr.Respond:
-			finishLoading()
-		case <-grantGiveUp:
-			finishLoading()
-			b.giveUpParked(w, hr, reqCancel, "grant", data, replayStart)
-			return
-		case <-attemptReq.Context().Done():
-			finishLoading()
-			// Notify the scheduler so it can prune this request from its queue
-			// and swap waiters. Without this, a queued request whose client left
-			// would sit in the scheduler until drainQueue eventually starts a
-			// wasted model load for it.
-			b.cancelParked(hr)
-			return
-		case <-b.shutdownCtx.Done():
-			finishLoading()
-			swaputil.SendError(w, attemptReq, fmt.Errorf("%s is shutting down", b.name))
-			return
+		grantExemptLogged := false
+	grantWait:
+		for {
+			select {
+			case resp = <-hr.Respond:
+				finishLoading()
+				break grantWait
+			case <-grantGiveUp:
+				// A session-carrying request is exempt (sessionExempt/
+				// sessionID8Exempt captured once, above, before admission -
+				// see the WHY-comment there for why this must NOT re-read
+				// data.Metadata here): log once, then nil the give-up channel
+				// so this case can never fire again for this request - a nil
+				// channel blocks forever in select, so the loop just keeps
+				// parking without busy-looping or re-arming a timer.
+				// finishLoading() is deliberately NOT called here: the
+				// request has not given up, so the loading stream (if any)
+				// must keep running.
+				if sessionExempt {
+					if !grantExemptLogged {
+						grantExemptLogged = true
+						b.logger.Infof("park-exempt: session=%s tier=%s waited_s=%.0f",
+							sessionID8Exempt, data.Tier.Name, time.Since(replayStart).Seconds())
+					}
+					grantGiveUp = nil
+					continue
+				}
+				finishLoading()
+				b.giveUpParked(w, hr, reqCancel, "grant", data, replayStart)
+				return
+			case <-attemptReq.Context().Done():
+				finishLoading()
+				// Notify the scheduler so it can prune this request from its queue
+				// and swap waiters. Without this, a queued request whose client left
+				// would sit in the scheduler until drainQueue eventually starts a
+				// wasted model load for it.
+				b.cancelParked(hr)
+				return
+			case <-b.shutdownCtx.Done():
+				finishLoading()
+				swaputil.SendError(w, attemptReq, fmt.Errorf("%s is shutting down", b.name))
+				return
+			}
 		}
 
 		if resp.Err != nil {
@@ -1197,6 +1309,19 @@ func (b *baseRouter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 			// and pinged rather than ended with an error it must retry. See
 			// pingWriter.slotGranted.
 			pw.slotGranted()
+		}
+		// Stamp the grant onto the LIVE in-flight entry too, not just onto
+		// the pinger's own state above - every granted request reaches this
+		// point (pw is nil off the Anthropic streaming path), so this fires
+		// unconditionally. See swaputil.InflightMetadataSetter for why this
+		// goes through a context callback rather than an import.
+		if setter, ok := swaputil.InflightMetadataSetterFromContext(attemptReq.Context()); ok {
+			setter("slot_granted", "1")
+			// The park (if there was one) is over: drop kv_parked rather than
+			// leaving a stale 1 on a request that is now serving, which would
+			// hold the row at PARKED for the rest of its life. Setting an
+			// empty value deletes the key - see inflightTracker.SetMetadata.
+			setter("kv_parked", "")
 		}
 		resp.HandleFunc(w, attemptReq)
 
@@ -1236,5 +1361,41 @@ func (b *baseRouter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 				data.Tier.Name, data.ModelID, outcome, attempt, time.Since(replayStart).Seconds())
 		}
 		return
+	}
+}
+
+// Capacity implements LocalRouter. It reports per-model serving-slot occupancy
+// when the configured scheduler can supply it, and nil otherwise.
+//
+// The read is lock-free and does NOT go through the run loop: the scheduler
+// publishes an immutable snapshot on every occupancy or queue change, so an
+// HTTP handler can read it without stalling behind request scheduling. A
+// snapshot may therefore be a few microseconds stale, which is the correct
+// trade for a status surface.
+func (b *baseRouter) Capacity() []swaputil.ModelCapacity {
+	if r, ok := b.schedule.(scheduler.CapacityReporter); ok {
+		return r.Capacity()
+	}
+	return nil
+}
+
+// Cooldown implements LocalRouter. It reports the current swap-grace
+// cooldown when the configured scheduler can supply it, and nil otherwise.
+// Same lock-free, run-loop-independent read as Capacity above.
+func (b *baseRouter) Cooldown() *swaputil.Cooldown {
+	if r, ok := b.schedule.(scheduler.CooldownReporter); ok {
+		return r.Cooldown()
+	}
+	return nil
+}
+
+// FinishCooldown implements LocalRouter. It manually ends the current
+// cooldown, letting the queued swap proceed at the next scheduling pass
+// instead of waiting out the resident's remaining grace. A no-op when the
+// configured scheduler does not support cooldown reporting, or when nothing
+// is currently held.
+func (b *baseRouter) FinishCooldown() {
+	if r, ok := b.schedule.(scheduler.CooldownReporter); ok {
+		r.FinishCooldown()
 	}
 }

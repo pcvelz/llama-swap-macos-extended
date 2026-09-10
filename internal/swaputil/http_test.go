@@ -381,6 +381,85 @@ func TestExtractContext_SessionID(t *testing.T) {
 	}
 }
 
+// TestExtractContext_SessionIDFromHeader covers the channel current Claude
+// Code CLI builds actually use: the bare session uuid arrives via the
+// X-Claude-Code-Session-Id request header, not embedded in a
+// metadata.user_id body field (live-verified 2026-09-02 against a real
+// claude-cli/2.1.252 /v1/messages request: ReqHeaders carried
+// X-Claude-Code-Session-Id directly and no metadata.user_id segment produced
+// a session_id, which is why the in-flight entry's Metadata came back nil).
+// The header must win regardless of request method or body content type,
+// since GET/form requests carry no JSON body to inspect at all.
+func TestExtractContext_SessionIDFromHeader(t *testing.T) {
+	const uuid = "cf006070-986b-4150-ac78-308a899c3321"
+
+	t.Run("JSON POST with header, no metadata.user_id in body", func(t *testing.T) {
+		r, _ := http.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"m"}`))
+		r.Header.Set("Content-Type", "application/json")
+		r.Header.Set("X-Claude-Code-Session-Id", uuid)
+		got, err := extractContext(r)
+		if err != nil {
+			t.Fatalf("extractContext: %v", err)
+		}
+		if got.Metadata["session_id"] != uuid {
+			t.Errorf("session_id = %q, want %q", got.Metadata["session_id"], uuid)
+		}
+	})
+
+	t.Run("header wins over a differing metadata.user_id segment", func(t *testing.T) {
+		body := `{"model":"m","metadata":{"user_id":"user_abc_account_def_session_11111111-1111-1111-1111-111111111111"}}`
+		r, _ := http.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
+		r.Header.Set("Content-Type", "application/json")
+		r.Header.Set("X-Claude-Code-Session-Id", uuid)
+		got, err := extractContext(r)
+		if err != nil {
+			t.Fatalf("extractContext: %v", err)
+		}
+		if got.Metadata["session_id"] != uuid {
+			t.Errorf("session_id = %q, want header value %q", got.Metadata["session_id"], uuid)
+		}
+	})
+
+	t.Run("GET request", func(t *testing.T) {
+		r, _ := http.NewRequest(http.MethodGet, "/v1/models?model=m", nil)
+		r.Header.Set("X-Claude-Code-Session-Id", uuid)
+		got, err := extractContext(r)
+		if err != nil {
+			t.Fatalf("extractContext: %v", err)
+		}
+		if got.Metadata["session_id"] != uuid {
+			t.Errorf("session_id = %q, want %q", got.Metadata["session_id"], uuid)
+		}
+	})
+
+	t.Run("form POST request", func(t *testing.T) {
+		form := url.Values{"model": {"whisper-1"}}
+		r, _ := http.NewRequest(http.MethodPost, "/v1/audio/transcriptions", strings.NewReader(form.Encode()))
+		r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		r.Header.Set("X-Claude-Code-Session-Id", uuid)
+		got, err := extractContext(r)
+		if err != nil {
+			t.Fatalf("extractContext: %v", err)
+		}
+		if got.Metadata["session_id"] != uuid {
+			t.Errorf("session_id = %q, want %q", got.Metadata["session_id"], uuid)
+		}
+	})
+
+	t.Run("malformed header value is ignored, not trusted verbatim", func(t *testing.T) {
+		r, _ := http.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"m"}`))
+		r.Header.Set("Content-Type", "application/json")
+		r.Header.Set("X-Claude-Code-Session-Id", "'; DROP TABLE sessions;--")
+		got, err := extractContext(r)
+		if err != nil {
+			t.Fatalf("extractContext: %v", err)
+		}
+		if _, ok := got.Metadata["session_id"]; ok {
+			t.Errorf("session_id = %q, want key absent for a non-uuid header value", got.Metadata["session_id"])
+		}
+	})
+}
+
 func TestExtractContext_URLEncodedForm(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -935,5 +1014,38 @@ func TestFetchContext_UpstreamPath_DoesNotReadBody(t *testing.T) {
 	}
 	if string(got) != body {
 		t.Errorf("body was consumed: %q", string(got))
+	}
+}
+
+// TestEstimateTokens_LargePromptReflectsRealSize is the regression guard for
+// the "est=1079 for a 20-35k-token prompt" under-count: a large buffered body
+// must estimate to a large token count (body bytes / 4), not a small constant.
+// If EstimateTokens ever regresses to reading a wrong/stale field or a default,
+// the KV-aware admission gate silently stops parking oversized concurrent
+// prefills and the shared --kv-unified pool OOMs.
+func TestEstimateTokens_LargePromptReflectsRealSize(t *testing.T) {
+	// ~120 KB body ~= a 30k-token prompt at the documented 4 bytes/token.
+	body := make([]byte, 120_000)
+	for i := range body {
+		body[i] = 'a'
+	}
+	got := EstimateTokens(body)
+	if want := len(body) / 4; got != want {
+		t.Fatalf("EstimateTokens(%d-byte body)=%d, want %d", len(body), got, want)
+	}
+	// The concrete regression: a 30k-token prompt must NOT read as ~1000.
+	if got < 20_000 {
+		t.Fatalf("EstimateTokens under-counted a large prompt: got %d, want >= 20000 (est=1079 regression)", got)
+	}
+}
+
+// TestEstimateTokens_EmptyBodyIsZero pins the GET/absent-body case: an empty
+// body estimates 0, which never blocks admission on its own.
+func TestEstimateTokens_EmptyBodyIsZero(t *testing.T) {
+	if got := EstimateTokens(nil); got != 0 {
+		t.Fatalf("EstimateTokens(nil)=%d, want 0", got)
+	}
+	if got := EstimateTokens([]byte{}); got != 0 {
+		t.Fatalf("EstimateTokens(empty)=%d, want 0", got)
 	}
 }

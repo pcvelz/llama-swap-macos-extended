@@ -15,6 +15,7 @@ import (
 	"github.com/mostlygeek/llama-swap/internal/logmon"
 	"github.com/mostlygeek/llama-swap/internal/process"
 	"github.com/mostlygeek/llama-swap/internal/router/scheduler"
+	"github.com/mostlygeek/llama-swap/internal/swaputil"
 )
 
 // These tests cover baseRouter's own machinery — the run loop, process
@@ -342,6 +343,44 @@ func TestBaseRouter_OnDemandStart(t *testing.T) {
 	}
 	if got := a.serveCalls.Load(); got != 1 {
 		t.Errorf("serveCalls=%d want 1", got)
+	}
+}
+
+// TestBaseRouter_GrantStampsInflightSlotGrantedMetadata pins the router
+// side of the live in-flight slot-grant marker: the moment ServeHTTP's
+// select receives off hr.Respond (a granted slot - see the pw.slotGranted()
+// call site), it must also call any swaputil.InflightMetadataSetter carried
+// on the request's context with ("slot_granted", "1"). The router package
+// cannot import internal/server's inflightTracker (import direction runs
+// server -> router), so this is the decoupled context-callback the inflight
+// middleware wires in - see internal/server/inflight.go
+// CreateInflightMiddleware and TestInflightTracker_SetMetadata_*.
+func TestBaseRouter_GrantStampsInflightSlotGrantedMetadata(t *testing.T) {
+	a := newFakeProcess("a")
+	a.autoReady = true
+
+	b := newTestBase(t, map[string]process.Process{"a": a}, &stubPlanner{})
+
+	var mu sync.Mutex
+	calls := map[string]string{}
+	setter := swaputil.InflightMetadataSetter(func(key, value string) {
+		mu.Lock()
+		calls[key] = value
+		mu.Unlock()
+	})
+	ctx := swaputil.WithInflightMetadataSetter(context.Background(), setter)
+
+	w := httptest.NewRecorder()
+	b.ServeHTTP(w, newRequestCtx(ctx, "a"))
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%q", w.Code, w.Body.String())
+	}
+	mu.Lock()
+	got := calls["slot_granted"]
+	mu.Unlock()
+	if got != "1" {
+		t.Errorf(`slot_granted metadata = %q, want "1" (setter calls: %v)`, got, calls)
 	}
 }
 

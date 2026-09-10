@@ -1,8 +1,10 @@
 package process
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -36,6 +38,29 @@ const cmdWaitDelay = 10 * time.Second
 // Stop() by this point, so killProcess is a no-op kill; the short grace just
 // bounds the rare case where a process is still alive when its context is cut.
 const parentCancelGraceTimeout = time.Second
+
+// computeErrorRestartThreshold is the number of CONSECUTIVE upstream 500
+// responses whose body contains computeErrorSignature that mark a child as
+// stuck in the Metal-OOM error state ("backend is in error state from a
+// previous command buffer failure - recreate the backend to recover"). A lone
+// Compute error can be a per-request KV-shrink failure that llama.cpp b10087
+// (PR #24843) made catchable and recoverable on the very next request, so we
+// wait for a run of them before concluding the child itself is wedged. A
+// package-level var (not const) so tests can lower it. WHY 3: the witnessed
+// production incident had 498 consecutive failures with zero self-recovery
+// once the backend entered the error state, so 3 is enough to rule out a
+// one-off while still reacting fast.
+var computeErrorRestartThreshold int32 = 3
+
+// computeErrorSignature is the llama-server error string that marks a child
+// stuck in the Metal-OOM error state (see doStart's ModifyResponse hook).
+const computeErrorSignature = "Compute error"
+
+// computeErrorBodyPeekBytes bounds how much of a 500 response body is read
+// looking for computeErrorSignature, so a pathologically large error body
+// can't balloon memory or latency on the hot request path. The body is
+// restored in full for the client regardless of this cap.
+const computeErrorBodyPeekBytes = 4096
 
 // startReq asks the run loop to bring the process up. Run and EnsureReady share
 // this one request type — and therefore one code path — so there is only ever a
@@ -91,6 +116,20 @@ type ProcessCommand struct {
 
 	lastUse  atomic.Int64 // unix nano timestamp of last ServeHTTP completion
 	inflight atomic.Int64 // current in-flight ServeHTTP calls
+
+	// computeErrorCount tracks CONSECUTIVE upstream 500 responses whose body
+	// contains computeErrorSignature (see doStart's ModifyResponse hook and
+	// computeErrorRestartThreshold). Any 2xx response resets it to 0. Reset to
+	// 0 at the top of every doStart so a fresh child never inherits a streak
+	// from the process it replaced.
+	computeErrorCount atomic.Int32
+
+	// computeErrorRestarting guards against double-triggering a restart while
+	// the async Stop() from a previous trigger is still in flight: requests
+	// still landing on the old (not-yet-nilled) handler during that window
+	// can keep incrementing computeErrorCount past the threshold before the
+	// process actually stops. Cleared once that Stop() returns.
+	computeErrorRestarting atomic.Bool
 
 	// allowIdleEvict, when set, is called by the TTL goroutine before
 	// idle-evicting; returning false suppresses eviction this tick (model is
@@ -277,7 +316,7 @@ func (p *ProcessCommand) run() {
 			startCtx, cancelStart := context.WithCancel(context.Background())
 			resultCh := make(chan startResult, 1)
 			go func() {
-				resultCh <- p.doStart(startCtx, req.timeout)
+				resultCh <- p.startWithOrphanReclaim(startCtx, req.timeout)
 			}()
 
 			// pendingStop holds a Stop request that arrived mid-start, so we
@@ -411,6 +450,12 @@ func (p *ProcessCommand) run() {
 }
 
 func (p *ProcessCommand) doStart(startCtx context.Context, healthCheckTimeout time.Duration) startResult {
+	// WHY: a fresh child process starts a fresh error-state streak. Without
+	// this, a Compute-error count left over from the process being replaced
+	// could immediately re-trigger a restart of the brand-new child.
+	p.computeErrorCount.Store(0)
+	p.computeErrorRestarting.Store(false)
+
 	if p.config.Proxy == "" {
 		return startResult{err: fmt.Errorf("upstream proxy missing")}
 	}
@@ -444,6 +489,7 @@ func (p *ProcessCommand) doStart(startCtx context.Context, healthCheckTimeout ti
 		if strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream") {
 			resp.Header.Set("X-Accel-Buffering", "no")
 		}
+		p.trackComputeErrorState(resp)
 		return nil
 	}
 	// httputil.ReverseProxy panics with http.ErrAbortHandler when the upstream
@@ -531,7 +577,7 @@ func (p *ProcessCommand) doStart(startCtx context.Context, healthCheckTimeout ti
 	}
 	prematureExit := func() startResult {
 		cmdCancel()
-		return startResult{err: fmt.Errorf("upstream command exited prematurely")}
+		return startResult{err: ErrUpstreamPrematureExit}
 	}
 
 	if startCtx.Err() != nil {
@@ -586,6 +632,61 @@ func (p *ProcessCommand) doStart(startCtx context.Context, healthCheckTimeout ti
 	}
 
 	return startResult{cmd: cmd, cmdDone: cmdDone, cancel: cmdCancel, handlerFn: handlerFn}
+}
+
+// trackComputeErrorState updates the consecutive-Compute-error streak from a
+// single upstream response and triggers a restart once it crosses
+// computeErrorRestartThreshold. Called from ModifyResponse, so resp.Body must
+// be left readable for the client afterwards.
+func (p *ProcessCommand) trackComputeErrorState(resp *http.Response) {
+	switch {
+	case resp.StatusCode >= 200 && resp.StatusCode < 300:
+		// WHY: any successful response (including the start of a streaming
+		// response, which is already a 2xx here even if it later disconnects
+		// mid-stream) proves the child answered normally, so the streak ends.
+		p.computeErrorCount.Store(0)
+
+	case resp.StatusCode == http.StatusInternalServerError && resp.Body != nil:
+		// WHY: peek a bounded prefix for the signature, then restore the
+		// FULL body (peeked prefix + whatever remains unread) so the client
+		// still receives its complete, un-truncated 500 response.
+		peeked := make([]byte, computeErrorBodyPeekBytes)
+		n, _ := io.ReadFull(resp.Body, peeked)
+		resp.Body = io.NopCloser(io.MultiReader(bytes.NewReader(peeked[:n]), resp.Body))
+
+		if strings.Contains(string(peeked[:n]), computeErrorSignature) {
+			count := p.computeErrorCount.Add(1)
+			if count >= computeErrorRestartThreshold && p.computeErrorRestarting.CompareAndSwap(false, true) {
+				p.proxyLogger.Errorf("<%s> child error-state: model=%s consecutive_compute_errors=%d - restarting child", p.id, p.id, count)
+				// WHY: run off the request goroutine so a slow kill never
+				// delays the 500 response the client already received.
+				go p.restartOnComputeError()
+			}
+		}
+		// WHY: a plain 500 without the signature is not the error-state
+		// signature (could be an ordinary per-request failure) - left
+		// unchanged rather than reset, since it doesn't prove the child
+		// recovered either.
+
+	default:
+		// WHY: any other status (4xx, 502/503 from a dead upstream, etc.) is
+		// neither the error-state signature nor proof of recovery - leave
+		// the streak as-is.
+	}
+}
+
+// restartOnComputeError is the async continuation of the error-state
+// restart: it reuses the same Stop() path the TTL/unload logic uses (see the
+// UnloadAfter goroutine in run()) so the child returns to StateStopped and
+// the next request starts a fresh process normally. Once Stop() returns, the
+// streak and guard are cleared so a future error episode on the new child is
+// detected fresh.
+func (p *ProcessCommand) restartOnComputeError() {
+	if err := p.Stop(time.Duration(p.config.UnloadTimeout) * time.Second); err != nil {
+		p.proxyLogger.Warnf("<%s> child error-state restart: stop failed: %v", p.id, err)
+	}
+	p.computeErrorCount.Store(0)
+	p.computeErrorRestarting.Store(false)
 }
 
 // sendStopSignal runs the configured CmdStop (if any) or sends SIGTERM to

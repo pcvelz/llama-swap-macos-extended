@@ -61,6 +61,10 @@ var (
 	ErrNoRouterFound     = fmt.Errorf("no router found for model")
 	ErrNoPeerModelFound  = fmt.Errorf("peer model not found")
 	ErrNoLocalModelFound = fmt.Errorf("local model not found")
+	// ErrModelNotLoaded answers a slot-free status read (GET/HEAD) whose model
+	// is known but not resident and not loading. Such a read must never be
+	// the request that queues or wins a swap.
+	ErrModelNotLoaded = fmt.Errorf("model not loaded")
 )
 
 // IsWebSocketUpgrade reports whether r contains a valid websocket protocol
@@ -116,6 +120,11 @@ func SendError(w http.ResponseWriter, r *http.Request, err error) {
 		SendResponse(w, r, http.StatusNotFound, "no local server found for requested model")
 	case errors.Is(err, ErrNoRouterFound):
 		SendResponse(w, r, http.StatusNotFound, "no router for requested model")
+	case errors.Is(err, ErrModelNotLoaded):
+		// A status read on a model that is not resident: 503 rather than a
+		// queued swap, so a poller learns "not loaded" in microseconds and
+		// never occupies the scheduler queue (2026-09-10).
+		SendResponse(w, r, http.StatusServiceUnavailable, "model not loaded; status reads do not trigger a load")
 	default:
 		SendResponse(w, r, http.StatusInternalServerError, fmt.Sprintf("unspecific error: %v", err))
 	}
@@ -160,6 +169,7 @@ func FetchContext(r *http.Request, cfg config.Config) (ReqContextData, error) {
 
 	if strings.HasPrefix(r.URL.Path, "/upstream/") {
 		if data, ok := extractUpstreamContext(r, cfg); ok {
+			StampModelAlias(&data, cfg)
 			*r = *r.WithContext(SetContext(r.Context(), data))
 			return data, nil
 		}
@@ -175,11 +185,28 @@ func FetchContext(r *http.Request, cfg config.Config) (ReqContextData, error) {
 		if mc, ok := cfg.Models[realName]; ok {
 			data.SendLoadingState = mc.SendLoadingState != nil && *mc.SendLoadingState
 		}
+		StampModelAlias(&data, cfg)
 		*r = *r.WithContext(SetContext(r.Context(), data))
 		return data, nil
 	}
 
 	return ReqContextData{}, ErrNoModelInContext
+}
+
+// StampModelAlias records the resolved model's display alias on data's
+// metadata bag. Called once per request, at the point the model id is known
+// and before the context is stored, so every consumer of the bag (in-flight
+// entries, activity log) reads the same answer without repeating the lookup.
+// Re-stamped when a later layer REwrites ModelID (server.go's resident-alias
+// resolution), since the alias must name the model that actually serves.
+func StampModelAlias(data *ReqContextData, cfg config.Config) {
+	if data.ModelID == "" {
+		return
+	}
+	if data.Metadata == nil {
+		data.Metadata = map[string]string{}
+	}
+	data.Metadata["model_alias"] = ShortestAlias(cfg, data.ModelID)
 }
 
 // EstimateTokens gives a cheap, conservative estimate of a request's context
@@ -488,6 +515,171 @@ func sessionIDFromUserID(userID string) string {
 	return m[1]
 }
 
+// claudeCodeSessionHeader is the request header current Claude Code CLI
+// builds (live-verified 2026-09-02 against claude-cli/2.1.252) use to carry
+// their session identity as a bare uuid - the channel this fork's original
+// metadata.user_id extraction missed entirely, which is why in-flight
+// entries surfaced a nil Metadata map for real traffic.
+const claudeCodeSessionHeader = "X-Claude-Code-Session-Id"
+
+// bareSessionUUIDPattern validates claudeCodeSessionHeader's value before
+// trusting it as a session id, so a malformed or hostile header value is
+// dropped rather than propagated into Metadata/logs/UI as-is.
+var bareSessionUUIDPattern = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
+
+// sessionIDFromHeader returns the session uuid carried by
+// claudeCodeSessionHeader, or "" when the header is absent or is not a bare
+// uuid.
+func sessionIDFromHeader(r *http.Request) string {
+	v := strings.TrimSpace(r.Header.Get(claudeCodeSessionHeader))
+	if !bareSessionUUIDPattern.MatchString(v) {
+		return ""
+	}
+	return v
+}
+
+// claudeCodeParentSessionHeader carries the id of the session that DISPATCHED
+// a headless run (llama-cm's llama/dispatch and
+// llama/providers/llamacpp/agentic.sh set it). Without it a dispatched child
+// is just another anonymous request on the queue; with it a renderer can say
+// which interactive session is waiting on that row.
+const claudeCodeParentSessionHeader = "X-Claude-Code-Parent-Session-Id"
+
+// parentSessionIDPattern validates claudeCodeParentSessionHeader's value.
+// Deliberately looser than bareSessionUUIDPattern: a dispatcher may only have
+// the SHORT form of its parent's id to hand (the 8-hex prefix every renderer
+// displays), so a hex run of at least 8 characters is accepted alongside a
+// full uuid. Anything else is dropped rather than propagated into
+// Metadata/logs/UI as-is.
+var parentSessionIDPattern = regexp.MustCompile(`^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}|[0-9a-fA-F]{8,})$`)
+
+// parentSessionIDFromHeader returns the dispatching session's id carried by
+// claudeCodeParentSessionHeader, or "" when the header is absent or malformed.
+func parentSessionIDFromHeader(r *http.Request) string {
+	v := strings.TrimSpace(r.Header.Get(claudeCodeParentSessionHeader))
+	if !parentSessionIDPattern.MatchString(v) {
+		return ""
+	}
+	return v
+}
+
+// claudeCodeAgentHeader carries the id of the Agent-tool SUBAGENT making a
+// request. Claude Code sets it on every request a subagent issues while
+// keeping claudeCodeSessionHeader at the PARENT's id (live-verified 2026-09-08
+// against claude-cli/2.1.263: session 934b47c6, agent a4c4e94e633cf6841). It
+// is the only wire-level signal that separates a subagent's turn from its
+// parent's - without it a renderer prints the parent's id on both, and slot
+// affinity keys both onto one lane.
+const claudeCodeAgentHeader = "X-Claude-Code-Agent-Id"
+
+// agentIDPattern validates claudeCodeAgentHeader's value: live ids are a
+// 17-hex run, and the 8-hex prefix a renderer displays is accepted too (same
+// shape rule as parentSessionIDPattern's short form). Anything else is dropped
+// rather than propagated into Metadata/logs/UI as-is.
+var agentIDPattern = regexp.MustCompile(`^[0-9a-fA-F]{8,}$`)
+
+// agentIDFromHeader returns the subagent id carried by claudeCodeAgentHeader,
+// or "" when the header is absent or malformed.
+func agentIDFromHeader(r *http.Request) string {
+	v := strings.TrimSpace(r.Header.Get(claudeCodeAgentHeader))
+	if !agentIDPattern.MatchString(v) {
+		return ""
+	}
+	return v
+}
+
+// Client families reported in the `client` metadata key. The set is closed so
+// a renderer can switch on it instead of displaying a raw user-agent string,
+// which is what a session-less queue row used to surface.
+const (
+	clientClaudeCode = "claude-code"
+	clientHermes     = "hermes"
+	clientCurl       = "curl"
+	clientPythonSDK  = "python-sdk"
+	clientOther      = "other"
+)
+
+// clientFamily classifies who is behind a request. A Claude Code session
+// header is decisive - the CLI sets it and no other client sends it - so
+// hasSession short-circuits the User-Agent sniffing, which is only a
+// best-effort family guess for everything else.
+func clientFamily(r *http.Request, hasSession bool) string {
+	if hasSession {
+		return clientClaudeCode
+	}
+	ua := strings.TrimSpace(r.Header.Get("User-Agent"))
+	switch {
+	case strings.HasPrefix(ua, "claude-cli"):
+		return clientClaudeCode
+	case strings.Contains(ua, "Anthropic/Python"):
+		return clientPythonSDK
+	case strings.HasPrefix(ua, "curl/"):
+		return clientCurl
+	case strings.Contains(strings.ToLower(ua), "hermes"):
+		return clientHermes
+	default:
+		return clientOther
+	}
+}
+
+// sessionMetadata builds the session-identity metadata bag for a request: the
+// session_id/client_user_id pair, the dispatching parent_session_id, and the
+// client family. It applies to every request shape (GET query, JSON body,
+// form body) since the header checks need no body at all. The
+// claudeCodeSessionHeader takes priority as the current, authoritative
+// channel; the metadata.user_id session_<uuid> segment (userID, "" when the
+// caller has no JSON body to inspect) is kept as a fallback for whichever
+// older CLI builds still rely on it instead.
+func sessionMetadata(r *http.Request, userID string) map[string]string {
+	metadata := make(map[string]string)
+	sessionID := sessionIDFromHeader(r)
+	fromHeader := sessionID != ""
+	if fromHeader {
+		metadata["session_id"] = sessionID
+		if userID != "" {
+			metadata["client_user_id"] = userID
+		}
+	} else if sessionID = sessionIDFromUserID(userID); sessionID != "" {
+		metadata["session_id"] = sessionID
+		metadata["client_user_id"] = userID
+	}
+	if parentID := parentSessionIDFromHeader(r); parentID != "" {
+		metadata["parent_session_id"] = parentID
+	}
+	if agentID := agentIDFromHeader(r); agentID != "" {
+		metadata["agent_id"] = agentID
+	}
+	metadata["client"] = clientFamily(r, fromHeader)
+	return metadata
+}
+
+// ShortestAlias returns the shortest alias configured for modelID, falling
+// back to modelID itself when the model has no alias (or is not in the config
+// at all). The shortest alias is the name an operator types and reads
+// (`cq35`), where the model id is a repo/quant path no queue row has room
+// for. Ties break lexicographically so the answer is stable across reloads:
+// config.ModelConfig.Aliases keeps YAML order, which says nothing about
+// which of two equal-length aliases should win.
+func ShortestAlias(cfg config.Config, modelID string) string {
+	mc, ok := cfg.Models[modelID]
+	if !ok {
+		return modelID
+	}
+	best := ""
+	for _, alias := range mc.Aliases {
+		if alias == "" {
+			continue
+		}
+		if best == "" || len(alias) < len(best) || (len(alias) == len(best) && alias < best) {
+			best = alias
+		}
+	}
+	if best == "" {
+		return modelID
+	}
+	return best
+}
+
 // extractContext pulls fields from an HTTP request into a ReqContextData,
 // returning whatever is available. For GET requests it reads query parameters.
 // For POST requests it inspects Content-Type and parses JSON,
@@ -504,7 +696,7 @@ func extractContext(r *http.Request) (ReqContextData, error) {
 			Model:     q.Get("model"),
 			Streaming: q.Get("stream") == "true",
 			ApiKey:    apiKey,
-			Metadata:  make(map[string]string),
+			Metadata:  sessionMetadata(r, ""),
 			Tier:      TierFromContext(r.Context()),
 		}, nil
 	}
@@ -520,22 +712,16 @@ func extractContext(r *http.Request) (ReqContextData, error) {
 	contentType := r.Header.Get("Content-Type")
 
 	if strings.Contains(contentType, "application/json") {
-		metadata := make(map[string]string)
-		// Claude Code carries its session identity in metadata.user_id
-		// (e.g. "user_..._account_..._session_<uuid>"). Only stamp both
-		// keys together when a session_<uuid> segment is actually found -
-		// a user_id with no session segment leaves neither key set, same
-		// as a request with no metadata.user_id at all.
+		// Claude Code carries its session identity via the
+		// claudeCodeSessionHeader request header (current CLI builds) or,
+		// as a fallback, metadata.user_id in the JSON body (e.g.
+		// "user_..._account_..._session_<uuid>"); see sessionMetadata.
 		userID := gjson.GetBytes(bodyBytes, "metadata.user_id").String()
-		if sessionID := sessionIDFromUserID(userID); sessionID != "" {
-			metadata["session_id"] = sessionID
-			metadata["client_user_id"] = userID
-		}
 		return ReqContextData{
 			Model:     gjson.GetBytes(bodyBytes, "model").String(),
 			Streaming: gjson.GetBytes(bodyBytes, "stream").Bool(),
 			ApiKey:    apiKey,
-			Metadata:  metadata,
+			Metadata:  sessionMetadata(r, userID),
 			Tier:      TierFromContext(r.Context()),
 			Body:      bodyBytes,
 		}, nil
@@ -559,7 +745,7 @@ func extractContext(r *http.Request) (ReqContextData, error) {
 		Model:     r.FormValue("model"),
 		Streaming: r.FormValue("stream") == "true",
 		ApiKey:    apiKey,
-		Metadata:  make(map[string]string),
+		Metadata:  sessionMetadata(r, ""),
 		Tier:      TierFromContext(r.Context()),
 		Body:      bodyBytes,
 	}, nil

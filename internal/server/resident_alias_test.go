@@ -42,16 +42,38 @@ func TestResolveResidentAlias_ResolvesToReadyModel(t *testing.T) {
 func TestResolveResidentAlias_NothingResident404Path(t *testing.T) {
 	cfg := residentAliasTestConfig(t)
 
-	// No processes at all, and a process that exists but is not ready: both
-	// must refuse — resolving would otherwise trigger a load.
+	// No processes at all, and a process on its way out: both must refuse -
+	// resolving would otherwise trigger a load.
 	for _, running := range []map[string]process.ProcessState{
 		{},
-		{"modelA": process.StateStarting},
 		{"modelA": process.StateStopping},
 	} {
 		_, ok := resolveResidentAlias(cfg, running, "default")
 		assert.False(t, ok)
 	}
+}
+
+// A model that is LOADING is the resident-to-be: a request resolved onto it
+// waits in the router for ready, exactly like the parent session's own turn
+// does during the same reload. Refusing here instead gave a Claude Code
+// subagent a 0 ms 404 on every turn of a child reload while its parent
+// survived (llama-cm incident 2026-09-08-subagent-turns-invisible-share-
+// parent-slot-lane, dogfood audit row 3). Nothing new is loaded: the process
+// is already starting.
+func TestResolveResidentAlias_LoadingModelIsWaitedForNotRefused(t *testing.T) {
+	cfg := residentAliasTestConfig(t)
+
+	resolved, ok := resolveResidentAlias(cfg, map[string]process.ProcessState{"modelA": process.StateStarting}, "default")
+	assert.True(t, ok)
+	assert.Equal(t, "modelA", resolved)
+
+	// A ready model still wins over a loading one.
+	resolved, ok = resolveResidentAlias(cfg, map[string]process.ProcessState{
+		"modelA": process.StateStarting,
+		"modelB": process.StateReady,
+	}, "default")
+	assert.True(t, ok)
+	assert.Equal(t, "modelB", resolved)
 }
 
 func TestResolveResidentAlias_NonMatchingIdRefused(t *testing.T) {

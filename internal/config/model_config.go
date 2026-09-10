@@ -135,6 +135,16 @@ type ModelConfig struct {
 	// and its server flags, not of the request.
 	PrefillTokensPerSecond float64 `yaml:"prefillTokensPerSecond"`
 
+	// SlotAffinity pins a client session to the llama-server slot that served
+	// its previous request. When true, llama-swap remembers the id_slot the
+	// child reported on each response (keyed by the request's session_id, see
+	// swaputil.extractContext) and injects it as `id_slot` into the next JSON
+	// body from the same session, so llama.cpp reuses that slot's KV prefix
+	// instead of picking a slot by its own LCP heuristic. Off by default; a
+	// model whose child runs a single slot gains nothing from it. See
+	// internal/server/slot_affinity.go.
+	SlotAffinity bool `yaml:"slotAffinity"`
+
 	// Copy of HealthCheckTimeout from global config
 	HealthCheckTimeout int `yaml:"healthCheckTimeout"`
 }

@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"sort"
 	"strconv"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/mostlygeek/llama-swap/internal/config"
@@ -15,6 +17,23 @@ import (
 // defaultConcurrencyLimit caps simultaneous in-flight requests per model when
 // the model config leaves concurrencyLimit unset.
 const defaultConcurrencyLimit = 10
+
+// largePrefillThreshold is the estimated-token size (see swaputil.EstimateTokens
+// -> buffered body bytes / 4) at or above which a request counts as a "large
+// prefill" for KV-aware admission. WHY it exists: on a shared --kv-unified
+// --parallel 2 box (cq27/cq35) the summed-token pool check alone still admits
+// TWO large prefills whenever their estimates happen to fit the pool (e.g.
+// 100k+100k < the 262k full-KV pool), but their two concurrent Metal prefill
+// compute-buffers oversubscribe GPU memory (kIOGPUCommandBufferCallbackError
+// OutOfMemory) AND thrash each other's shared KV cache into endless
+// re-prefills. So large prefills must SERIALIZE (only one in flight per model)
+// while small requests still ride the second slot concurrently -- see kvAdmit.
+// A package var (not const) so tests can lower it to exercise the gate with
+// small token counts. Default 8192: well above Claude Code housekeeping /
+// count_tokens / short turns (hundreds of tokens, observed est~300-500 live)
+// and well below a real agent turn's 20k-100k prefill (observed live), so it
+// separates the two populations cleanly.
+var largePrefillThreshold = 8192
 
 // grantedReq is one currently-granted (in-flight) request's tier bookkeeping,
 // tracked alongside FIFO.inFlight so the preemption branch can find victims
@@ -71,29 +90,67 @@ type FIFO struct {
 	// for models with a positive cfg.KVPoolTokens entry; see kvAdmit.
 	kvInFlight map[string]int
 
+	// kvLargeInFlight tracks, per model, how many currently-granted requests
+	// are "large prefills" (EstimatedTokens >= largePrefillThreshold). kvAdmit
+	// parks a large arrival while this is > 0 for its model, serializing large
+	// prefills so two never co-schedule and OOM the shared KV pool; small
+	// requests ignore it. Maintained alongside kvInFlight in grantHandler /
+	// releaseKV.
+	kvLargeInFlight map[string]int
+
 	// grace maps a model ID to its swap-grace duration: a request for a
 	// different model is held in the queue until this model has been idle
 	// (in-flight 0) for at least this long before it may be evicted. Absent or
 	// <= 0 means no grace for that model.
 	grace map[string]time.Duration
+	// starvation is the valve threshold applied in withinGrace: how long a
+	// deferred request may wait (from its first deferral, see graceWait)
+	// before the evictee's grace is deemed served. 0 = use the evictee's own
+	// grace (historic behaviour); starvationOff = never open the valve. Set
+	// once from the global swapStarvationSeconds; see config.Config.
+	starvation    time.Duration
+	starvationOff bool
 	// idleSince records when each model last became idle — its in-flight dropped
 	// to 0, or it just became ready. Grace is measured from this. A busy model
 	// (in-flight > 0) is already deferred by the in-flight check before the grace
 	// check runs, so a stale idleSince on a busy model is harmless.
 	idleSince map[string]time.Time
-	// graceWait records, per REQUESTED model, when its oldest queued request
-	// was FIRST deferred by a swap-grace. It powers the starvation valve in
-	// withinGrace: grace is an idle-STREAK requirement, so a continuous
-	// consumer of the resident model (cadence < grace) resets idleSince
-	// forever and a parked cross-model request would starve indefinitely
+	// cooldownWaitSince records when the CURRENT cooldown first held a
+	// cross-model request (zero when nothing is held). It powers the
+	// starvation valve in withinGrace: grace is an idle-STREAK requirement,
+	// so a continuous consumer of the resident (cadence < grace) resets
+	// idleSince forever and a parked cross-model request would starve
 	// (witnessed 2026-07-15: a ~20s-cadence client pinned a 600s-grace model;
 	// the parked request waited 13+ min until manually flushed). Once the
-	// deferred request has itself waited >= the evictee's grace, the evictee
-	// has had its full protection window and the swap proceeds at the next
-	// drain gap. Cleared when the model's swap starts or its queue empties.
-	graceWait map[string]time.Time
+	// cooldown has held requests for >= the threshold, the resident has had
+	// its full protection window and the swap proceeds at the next drain gap.
+	// ONE timestamp, not one per requested model: the cooldown is a state of
+	// the resident, and every model queued behind it shares the same wait
+	// (2026-09-10). Cleared when a swap starts or the queue empties.
+	cooldownWaitSince time.Time
+	// cooldownForcedMu guards cooldownForced. Unlike every other field on
+	// FIFO, cooldownForced is written from arbitrary HTTP goroutines
+	// (FinishCooldown is the menu-bar helper's cooldown row click / POST
+	// /api/swap-grace/finish), not just the run loop, so it needs its own
+	// lock rather than the run-loop-only convention the rest of this struct
+	// follows.
+	cooldownForcedMu sync.Mutex
+	// cooldownForced is the one-shot "end the current cooldown now" flag.
+	// consumeForced clears it the instant it lets a swap proceed, so a
+	// finish never carries over to a later, unrelated cooldown.
+	cooldownForced bool
 	// now is the clock; overridable in tests.
 	now func() time.Time
+
+	// capacity is the lock-free snapshot published by publishCapacity for
+	// readers outside the run loop (HTTP handlers). Written only on the run
+	// loop; see capacity.go.
+	capacity atomic.Pointer[[]swaputil.ModelCapacity]
+
+	// cooldown is the lock-free snapshot published by publishGrace for
+	// readers outside the run loop (HTTP handlers, SSE): the single current
+	// cooldown, or nil. Written only on the run loop; see grace.go.
+	cooldown atomic.Pointer[swaputil.Cooldown]
 
 	// nextArrivalSeq hands out HandlerReq.arrivalSeq — see its doc comment.
 	// Plain uint64, not atomic: only ever touched on the run loop.
@@ -119,21 +176,31 @@ func NewFIFO(name string, logger *logmon.Monitor, planner Swapper, cfg config.Fi
 	}
 
 	return &FIFO{
-		name:       name,
-		logger:     logger,
-		planner:    planner,
-		cfg:        cfg,
-		effects:    eff,
-		limits:     limits,
-		active:     make(map[string]*activeSwap),
-		inFlight:   make(map[string]int),
-		granted:    make(map[string][]*grantedReq),
-		kvInFlight: make(map[string]int),
-		grace:      grace,
-		idleSince:  make(map[string]time.Time),
-		graceWait:  make(map[string]time.Time),
-		now:        time.Now,
+		name:            name,
+		logger:          logger,
+		planner:         planner,
+		cfg:             cfg,
+		effects:         eff,
+		limits:          limits,
+		active:          make(map[string]*activeSwap),
+		inFlight:        make(map[string]int),
+		granted:         make(map[string][]*grantedReq),
+		kvInFlight:      make(map[string]int),
+		kvLargeInFlight: make(map[string]int),
+		grace:           grace,
+		idleSince:       make(map[string]time.Time),
+		now:             time.Now,
 	}
+}
+
+// SetSwapStarvationSeconds installs the global swapStarvationSeconds valve
+// (config.Config.SwapStarvationSeconds): -1 is the "valve off" sentinel
+// (validated in config.load), 0 keeps the per-evictee grace as the threshold,
+// N > 0 is an explicit threshold. Called once at construction, before the run
+// loop starts, so no locking is needed.
+func (s *FIFO) SetSwapStarvationSeconds(n int) {
+	s.starvationOff = n < 0
+	s.starvation = time.Duration(max(n, 0)) * time.Second
 }
 
 // OnRequest decides what to do with one incoming ServeHTTP request. It never
@@ -175,6 +242,22 @@ func (s *FIFO) OnRequest(req HandlerReq) {
 		return
 	}
 
+	// (1a) A status read (GET /slots|/props|/metrics|/health under
+	// /upstream/<model>/, see HandlerReq.StatusRead) on a model that is neither
+	// ready nor loading is refused here, never queued. Queued, it would be a
+	// swap request in every respect but the caller's intent: it counted as
+	// "waiting" behind the resident's cooldown, flapped as the poller timed
+	// out and re-polled, and could have been the request that won the swap
+	// (menu-bar helper polling parked models' /slots every 2s, 2026-09-10). A
+	// read on a model that IS loading joins that swap below like any other
+	// request: the answer is seconds away and nothing extra is triggered.
+	if req.StatusRead && state != process.StateReady {
+		if _, loading := s.active[req.Model]; !loading {
+			s.rejectAdmission(req, ErrModelNotLoaded)
+			return
+		}
+	}
+
 	// (1b) Admit before anything else can commit a response stream. A false
 	// return means the caller is already gone; it never reaches the queue.
 	if !s.admit(req) {
@@ -192,6 +275,7 @@ func (s *FIFO) OnRequest(req HandlerReq) {
 	// joining an in-flight swap cannot bypass it.
 	if s.blockedByRankBarrier(req) {
 		s.logger.Debugf("%s: queuing request for model %s (rank barrier: higher-rank request queued)", s.name, req.Model)
+		markParked(&req, ParkRank)
 		s.enqueue(req)
 		return
 	}
@@ -199,6 +283,7 @@ func (s *FIFO) OnRequest(req HandlerReq) {
 	// (3) Join an in-flight swap for the same model.
 	if sw, ok := s.active[req.Model]; ok {
 		s.logger.Debugf("%s: joining in-flight swap for model %s (%d waiters)", s.name, req.Model, len(sw.waiters)+1)
+		markParked(&req, ParkLoading)
 		sw.waiters = append(sw.waiters, req)
 		return
 	}
@@ -216,6 +301,7 @@ func (s *FIFO) OnRequest(req HandlerReq) {
 			s.logger.Debugf("%s: preempting same-model in-flight request(s) on %s for higher-rank arrival at concurrency cap", s.name, req.Model)
 		}
 		s.logger.Debugf("%s: queuing request for model %s (concurrency limit %d reached)", s.name, req.Model, s.limit(req.Model))
+		markParked(&req, ParkCap)
 		s.enqueue(req)
 		return
 	}
@@ -231,6 +317,8 @@ func (s *FIFO) OnRequest(req HandlerReq) {
 				s.logger.Debugf("%s: preempting same-model in-flight request(s) on %s for higher-rank arrival", s.name, req.Model)
 			}
 			s.logKVParked(req.Model, req.EstimatedTokens)
+			markKVParked(req)
+			markParked(&req, ParkKV)
 			s.enqueue(req)
 			return
 		}
@@ -242,6 +330,7 @@ func (s *FIFO) OnRequest(req HandlerReq) {
 	// (5) Collision with an in-flight swap — queue.
 	if collidesWith(req.Model, evict, s.active) {
 		s.logger.Debugf("%s: queuing request for model %s (collides with in-flight swap)", s.name, req.Model)
+		markParked(&req, ParkSwapCollision)
 		s.enqueue(req)
 		return
 	}
@@ -255,6 +344,7 @@ func (s *FIFO) OnRequest(req HandlerReq) {
 			s.logger.Debugf("%s: preempting in-flight request(s) blocking model %s for higher-rank arrival", s.name, req.Model)
 		}
 		s.logger.Debugf("%s: queuing request for model %s (would evict in-flight process)", s.name, req.Model)
+		markParked(&req, ParkBusy)
 		s.enqueue(req)
 		return
 	}
@@ -264,15 +354,16 @@ func (s *FIFO) OnRequest(req HandlerReq) {
 	// out brief request gaps (an agent pausing to run a tool) instead of being
 	// evicted the instant it drains. OnServeDone (new traffic) or OnTick (pure
 	// idle) retries; the swap proceeds once the grace elapses.
-	if s.withinGrace(req.Model, evict) {
-		s.noteGraceDeferral(req.Model)
+	if s.deferredByGrace(evict) {
 		s.logger.Debugf("%s: queuing request for model %s (evictee still within swap-grace)", s.name, req.Model)
+		markParked(&req, ParkCooldown)
 		s.enqueue(req)
 		return
 	}
 
 	// (7) Start a new (possibly parallel) swap.
 	s.logger.Debugf("%s: starting swap for model %s, evicting %v", s.name, req.Model, evict)
+	markParked(&req, ParkLoading)
 	s.startSwap(req, evict, running)
 }
 
@@ -295,6 +386,8 @@ func (s *FIFO) OnCancel(req HandlerReq) {
 			kept = append(kept, q)
 		}
 		s.queued = kept
+		s.publishCapacity()
+		s.publishGrace()
 	}
 
 	// Prune from any active swap's waiters.
@@ -311,19 +404,12 @@ func (s *FIFO) OnCancel(req HandlerReq) {
 	}
 
 	if removed {
-		// If that was the LAST queued request for this model, drop its
-		// starvation-valve reference: a stale graceWait would let a future,
-		// unrelated request for the same model bypass the evictee's grace
-		// instantly (the valve must measure THAT request's own wait).
-		stillQueued := false
-		for _, q := range s.queued {
-			if q.Model == req.Model {
-				stillQueued = true
-				break
-			}
-		}
-		if !stillQueued {
-			delete(s.graceWait, req.Model)
+		// If that was the LAST queued request, drop the cooldown's
+		// starvation-valve reference: a stale timestamp would let a future,
+		// unrelated request bypass the resident's grace instantly (the valve
+		// must measure THAT cooldown's own wait).
+		if len(s.queued) == 0 {
+			s.cooldownWaitSince = time.Time{}
 		}
 		s.logger.Debugf("%s: cancelled request for model %s pruned from scheduler", s.name, req.Model)
 		broadcastQueuePositions(s.queued)
@@ -360,6 +446,7 @@ func (s *FIFO) OnSwapDone(ev SwapDone) {
 		// rejecting the excess waiter with a 429 at admission time.
 		if s.atCapacity(w) {
 			s.logger.Debugf("%s: swap waiter for model %s re-queued (concurrency limit %d reached)", s.name, ev.ModelID, s.limit(ev.ModelID))
+			markParked(&w, ParkCap)
 			s.enqueue(w)
 			continue
 		}
@@ -399,6 +486,8 @@ func (s *FIFO) OnServeDone(ev ServeDoneEvent) {
 	}
 
 	kvReleased := s.releaseKV(ev.ModelID, ev.EstimatedTokens)
+	s.publishCapacity()
+	s.publishGrace()
 
 	// A serving slot always came free here, so a request parked purely by the
 	// concurrency cap must get another chance; drainQueue is a no-op on an
@@ -414,6 +503,12 @@ func (s *FIFO) OnServeDone(ev ServeDoneEvent) {
 // deferred request would wait forever. The router arms it only when a swap-grace
 // is configured; it is a no-op when the queue is empty.
 func (s *FIFO) OnTick() {
+	if len(s.queued) == 0 {
+		// A finish clicked while nothing was held has nothing to end. Drop
+		// it here rather than let it sit armed against the NEXT cooldown,
+		// which would silently skip a grace the operator never saw.
+		s.consumeForced()
+	}
 	s.drainQueue()
 }
 
@@ -424,14 +519,13 @@ func (s *FIFO) OnTick() {
 // scheduler) is treated as evictable. grace <= 0 means no grace for that model.
 //
 // Starvation valve: the idle-streak requirement alone lets a continuous
-// consumer of the evictee (request cadence < grace) defer reqModel FOREVER —
+// consumer of the evictee (request cadence < grace) defer the swap FOREVER —
 // idleSince resets on every completion. So a deferral is honoured only until
-// reqModel's oldest queued request has itself waited the evictee's full grace
-// (measured from its first deferral, tracked in graceWait): at that point the
-// evictee has had every bit of protection the grace promises, and the swap
-// proceeds at the next drain gap. reqModel must be the REQUESTED model whose
-// deferral is being decided; callers record graceWait on a true return.
-func (s *FIFO) withinGrace(reqModel string, evict []string) bool {
+// the cooldown has held requests for the threshold (measured from its first
+// deferral, cooldownWaitSince): at that point the evictee has had every bit
+// of protection the grace promises, and the swap proceeds at the next drain
+// gap. Callers record cooldownWaitSince on a true return.
+func (s *FIFO) withinGrace(evict []string) bool {
 	now := s.now()
 	for _, m := range evict {
 		g := s.grace[m]
@@ -443,8 +537,18 @@ func (s *FIFO) withinGrace(reqModel string, evict []string) bool {
 			continue
 		}
 		if now.Sub(since) < g {
-			if w, ok := s.graceWait[reqModel]; ok && now.Sub(w) >= g {
-				continue // valve open: requester already waited m's full grace
+			// Valve threshold: the evictee's own grace unless the operator set
+			// swapStarvationSeconds. starvationOff means an interactive session
+			// inside its grace is never swapped out mid-cadence, whatever the
+			// parked request's age (2026-09-08 cq35h eviction).
+			if !s.starvationOff {
+				threshold := g
+				if s.starvation > 0 {
+					threshold = s.starvation
+				}
+				if !s.cooldownWaitSince.IsZero() && now.Sub(s.cooldownWaitSince) >= threshold {
+					continue // valve open: the cooldown already held for the threshold
+				}
 			}
 			return true
 		}
@@ -452,12 +556,59 @@ func (s *FIFO) withinGrace(reqModel string, evict []string) bool {
 	return false
 }
 
-// noteGraceDeferral records the FIRST time a request for reqModel was deferred
-// by a swap-grace, so the starvation valve has a fixed reference point.
-func (s *FIFO) noteGraceDeferral(reqModel string) {
-	if _, ok := s.graceWait[reqModel]; !ok {
-		s.graceWait[reqModel] = s.now()
+// noteGraceDeferral records the FIRST time the current cooldown deferred a
+// request, so the starvation valve has a fixed reference point.
+func (s *FIFO) noteGraceDeferral() {
+	if s.cooldownWaitSince.IsZero() {
+		s.cooldownWaitSince = s.now()
 	}
+}
+
+// deferredByGrace is the single call site both OnRequest and drainQueue use
+// to decide whether a cross-model swap must still wait: it drains a manual
+// finish (FinishCooldown / POST /api/swap-grace/finish) before falling back
+// to the normal idle-streak + starvation-valve check in withinGrace, and
+// records the deferral for the valve on a true return.
+func (s *FIFO) deferredByGrace(evict []string) bool {
+	if !s.withinGrace(evict) {
+		return false
+	}
+	if s.consumeForced() {
+		return false
+	}
+	s.noteGraceDeferral()
+	return true
+}
+
+// consumeForced reports whether a FinishCooldown is pending, clearing it if
+// so. Clearing on read makes the finish one-shot: it only ever ends the ONE
+// cooldown it was meant for, never a later, unrelated one. It is consulted
+// only while a grace is actually holding (see deferredByGrace), so a click
+// that lands after the cooldown already expired on its own is not left
+// armed against the next cooldown either.
+func (s *FIFO) consumeForced() bool {
+	s.cooldownForcedMu.Lock()
+	defer s.cooldownForcedMu.Unlock()
+	forced := s.cooldownForced
+	s.cooldownForced = false
+	return forced
+}
+
+// FinishCooldown manually ends the current cooldown: the next scheduling
+// decision (normally the next OnTick, armed at 1s while any swap-grace is
+// configured) bypasses withinGrace once, letting the queued swap proceed
+// immediately instead of waiting out the resident's remaining grace. A
+// no-op if nothing is deferred by grace when that next decision runs.
+//
+// Unlike every other FIFO method, this is safe to call from ANY goroutine —
+// it is the HTTP-handler entry point for POST /api/swap-grace/finish (the
+// menu-bar helper's cooldown row click), not a run-loop event. It only ever
+// touches cooldownForced, which cooldownForcedMu protects for exactly this
+// reason.
+func (s *FIFO) FinishCooldown() {
+	s.cooldownForcedMu.Lock()
+	defer s.cooldownForcedMu.Unlock()
+	s.cooldownForced = true
 }
 
 // OnUnload reconciles router-owned state with the impending Stop, performs the
@@ -497,6 +648,8 @@ func (s *FIFO) OnUnload(targets []string, timeout time.Duration) {
 			kept = append(kept, w)
 		}
 		s.queued = kept
+		s.publishCapacity()
+		s.publishGrace()
 	}
 
 	// Stop the targeted processes. Done synchronously so Unload's caller can
@@ -529,6 +682,9 @@ func (s *FIFO) OnShutdown(err error) {
 // that already walked away will never produce a matching OnServeDone, so
 // reserving its estimate would strand that budget forever too.
 func (s *FIFO) grantHandler(req HandlerReq, modelID string) {
+	// The park, if any, is over: a granted row must not keep saying why it
+	// was waiting.
+	clearParked(&req)
 	// Nil Ctx only happens in tests that build a bare HandlerReq; skip rather
 	// than panic in ctx.Value.
 	if req.Ctx != nil {
@@ -541,6 +697,12 @@ func (s *FIFO) grantHandler(req HandlerReq, modelID string) {
 		s.inFlight[modelID]++
 		if req.EstimatedTokens > 0 {
 			s.kvInFlight[modelID] += req.EstimatedTokens
+			// Count large prefills separately so kvAdmit can serialize them
+			// (see largePrefillThreshold): a second large one parks while this
+			// is > 0, even when the summed-token pool check would still fit.
+			if req.EstimatedTokens >= largePrefillThreshold {
+				s.kvLargeInFlight[modelID]++
+			}
 		}
 		// Track tier + preempt handle for the preemption branch. req.Preempt
 		// is nil for callers that don't wire tiered-queue support (e.g. tests
@@ -549,6 +711,8 @@ func (s *FIFO) grantHandler(req HandlerReq, modelID string) {
 		if req.Preempt != nil {
 			s.granted[modelID] = append(s.granted[modelID], &grantedReq{tier: req.Tier, preempt: req.Preempt})
 		}
+		s.publishCapacity()
+		s.publishGrace()
 	}
 }
 
@@ -669,6 +833,9 @@ func (s *FIFO) tryPreempt(req HandlerReq, evict []string, limit int) bool {
 //     rejected outright for being "too big" — only ever parked behind
 //     others; when it's the only one, there's nothing for it to collide
 //     with, so let it through and let llama.cpp be the final arbiter.
+//   - a LARGE arrival (estimate >= largePrefillThreshold) is parked whenever a
+//     large request is already in flight for the model, so large prefills
+//     serialize; small requests are unaffected.
 //   - otherwise -> admit only if the combined estimate still fits the pool.
 func (s *FIFO) kvAdmit(model string, estimate int) bool {
 	pool := s.cfg.KVPoolTokens[model]
@@ -679,7 +846,59 @@ func (s *FIFO) kvAdmit(model string, estimate int) bool {
 	if inflight <= 0 {
 		return true
 	}
+	// SERIALIZE LARGE PREFILLS: a large arrival must not co-schedule with a
+	// large request already in flight on this model, independent of the
+	// summed-token pool check below. Two concurrent large Metal prefill
+	// compute-buffers oversubscribe GPU memory (OOM) and thrash the shared
+	// --kv-unified cache into endless re-prefills even when their summed
+	// estimate still fits the pool (100k+100k < a 262k pool). Small requests
+	// (estimate < largePrefillThreshold) skip this and still ride the second
+	// slot concurrently. The parked large request is granted when the
+	// in-flight one frees (releaseKV -> drainQueue re-checks) or its client
+	// disconnects (the base router drops it from the queue), so this never
+	// deadlocks.
+	if estimate >= largePrefillThreshold && s.kvLargeInFlight[model] > 0 {
+		return false
+	}
 	return inflight+estimate <= pool
+}
+
+// markKVParked stamps kv_parked=1 onto req's LIVE in-flight entry, so a
+// renderer reading the /api/events snapshot can tell a request that is merely
+// waiting on KV admission from one that is stalled: a parked request produces
+// no bytes, which every byte heuristic reads as FLAT. Cleared at the grant
+// (internal/router/base.go, alongside slot_granted). Silently a no-op for a
+// request that never passed through the inflight middleware - see
+// swaputil.InflightMetadataSetterFromContext.
+// markParked stamps reason as `park_reason` on req's live in-flight entry,
+// only when it differs from what was last stamped (see HandlerReq.parkReason).
+// Silently a no-op for a request without an inflight setter in its context.
+func markParked(req *HandlerReq, reason string) {
+	if req.parkReason == reason {
+		return
+	}
+	req.parkReason = reason
+	if req.Ctx == nil {
+		return
+	}
+	if setter, ok := swaputil.InflightMetadataSetterFromContext(req.Ctx); ok {
+		setter("park_reason", reason)
+	}
+}
+
+// clearParked removes `park_reason` from req's live entry once it holds a
+// slot (an empty value deletes the key - see inflightTracker.SetMetadata).
+func clearParked(req *HandlerReq) {
+	markParked(req, "")
+}
+
+func markKVParked(req HandlerReq) {
+	if req.Ctx == nil {
+		return
+	}
+	if setter, ok := swaputil.InflightMetadataSetterFromContext(req.Ctx); ok {
+		setter("kv_parked", "1")
+	}
 }
 
 // releaseKV returns estimate tokens to model's KV budget and reports whether
@@ -694,6 +913,11 @@ func (s *FIFO) releaseKV(model string, estimate int) bool {
 	s.kvInFlight[model] -= estimate
 	if s.kvInFlight[model] < 0 {
 		s.kvInFlight[model] = 0
+	}
+	// Mirror grantHandler's large-prefill count so serialization releases with
+	// the request (guarded so a stray release can't drive the counter negative).
+	if estimate >= largePrefillThreshold && s.kvLargeInFlight[model] > 0 {
+		s.kvLargeInFlight[model]--
 	}
 	s.logger.Infof("kv-admission: released %s est=%d inflight=%d pool=%d",
 		model, estimate, s.kvInFlight[model], s.cfg.KVPoolTokens[model])
@@ -711,9 +935,9 @@ func (s *FIFO) logKVParked(model string, estimate int) {
 // the set EvictionFor saw, forwarded to OnSwapStart so the planner logs against
 // the same picture it decided on.
 func (s *FIFO) startSwap(initial HandlerReq, evict, running []string) {
-	// The wait is over — drop the starvation-valve reference so a FUTURE
-	// request for this model starts a fresh grace wait of its own.
-	delete(s.graceWait, initial.Model)
+	// The wait is over — drop the cooldown's starvation-valve reference so
+	// the NEXT cooldown measures a fresh wait of its own.
+	s.cooldownWaitSince = time.Time{}
 	s.active[initial.Model] = &activeSwap{
 		modelID: initial.Model,
 		evict:   evict,
@@ -759,6 +983,8 @@ func (s *FIFO) enqueue(req HandlerReq) {
 	copy(s.queued[i+1:], s.queued[i:])
 	s.queued[i] = req
 	broadcastQueuePositions(s.queued)
+	s.publishCapacity()
+	s.publishGrace()
 }
 
 // blockedByRankBarrier reports whether any OTHER queued request has strictly
@@ -810,6 +1036,7 @@ func (s *FIFO) drainQueue() {
 
 	for _, req := range pending {
 		if barrierArmed && req.Tier.Rank < barrierRank {
+			markParked(&req, ParkRank)
 			remaining = append(remaining, req)
 			continue
 		}
@@ -821,6 +1048,7 @@ func (s *FIFO) drainQueue() {
 		}
 		if sw, ok := s.active[req.Model]; ok {
 			s.logger.Debugf("%s: queued request for model %s now joining in-flight swap", s.name, req.Model)
+			markParked(&req, ParkLoading)
 			sw.waiters = append(sw.waiters, req)
 			continue
 		}
@@ -832,6 +1060,7 @@ func (s *FIFO) drainQueue() {
 			if s.tryPreempt(req, []string{req.Model}, 1) {
 				s.logger.Debugf("%s: preempting same-model in-flight request(s) on %s for queued higher-rank request at concurrency cap", s.name, req.Model)
 			}
+			markParked(&req, ParkCap)
 			stick(req)
 			continue
 		}
@@ -844,6 +1073,8 @@ func (s *FIFO) drainQueue() {
 					s.logger.Debugf("%s: preempting same-model in-flight request(s) on %s for queued higher-rank request", s.name, req.Model)
 				}
 				s.logKVParked(req.Model, req.EstimatedTokens)
+				markKVParked(req)
+				markParked(&req, ParkKV)
 				stick(req)
 				continue
 			}
@@ -852,6 +1083,7 @@ func (s *FIFO) drainQueue() {
 			continue
 		}
 		if collidesWith(req.Model, evict, s.active) {
+			markParked(&req, ParkSwapCollision)
 			stick(req)
 			continue
 		}
@@ -859,19 +1091,27 @@ func (s *FIFO) drainQueue() {
 			if s.tryPreempt(req, evict, 0) {
 				s.logger.Debugf("%s: preempting in-flight request(s) blocking queued model %s", s.name, req.Model)
 			}
+			markParked(&req, ParkBusy)
 			stick(req)
 			continue
 		}
-		if s.withinGrace(req.Model, evict) {
-			s.noteGraceDeferral(req.Model)
+		if s.deferredByGrace(evict) {
+			markParked(&req, ParkCooldown)
 			stick(req)
 			continue
 		}
 		s.logger.Debugf("%s: queued request for model %s now starting swap, evicting %v", s.name, req.Model, evict)
+		markParked(&req, ParkLoading)
 		s.startSwap(req, evict, running)
 	}
 	s.queued = remaining
+	if len(s.queued) == 0 {
+		// Nothing held any more: the next cooldown measures its own wait.
+		s.cooldownWaitSince = time.Time{}
+	}
 	broadcastQueuePositions(s.queued)
+	s.publishCapacity()
+	s.publishGrace()
 }
 
 // runningSet is the live model set handed to the Swapper: every process the

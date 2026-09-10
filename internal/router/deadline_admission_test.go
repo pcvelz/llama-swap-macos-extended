@@ -155,6 +155,59 @@ func TestBaseRouter_OverBudgetPreemptible_RefusedImmediately(t *testing.T) {
 	}
 }
 
+// TestBaseRouter_OverBudgetWithSessionID_NotRefused: THE SESSION-EXEMPTION
+// GUARD. A live Claude Code session (carrying the X-Claude-Code-Session-Id
+// header) is never deadline-refused on the prefill-rate ESTIMATE, however far
+// over budget - the user ruling (llama-cm docs/intent/llama-swap-backend.md
+// "What a Claude Code session is promised") is that a session always gets a
+// turn: waiting is normal, slow is not broken, only zero output is a real
+// failure. Same over-budget input as the core test above (which proves the
+// refusal still fires for session-less traffic), opposite outcome here.
+func TestBaseRouter_OverBudgetWithSessionID_NotRefused(t *testing.T) {
+	shortenDeadlineBudget(t, 2*time.Second)
+
+	m1 := newFakeProcess("m1")
+	m1.markReady()
+	logs := &syncBuf{}
+	// Same 1 token/s over a 2s budget as the refusal test: without the
+	// session id this would be refused.
+	mc := config.ModelConfig{ConcurrencyLimit: 1, PrefillTokensPerSecond: 1}
+	b := newDeadlineTestBase(t, m1, mc, config.FifoConfig{}, logs)
+
+	req := buildParkReq("m1", "over-budget-session", replayTierBackground,
+		"/v1/chat/completions", bigBody("m1", 100))
+	req.Header.Set("X-Claude-Code-Session-Id", "cf006070-1234-4abc-9def-0123456789ab")
+
+	rec := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		b.ServeHTTP(rec, req)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("session-tagged over-budget request never completed - it appears stuck rather than admitted")
+	}
+
+	if rec.Code == http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want NOT 503 - a live session must never be deadline-refused on the estimate", rec.Code)
+	}
+	if got := rec.Header().Get("X-LlamaSwap-Preempted"); got == "1" {
+		t.Fatal("X-LlamaSwap-Preempted = \"1\" - a session-tagged request was refused")
+	}
+	if calls := m1.serveCalls.Load(); calls != 1 {
+		t.Fatalf("fakeProcess.ServeHTTP called %d times, want 1 - the session-tagged request must be admitted, not refused", calls)
+	}
+	if got := logs.String(); !strings.Contains(got, "deadline-exempt: session=cf006070 tier=background est_s=100") {
+		t.Fatalf("deadline-exempt log line missing or malformed.\nlogs:\n%s", got)
+	}
+	if got := logs.String(); strings.Contains(got, "deadline-refuse:") {
+		t.Fatalf("deadline-refuse log line present - the session exemption did not take effect.\nlogs:\n%s", got)
+	}
+}
+
 // TestBaseRouter_WithinBudgetPreemptible_ServesNormally: the trap guard on
 // feature A. A background request that CAN finish inside the budget is
 // untouched - the refusal must key on the estimate, not on the tier.
@@ -404,5 +457,73 @@ func TestBaseRouter_DeadlineRefuse_NoLeak(t *testing.T) {
 	}
 	if rec.Code != http.StatusOK {
 		t.Fatalf("fresh request status = %d, want 200", rec.Code)
+	}
+}
+
+// TestBaseRouter_SessionCarrying_NotGivenUpPastParkBudget: THE PARK-STAGE
+// COUNTERPART to the up-front deadlineRefuse exemption above. Witnessed
+// production incident (2026-09-02, ~23:10): a live Claude Code session's
+// request, genuinely parked behind a monopolized slot, was cut with a bare
+// 503 once parkGiveUpBudget expired - the same user ruling (docs/intent/
+// llama-swap-backend.md "What a Claude Code session is promised": a session
+// always gets a turn, waiting is normal, only zero output is a real failure)
+// that exempts the up-front estimate refusal must also exempt this later
+// give-up. Modelled on TestBaseRouter_PingWriterArmed_NotGivenUp: sleep well
+// past the (shortened) park budget and prove the request is STILL waiting,
+// not given up, then free the slot and prove it serves normally.
+func TestBaseRouter_SessionCarrying_NotGivenUpPastParkBudget(t *testing.T) {
+	shortenParkBudget(t, 200*time.Millisecond)
+
+	m1 := newFakeProcess("m1")
+	m1.markReady()
+	logs := &syncBuf{}
+	b := newParkTestBaseLogged(t, m1, nil, logs)
+	release := startHog(t, b, m1)
+
+	req := buildParkReq("m1", "session-parked", replayTierBackground,
+		"/v1/chat/completions", `{"model":"m1"}`)
+	req.Header.Set("X-Claude-Code-Session-Id", "cf006070-1234-4abc-9def-0123456789ab")
+
+	rec := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		b.ServeHTTP(rec, req)
+	}()
+
+	// Well past the shortened park budget: a wrongly-armed give-up would have
+	// fired by now (see TestBaseRouter_ParkedPreemptibleRequest_GetsCanonical503,
+	// which proves 200ms is enough for the unexempted case to give up).
+	time.Sleep(1 * time.Second)
+
+	select {
+	case <-done:
+		t.Fatalf("session-carrying request was given up (status %d) - a live session must always get its turn, waiting is normal", rec.Code)
+	default:
+	}
+
+	// Releasing the hog frees the slot; the still-parked session request must
+	// then be served rather than having been abandoned.
+	release()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("session-carrying request never completed after the slot freed - it appears to have been dropped, not just delayed")
+	}
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("session-carrying request status = %d, want 200 - it must be served once the slot frees, not refused", rec.Code)
+	}
+	if rec.Header().Get("X-LlamaSwap-Preempted") != "" {
+		t.Fatal("session-carrying request carries X-LlamaSwap-Preempted - the park give-up fired despite the session exemption")
+	}
+	if calls := m1.serveCalls.Load(); calls != 2 {
+		t.Fatalf("fakeProcess.ServeHTTP called %d times, want 2 (hog + session request)", calls)
+	}
+	if got := logs.String(); !strings.Contains(got, "park-exempt: session=cf006070 tier=background") {
+		t.Fatalf("park-exempt log line missing or malformed.\nlogs:\n%s", got)
+	}
+	if got := logs.String(); strings.Contains(got, "stage=grant") {
+		t.Fatalf("giveUpParked(stage=grant) log present - the session exemption did not take effect.\nlogs:\n%s", got)
 	}
 }

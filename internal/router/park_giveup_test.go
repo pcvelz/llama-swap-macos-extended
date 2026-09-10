@@ -3,6 +3,7 @@ package router
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -184,6 +185,31 @@ func TestBaseRouter_ParkedPreemptibleRequest_GetsCanonical503(t *testing.T) {
 	}
 	if got := rec.Header().Get("Retry-After"); got == "" {
 		t.Fatal("Retry-After missing - it is what makes the client back off instead of 0s-retrying")
+	}
+	// The body is the half of the canonical shape a header cannot carry: an SDK
+	// that only surfaces the payload reports a status-only 503 as "503 status
+	// code (no body)", naming neither the cause nor whether a retry is safe.
+	if got := rec.Header().Get("Content-Type"); got != "application/json" {
+		t.Fatalf("Content-Type = %q, want application/json - the client must be told the body is parseable", got)
+	}
+	var envelope struct {
+		Type  string `json:"type"`
+		Error struct {
+			Type    string `json:"type"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &envelope); err != nil {
+		t.Fatalf("give-up body is not the Anthropic error envelope: %v - body=%q", err, rec.Body.String())
+	}
+	if envelope.Type != "error" {
+		t.Fatalf("envelope type = %q, want \"error\" - clients key on this before reading error.type", envelope.Type)
+	}
+	if envelope.Error.Type != "overloaded_error" {
+		t.Fatalf("error.type = %q, want overloaded_error - it is the one type that means the request never started, so retrying is safe", envelope.Error.Type)
+	}
+	if envelope.Error.Message == "" {
+		t.Fatal("error.message empty - the operator gets a typed 503 with nothing to read")
 	}
 	if calls := m1.serveCalls.Load(); calls != 1 {
 		t.Fatalf("fakeProcess.ServeHTTP called %d times, want exactly 1 (the hog only) - the parked request must never have been granted", calls)
@@ -502,5 +528,101 @@ func TestBaseRouter_ParkGiveUp_GrantRendezvousRace(t *testing.T) {
 	}
 	if rec.Code != http.StatusOK {
 		t.Fatalf("post-race request status = %d, want 200", rec.Code)
+	}
+}
+
+// TestBaseRouter_ParkedSessionRequest_NeverGivenUp: a request carrying a live
+// Claude Code session id (X-Claude-Code-Session-Id) must NEVER receive the
+// park-stage give-up, however long it waits past parkGiveUpBudget - see the
+// user ruling in docs/intent/llama-swap-backend.md "What a Claude Code
+// session is promised" (llama-cm): a session always gets a turn, waiting is
+// normal, only zero output is a real failure. The budget is shortened well
+// under the sleep below, so an unexempted request would already have been
+// given up (see TestBaseRouter_ParkedPreemptibleRequest_GetsCanonical503);
+// this one must still be waiting, then get served once the slot frees.
+func TestBaseRouter_ParkedSessionRequest_NeverGivenUp(t *testing.T) {
+	shortenParkBudget(t, 200*time.Millisecond)
+
+	m1 := newFakeProcess("m1")
+	m1.markReady()
+	logs := &syncBuf{}
+	b := newParkTestBaseLogged(t, m1, nil, logs)
+	release := startHog(t, b, m1)
+
+	req := buildParkReq("m1", "parked", replayTierBackground, "/v1/chat/completions", `{"model":"m1"}`)
+	req.Header.Set("X-Claude-Code-Session-Id", "cf006070-1234-4abc-9def-0123456789ab")
+
+	rec := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		b.ServeHTTP(rec, req)
+	}()
+
+	// Well past the (shortened) budget: an unexempted request would already
+	// have been given up by now (see TestBaseRouter_PingWriterArmed_NotGivenUp,
+	// which uses the same 200ms-budget/1s-wait margin for the same reason -
+	// comfortable headroom against scheduler jitter on a busy box).
+	time.Sleep(1 * time.Second)
+	select {
+	case <-done:
+		t.Fatalf("session-carrying request was given up (status %d) past the park budget - it must keep waiting indefinitely\nlogs:\n%s", rec.Code, logs.String())
+	default:
+	}
+	if got := logs.String(); !strings.Contains(got, "park-exempt: session=cf006070") {
+		t.Fatalf("expected a park-exempt log line for the exempted session, got:\n%s", got)
+	}
+
+	// Releasing the hog frees the slot; the exempted request must then be
+	// served rather than left parked forever.
+	release()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("session-carrying request never completed after the slot freed")
+	}
+	if rec.Code != http.StatusOK {
+		t.Fatalf("session-carrying request status = %d, want 200 - it must be served, never given up", rec.Code)
+	}
+	if got := rec.Header().Get("X-LlamaSwap-Preempted"); got != "" {
+		t.Fatalf("session-carrying request carries X-LlamaSwap-Preempted = %q, want empty - it must never be given up", got)
+	}
+}
+
+// TestBaseRouter_ParkedNoSessionRequest_StillGivenUp: the control for
+// TestBaseRouter_ParkedSessionRequest_NeverGivenUp above - a parked request
+// carrying NO session id must keep the pre-existing give-up behaviour
+// (canonical X-LlamaSwap-Preempted 503) once the budget elapses. This
+// duplicates TestBaseRouter_ParkedPreemptibleRequest_GetsCanonical503's
+// assertions by design, placed next to the new exemption test so a reader
+// sees both outcomes of the same fork side by side.
+func TestBaseRouter_ParkedNoSessionRequest_StillGivenUp(t *testing.T) {
+	shortenParkBudget(t, 100*time.Millisecond)
+
+	m1 := newFakeProcess("m1")
+	m1.markReady()
+	b := newParkTestBase(t, m1, nil)
+	release := startHog(t, b, m1)
+	defer release()
+
+	rec := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		b.ServeHTTP(rec, buildParkReq("m1", "parked", replayTierBackground,
+			"/v1/chat/completions", `{"model":"m1"}`))
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("no-session parked request never gave up - the give-up regressed for the pre-existing (non-exempt) population")
+	}
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("no-session parked request status = %d, want 503", rec.Code)
+	}
+	if got := rec.Header().Get("X-LlamaSwap-Preempted"); got != "1" {
+		t.Fatalf("X-LlamaSwap-Preempted = %q, want \"1\"", got)
 	}
 }

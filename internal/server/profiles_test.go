@@ -114,7 +114,12 @@ func TestServer_ProfileMiddleware_JSONAndFilters(t *testing.T) {
 
 	assert.Equal(t, "variant", received.Model)
 	assert.Equal(t, "real", received.ModelID)
-	assert.Empty(t, received.Metadata)
+	// Session identity: this request carries no Claude Code session, so the
+	// bag holds only the always-present client family and the resolved
+	// model's display alias - and no session_id.
+	assert.Equal(t, "other", received.Metadata["client"])
+	assert.Equal(t, "variant", received.Metadata["model_alias"])
+	assert.NotContains(t, received.Metadata, "session_id")
 	assert.Equal(t, "variant", gjson.GetBytes(body, "model").String())
 	assert.True(t, gjson.GetBytes(body, "thinking").Bool())
 

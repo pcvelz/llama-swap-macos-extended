@@ -43,6 +43,13 @@ public enum ThroughputWord: String {
     case decode = "DECODE"
     case flat = "FLAT"
     case parked = "PARKED"
+    /// Between turns: the lane has NO request on the proxy right now because
+    /// the client is running a tool locally (1-3s for an ordinary Bash/Read
+    /// call). Not a backend state at all - it is the honest word for a row
+    /// that BackendClient is holding on screen across a turn boundary rather
+    /// than letting it vanish and re-appear. Never render DECODE/PREFILL for
+    /// such a row: nothing is being computed for it.
+    case turn = "TURN"
 }
 
 /// Classifies one polled sample of a single in-flight request using the SAME

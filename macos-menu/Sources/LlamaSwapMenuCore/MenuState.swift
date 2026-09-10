@@ -39,13 +39,49 @@ public struct MenuState: Encodable {
     /// slot signal (see SessionThroughput.swift's header).
     public var queueRows: [QueueRow] = []
 
-    /// Currently active swap-grace holds (llama-cm llama-swap.yaml
-    /// swapGraceSeconds; see fifo.go's grace/idleSince/graceWait/withinGrace)
-    /// - one entry per (requested model, evictee) pair with a request queued
-    /// behind the evictee's grace window. Pushed by the "swapGrace" SSE
-    /// event/GET /api/swap-grace (BackendClient.handleEvent); empty when
-    /// nothing is currently held.
-    public var graceHolds: [GraceHoldRow] = []
+    /// The current swap-grace cooldown (llama-cm llama-swap.yaml
+    /// swapGraceSeconds; see fifo.go's grace/idleSince/withinGrace): the
+    /// resident model is idle inside its grace while queued requests for
+    /// another model wait for it. ONE state on the resident, never one per
+    /// waiting model (2026-09-10: two "waiting for cq35" rows). Pushed by the
+    /// "swapGrace" SSE event/GET /api/swap-grace (BackendClient.handleEvent);
+    /// nil when nothing is held.
+    public var cooldown: CooldownRow? = nil
+
+    /// The cooldown row's text. Names the model that IS loaded as the one
+    /// cooling down, then what loads next - never "X waiting for <loaded
+    /// model>", which reads as waiting for a model that is already there.
+    public static func cooldownLabel(_ cd: CooldownRow, resident: String, next: String) -> String {
+        "Cooldown: \(resident) (\(CompactFormatter.countdown(cd.remainingSeconds))), then \(next)"
+            + " · \(cd.waiting) waiting"
+    }
+
+    /// The phrase a PARKED row shows after the word: the scheduler's
+    /// `park_reason` (internal/router/scheduler Park* constants) in words.
+    /// `kv_parked` is the older flag for the same KV case. Unknown or absent
+    /// renders nothing - never a guess.
+    public static func parkDetail(reason: String?, kvParked: Bool) -> String? {
+        switch reason ?? "" {
+        case "cap": return "slots full"
+        case "kv": return "kv pool"
+        case "busy": return "resident busy"
+        case "cooldown": return "cooldown"
+        case "loading": return "loading"
+        case "rank": return "behind higher rank"
+        case "swap-collision": return "another swap in flight"
+        default: return kvParked ? "kv pool" : nil
+        }
+    }
+
+    /// One hot-slot line under the cooldown row: which session the slot is
+    /// being kept warm for (the cooldown's whole purpose - a session's slot
+    /// and KV cache survive a tool call or an AskUserQuestion pause), shown
+    /// like an active slot would be. Session ids are shown by their first 8
+    /// characters, the same short form the session rows use.
+    public static func hotSlotLabel(_ s: HotSlotRow) -> String {
+        guard !s.sessionId.isEmpty else { return "  slot \(s.slot) · free" }
+        return "  slot \(s.slot) · [\(String(s.sessionId.prefix(8)))] · hot, idle \(CompactFormatter.countdown(s.idleSeconds))"
+    }
 
     /// The "Queue: idle" line the design calls for when nothing is parked,
     /// else one summary per queued entry.
@@ -112,7 +148,7 @@ public struct MenuState: Encodable {
     private enum CodingKeys: String, CodingKey {
         case backendOnline, completed, waiting, waitingByTier, models, chosenModelID
         case pendingModelID, lastSwitchError, barValues, activeModelID
-        case sessionRows, queueRows, graceHolds
+        case sessionRows, queueRows, cooldown
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -129,21 +165,42 @@ public struct MenuState: Encodable {
         try c.encodeIfPresent(activeModelID, forKey: .activeModelID)
         try c.encode(sessionRows, forKey: .sessionRows)
         try c.encode(queueRows, forKey: .queueRows)
-        try c.encode(graceHolds, forKey: .graceHolds)
+        try c.encodeIfPresent(cooldown, forKey: .cooldown)
     }
 }
 
-/// One active swap-grace hold - mirrors internal/swaputil/events.go
-/// GraceHold exactly (field names match, so the default synthesized
-/// Codable decodes it with no CodingKeys needed). `id` is computed, not
-/// stored, so it plays no part in (de)coding - see QueueRow for the same
-/// pattern with a stored id.
-public struct GraceHoldRow: Identifiable, Codable, Equatable {
-    public var id: String { "\(requestedModel)->\(evicteeModel)" }
-    public let requestedModel: String
+/// The current cooldown - mirrors internal/swaputil/events.go Cooldown
+/// exactly (field names match, so the default synthesized Codable decodes
+/// it with no CodingKeys needed).
+public struct CooldownRow: Codable, Equatable {
     public let evicteeModel: String
+    public let nextModel: String
     public let waiting: Int
     public let remainingSeconds: Int
+    public let slots: [HotSlotRow]
+
+    public init(evicteeModel: String, nextModel: String, waiting: Int, remainingSeconds: Int, slots: [HotSlotRow]) {
+        self.evicteeModel = evicteeModel
+        self.nextModel = nextModel
+        self.waiting = waiting
+        self.remainingSeconds = remainingSeconds
+        self.slots = slots
+    }
+}
+
+/// One slot of the cooling resident and the session it is kept warm for -
+/// mirrors internal/swaputil/events.go HotSlot.
+public struct HotSlotRow: Identifiable, Codable, Equatable {
+    public var id: Int { slot }
+    public let slot: Int
+    public let sessionId: String
+    public let idleSeconds: Int
+
+    public init(slot: Int, sessionId: String, idleSeconds: Int) {
+        self.slot = slot
+        self.sessionId = sessionId
+        self.idleSeconds = idleSeconds
+    }
 }
 
 /// One in-flight request rendered as a menu row: who it belongs to, which
@@ -371,7 +428,8 @@ struct QueueEntry: Codable {
 
 /// The "swapGrace" SSE event's payload / GET /api/swap-grace's body -
 /// internal/server/apigroup.go handleAPISwapGrace and the SSE sibling event
-/// in handleAPIEvents both wrap the list in a "holds" key.
-struct SwapGracePayload: Codable {
-    let holds: [GraceHoldRow]
+/// in handleAPIEvents both wrap the single cooldown (or null) in a
+/// "cooldown" key.
+struct CooldownPayload: Codable {
+    let cooldown: CooldownRow?
 }

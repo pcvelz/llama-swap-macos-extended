@@ -37,6 +37,12 @@ type Server struct {
 	inflight *inflightTracker
 	metrics  *metricsMonitor
 	store    *store.Store
+	// slotAffinity pins sessions to the child slot that last served them for
+	// models with slotAffinity: true (slot_affinity.go).
+	slotAffinity *slotAffinityStore
+	// trace is the box's state machine as a log (state_trace.go); nil in
+	// tests that do not wire it.
+	trace    *stateTrace
 	build    BuildInfo
 	hardware *hw.HardwareSnapshot
 
@@ -203,6 +209,9 @@ func New(cfg config.Config, muxlog *logmon.Monitor, proxylog *logmon.Monitor, up
 		shutdownCtx: shutdownCtx,
 		shutdownFn:  shutdownFn,
 	}
+	s.slotAffinity = newSlotAffinityStore(cfg)
+	s.metrics.affinity = s.slotAffinity
+	s.wireStateTrace()
 	s.routes()
 	s.startPreload()
 	return s, nil
@@ -231,51 +240,159 @@ func (s *Server) localPeerHandler(w http.ResponseWriter, r *http.Request) {
 		// Resident-alias resolution: ids matching cfg.ResidentAliases (e.g.
 		// "claude-haiku-*" — Claude Code housekeeping and subagent
 		// orchestrator turns — or "default" — hook-layer analyze calls) are
-		// served by whichever local model is ALREADY resident. Only ready
-		// processes qualify: resolving to a non-resident model would trigger
-		// a load/swap, i.e. exactly the standing cross-model eviction
-		// pressure a static alias was rejected for. With nothing resident we
-		// fall through to the 404, which stays a cheap no-op for idle-time
-		// housekeeping. The rewritten context is what the local router's
+		// served by whichever local model is ALREADY resident, or is
+		// currently loading (the request then waits for ready like any
+		// request naming that model). Resolving to a model that is neither
+		// would trigger a load/swap, i.e. exactly the standing cross-model
+		// eviction pressure a static alias was rejected for. With nothing
+		// resident or loading we fall through to the 404, which stays a
+		// cheap no-op for idle-time housekeeping. The rewritten context is what the local router's
 		// scheduler reads (FetchContext returns the stored context first),
 		// so FIFO ordering and KV admission apply to the RESOLVED model; the
 		// earlier per-model concurrency/filter middleware saw the alias id
 		// and deliberately did not apply — those are keyed to real model
 		// blocks, which an alias-only id never is.
-		if resolved, ok := resolveResidentAlias(s.cfg, s.local.RunningModels(), data.Model); ok {
+		// Resolution is given a grace window (cfg.ResidentAliasGraceSeconds)
+		// rather than one look: right after a restart the listener is up
+		// seconds before the first real-model request has started a load,
+		// and an alias turn landing in that gap was refused instantly while
+		// its parent's own turn waited for the load and survived.
+		if resolved, ok := awaitResidentAlias(r.Context(), s.cfg, s.local.RunningModels, data.Model,
+			time.Duration(s.cfg.ResidentAliasGraceSeconds)*time.Second, residentAliasPollInterval); ok {
 			s.proxylog.Debugf("dispatch: resident alias %s -> %s", data.Model, resolved)
 			data.ModelID = resolved
+			// An alias that resolved only HERE (nothing was resident when the
+			// affinity middleware ran, e.g. inside the grace window after a
+			// restart) has no resolved_model on its live entry yet, so the menu
+			// polls /upstream/<alias>/slots and 404s (proxy log 19:28:56,
+			// 2026-09-08). Stamp it now; the middleware's own stamp is
+			// idempotent when it already ran.
+			if data.Metadata == nil {
+				data.Metadata = make(map[string]string, 1)
+			}
+			data.Metadata[resolvedModelMetadataKey] = resolved
+			stampInflightMetadata(r, resolvedModelMetadataKey, resolved)
+			// The row must name the model that actually serves, not the alias
+			// id the caller asked for, so the display alias is recomputed here
+			// rather than left at whatever FetchContext stamped.
+			swaputil.StampModelAlias(&data, s.cfg)
 			*r = *r.WithContext(swaputil.SetContext(r.Context(), data))
 			s.local.ServeHTTP(w, r)
 			return
 		}
-		swaputil.SendError(w, r, router.ErrNoRouterFound)
+		s.sendUnroutableModel(w, r, data.Model)
+	}
+}
+
+// sendUnroutableModel answers a request whose model id no router handles. The
+// bare "no router for requested model" it replaces names nothing, so a gateway
+// in front of the proxy can only report a transport-level failure and the
+// operator has to cross-reference the serving config by hand. This is the one
+// place that holds all three facts, so it states which id was asked for, which
+// ids exist, and which model is resident right now.
+func (s *Server) sendUnroutableModel(w http.ResponseWriter, r *http.Request, requested string) {
+	served := make([]string, 0, len(s.cfg.Models))
+	for id := range s.cfg.Models {
+		served = append(served, id)
+	}
+	sort.Strings(served)
+
+	resident := make([]string, 0, 1)
+	for id, state := range s.local.RunningModels() {
+		if state == process.StateReady {
+			resident = append(resident, id)
+		}
+	}
+	sort.Strings(resident)
+
+	residentTxt := "none"
+	if len(resident) > 0 {
+		residentTxt = strings.Join(resident, ", ")
+	}
+	msg := fmt.Sprintf("no router for requested model %q; served models: %s; resident: %s",
+		requested, strings.Join(served, ", "), residentTxt)
+	s.proxylog.Warnf("dispatch: %s", msg)
+	swaputil.SendResponse(w, r, http.StatusNotFound, msg)
+}
+
+// residentAliasPollInterval is how often awaitResidentAlias re-reads the
+// running set while waiting. 250 ms keeps the added latency on the happy
+// path (a model appears mid-wait) well under a second without hammering the
+// router's process map.
+const residentAliasPollInterval = 250 * time.Millisecond
+
+// awaitResidentAlias is resolveResidentAlias with patience: when the id is a
+// resident alias but nothing is resident or starting, it re-checks every
+// `poll` until `grace` has elapsed or the client goes away. It never loads a
+// model - a box that stays idle for the whole window is still refused, which
+// keeps idle-time housekeeping calls a cheap no-op. A non-alias id is refused
+// at once: the grace is for the alias hole only, not for unknown models.
+func awaitResidentAlias(ctx context.Context, cfg config.Config, running func() map[string]process.ProcessState,
+	requested string, grace, poll time.Duration) (string, bool) {
+	if !cfg.MatchesResidentAlias(requested) {
+		return "", false
+	}
+	if resolved, ok := resolveResidentAlias(cfg, running(), requested); ok {
+		return resolved, true
+	}
+	if grace <= 0 {
+		return "", false
+	}
+	deadline := time.NewTimer(grace)
+	defer deadline.Stop()
+	tick := time.NewTicker(poll)
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			// The client hung up (or its own timeout fired); parking the
+			// handler any longer would only hold a goroutine for nobody.
+			return "", false
+		case <-deadline.C:
+			return "", false
+		case <-tick.C:
+			if resolved, ok := resolveResidentAlias(cfg, running(), requested); ok {
+				return resolved, true
+			}
+		}
 	}
 }
 
 // resolveResidentAlias maps a request whose model id matches a configured
 // residentAliases pattern to the currently-resident local model. Returns
-// false when the id matches no pattern or no local process is ready — it
-// never causes a load. Pure function over its inputs so it is testable
-// without a Server.
+// false when the id matches no pattern or no local process is ready or
+// starting — it never causes a load. A STARTING process counts as the
+// resident-to-be: the request then waits in the router for ready, exactly as
+// a request naming that model would. Refusing during a reload gave a Claude
+// Code subagent (whose every turn arrives under claude-haiku-*) a 0 ms 404
+// per turn while its parent's own turns queued and survived the same reload.
+// Pure function over its inputs so it is testable without a Server.
 func resolveResidentAlias(cfg config.Config, running map[string]process.ProcessState, requested string) (string, bool) {
 	if !cfg.MatchesResidentAlias(requested) {
 		return "", false
 	}
 	ready := make([]string, 0, len(running))
+	starting := make([]string, 0, len(running))
 	for id, state := range running {
-		if state == process.StateReady {
+		switch state {
+		case process.StateReady:
 			ready = append(ready, id)
+		case process.StateStarting:
+			starting = append(starting, id)
 		}
-	}
-	if len(ready) == 0 {
-		return "", false
 	}
 	// Deterministic tie-break when several models are resident (possible in
 	// multi-group configs): smallest id. Single-resident deployments never
 	// hit this.
-	sort.Strings(ready)
-	return ready[0], true
+	if len(ready) > 0 {
+		sort.Strings(ready)
+		return ready[0], true
+	}
+	if len(starting) > 0 {
+		sort.Strings(starting)
+		return starting[0], true
+	}
+	return "", false
 }
 
 // tierNames returns the configured tier names (excluding the implicit
@@ -311,6 +428,15 @@ func stripAudioAPIPrefix(r *http.Request) {
 // routes builds the mux, registers every route, and wraps the mux with the
 // global CORS middleware.
 func (s *Server) routes() {
+	// Wired here rather than in the constructor so every path that builds a
+	// store and then rebuilds the chain (tests included) gets the same
+	// resolver localPeerHandler uses, evaluated per request against the
+	// models resident at that moment (see slotAffinityStore.resolveResident).
+	if s.slotAffinity != nil {
+		s.slotAffinity.resolveResident = func(requested string) (string, bool) {
+			return resolveResidentAlias(s.cfg, s.local.RunningModels(), requested)
+		}
+	}
 
 	authMW := CreateAuthMiddleware(s.cfg)
 	modelChain := chain.New(
@@ -327,6 +453,9 @@ func (s *Server) routes() {
 		CreateInflightMiddleware(s.inflight, s.cfg),
 		CreateFilterMiddleware(s.cfg),
 		CreateFormFilterMiddleware(s.cfg),
+		// After filters (so stripParams cannot undo the injection), before
+		// metrics (so captures show the body the child received).
+		CreateSlotAffinityMiddleware(s.slotAffinity, s.cfg),
 		CreateMetricsMiddleware(s.metrics, s.cfg),
 	)
 	// Custom endpoints only need auth.
@@ -390,6 +519,7 @@ func (s *Server) routes() {
 	mux.Handle("PUT /api/profiles/active", apiChain.ThenFunc(s.handleAPIActiveProfile))
 	mux.Handle("POST /api/inflight/{id}/cancel", apiChain.ThenFunc(s.handleAPICancelInflight))
 	mux.Handle("GET /api/events", apiChain.ThenFunc(s.handleAPIEvents))
+	mux.Handle("GET /api/capacity", apiChain.ThenFunc(s.handleAPICapacity))
 	mux.Handle("GET /api/metrics/activity", apiChain.ThenFunc(s.handleAPIActivity))
 	mux.Handle("GET /api/metrics/stats", apiChain.ThenFunc(s.handleAPIActivityStats))
 	mux.Handle("GET /api/performance", apiChain.ThenFunc(s.handleAPIPerformance))
@@ -398,6 +528,9 @@ func (s *Server) routes() {
 	mux.Handle("GET /api/captures/{id}", apiChain.ThenFunc(s.handleAPICapture))
 	mux.Handle("POST /api/models/pin/{model}", apiChain.ThenFunc(s.handleAPIPin))
 	mux.Handle("POST /api/models/unpin/{model}", apiChain.ThenFunc(s.handleAPIUnpin))
+	mux.Handle("GET /api/swap-grace", apiChain.ThenFunc(s.handleAPISwapGrace))
+	mux.Handle("POST /api/swap-grace/finish", apiChain.ThenFunc(s.handleAPISwapGraceFinish))
+	mux.Handle("GET /api/state-trace", apiChain.ThenFunc(s.handleAPIStateTrace))
 
 	s.mux = mux
 	s.handler = chain.New(CreateRequestLogMiddleware(s.proxylog), CreateCORSMiddleware()).Then(mux)
@@ -426,6 +559,7 @@ func (s *Server) Shutdown(timeout time.Duration) error {
 		return nil
 	}
 	s.shutdownFn()
+	s.slotAffinity.Close()
 
 	var wg sync.WaitGroup
 	var mu sync.Mutex

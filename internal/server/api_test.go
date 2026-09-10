@@ -200,6 +200,9 @@ func TestServer_FindModelInPath(t *testing.T) {
 
 func TestServer_HandleUpstream(t *testing.T) {
 	local := newStubRouter([]string{"m1"}, "upstream-body")
+	// A GET on an unloaded model is answered 503 before dispatch (status
+	// reads never queue a swap); the pass-through case needs a ready model.
+	local.running = map[string]process.ProcessState{"m1": process.StateReady}
 	s := newTestServer(local, newStubRouter(nil, ""))
 	s.cfg = config.Config{Models: map[string]config.ModelConfig{"m1": {}}}
 
@@ -534,8 +537,11 @@ func TestServer_HandleUpstream_IgnorePaths(t *testing.T) {
 			},
 		}
 
+		// POST: the inference path that may queue a load. (A GET on an
+		// unloaded model is a status read and is answered 503 before
+		// ignorePaths is even consulted - see the StatusRead guard.)
 		w := httptest.NewRecorder()
-		s.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/upstream/m1/v1/chat/completions", nil))
+		s.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/upstream/m1/v1/chat/completions", nil))
 
 		if w.Code != http.StatusOK || w.Body.String() != "upstream-body" {
 			t.Fatalf("status=%d body=%q, want 200 'upstream-body'", w.Code, w.Body.String())
@@ -609,6 +615,9 @@ func TestServer_HandleUpstream_MetricsSkipsUnsupportedPath(t *testing.T) {
 
 func TestServer_HandleUpstream_MetricsSkipsGET(t *testing.T) {
 	s := upstreamMetricsServer(t, `{"usage":{}}`)
+	// GET reaches the router only for a ready model (status reads on an
+	// unloaded model are answered 503 before dispatch).
+	s.local.(*stubRouter).running = map[string]process.ProcessState{"m1": process.StateReady}
 
 	w := httptest.NewRecorder()
 	s.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/upstream/m1/v1/chat/completions", nil))
@@ -643,6 +652,8 @@ func TestServer_HandleUpstream_InflightTracksSupportedPaths(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			local := newStubRouter([]string{"m1"}, "ok")
+			// The GET case only reaches the router for a ready model.
+			local.running = map[string]process.ProcessState{"m1": process.StateReady}
 			var s *Server
 			var during swaputil.InFlightRequestsEvent
 			local.serveHTTP = func(w http.ResponseWriter, r *http.Request) {
@@ -1368,14 +1379,15 @@ func TestServer_HandleUpstream_RootLoadGuard(t *testing.T) {
 		}
 	})
 
-	t.Run("GET sub-path is not guarded (only the root load-trigger path is)", func(t *testing.T) {
-		// A GET to a real sub-path (e.g. /v1/models) is not the load-trigger root;
-		// it passes through even when not ready, matching pre-guard behavior.
+	t.Run("GET sub-path is guarded too (a status read never queues a swap)", func(t *testing.T) {
+		// A GET to any sub-path (/v1/models, /slots, /props) on a model that
+		// is not ready is answered 503 here: dispatched, it would sit in the
+		// scheduler queue as a swap request (2026-09-10).
 		s := newGuardServer(nil)
 		w := httptest.NewRecorder()
 		s.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/upstream/m1/v1/models", nil))
-		if w.Code != http.StatusOK || w.Body.String() != "upstream-body" {
-			t.Errorf("status=%d body=%q, want 200/upstream-body (sub-path must pass through)", w.Code, w.Body.String())
+		if w.Code != http.StatusServiceUnavailable {
+			t.Errorf("status=%d body=%q, want 503 (sub-path GET on an unloaded model must not dispatch)", w.Code, w.Body.String())
 		}
 	})
 }

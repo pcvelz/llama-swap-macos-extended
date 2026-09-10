@@ -145,6 +145,19 @@ unloadTimeout: 10
 #   value, 0 disables the grace for that model only)
 swapGraceSeconds: 60
 
+# swapStarvationSeconds: the starvation valve on swapGraceSeconds
+# - optional, default: 0 (the valve opens after the evictee's own grace)
+# - -1 disables the valve: a resident inside its grace is never evicted while
+#   it keeps serving, however long the parked request has waited
+# - N > 0 opens the valve once the parked request has waited N seconds
+# - why it exists: a consumer with a request cadence shorter than the grace
+#   resets the resident's idle clock forever, so the parked request would
+#   starve; the valve caps that wait. But the valve at exactly the grace also
+#   evicts a hot interactive session the instant its turn ends once a parked
+#   request is older than the grace, and that costs the session its whole KV
+#   cache. Pick the side you need per deployment.
+swapStarvationSeconds: 0
+
 # peerStall: reclaim a serving slot from a client that has STOPPED READING its
 # response, e.g. a session the OS has suspended (SIGSTOP) mid-stream.
 # - optional, default: enabled with a 120 second budget
@@ -237,7 +250,9 @@ apiKeys:
 # whichever model is CURRENTLY resident (state ready), instead of a fixed model block
 # - optional, default: []
 # - unlike a static alias this never triggers a load or swap: with nothing
-#   resident the request 404s exactly as before
+#   resident (or loading) for residentAliasGraceSeconds (default 15, 0 = refuse
+#   at once) the request 404s exactly as before; the grace absorbs the seconds
+#   after a restart before the first real-model request has started a load
 # - patterns may not collide with a real model id or a static alias
 # - why: lets a virtual "whatever is already loaded" model id route
 #   housekeeping/orchestrator traffic to the resident model without ever
@@ -424,6 +439,31 @@ models:
     #   gaps between calls) can need a longer grace than its siblings without
     #   raising the grace globally
     swapGraceSeconds: 60
+
+    # slotAffinity: pin each client session to a llama-server slot
+    # - optional, default: false
+    # - llama-swap assigns a slot to the Claude Code session (from
+    #   metadata.user_id) on its first full-size request: the least-loaded
+    #   slot among sessions active in the last 15 minutes, ties to the
+    #   lowest slot id, out of concurrencyLimit slots - this is the primary
+    #   mechanism, since llama-server's Anthropic-format responses never
+    #   carry an id_slot to learn from
+    # - it also still learns the id_slot the child reports on a response
+    #   where the format carries one, refining the assignment; either way
+    #   the slot is injected as id_slot on the session's next request so
+    #   llama.cpp reuses the slot's KV prefix instead of choosing a slot by
+    #   its own LCP heuristic
+    # - a client-supplied id_slot is overridden once a slot has been
+    #   assigned or learned
+    # - the pinned slot is always injected, even when busy (llama.cpp queues
+    #   on it); no /slots probe is made per request
+    # - assigned/learned slots are dropped when the model's process stops
+    # - a response is only learned from once its input reaches 2048 tokens,
+    #   and a slot is only assigned or injected into requests whose body
+    #   reaches 16384 bytes, so a same-session housekeeping call (small on
+    #   both counts) can neither learn nor receive the slot pinned for that
+    #   session's full turns
+    slotAffinity: false
 
     # unloadTimeout: graceful timeout in seconds when unloading this model (manual, API, or ttl expiry)
     # - optional, default: global unloadTimeout

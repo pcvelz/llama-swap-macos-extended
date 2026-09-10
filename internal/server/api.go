@@ -709,7 +709,17 @@ func (s *Server) handleUpstream(w http.ResponseWriter, r *http.Request) {
 		//
 		// The web UI's "Load" button and the macOS menu helper are expected to call
 		// POST /upstream/<model>/ (updated alongside this guard).
-		if (r.Method == http.MethodGet || r.Method == http.MethodHead) && remainingPath == "/" {
+		//
+		// Every GET/HEAD path, not just the root: a status read (/slots,
+		// /props, /metrics, /health) dispatched for a model that is not READY
+		// becomes a queued swap request in the scheduler - it counted as
+		// "waiting" behind the resident's cooldown, flapped as the poller timed
+		// out and re-polled, and could have won the swap (menu-bar helper
+		// polling parked models' /slots every 2s, 2026-09-10). A read on a
+		// model that is LOADING is refused here too: the scheduler would let
+		// it join the swap, but a poller gets a fresh answer on its next tick
+		// anyway and nothing about a load is observable through /slots.
+		if r.Method == http.MethodGet || r.Method == http.MethodHead {
 			states := s.local.RunningModels()
 			if st, ok := states[modelID]; !ok || st != process.StateReady {
 				swaputil.SendResponse(w, r, http.StatusServiceUnavailable,

@@ -301,6 +301,9 @@ groups:
 			Enabled:        true,
 			TimeoutSeconds: 180,
 		},
+		// Seeded when residentAliasGraceSeconds is absent; see
+		// Config.ResidentAliasGraceSeconds.
+		ResidentAliasGraceSeconds: 15,
 		Routing: RoutingConfig{
 			Router: RouterConfig{
 				Use: "group",

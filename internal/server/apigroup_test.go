@@ -720,3 +720,81 @@ func TestServer_Pin_UnknownModel404(t *testing.T) {
 		t.Errorf("pin unknown model status=%d want 404", w.Code)
 	}
 }
+
+// TestServer_HandleAPISwapGrace_EmptyReportsEmptyList asserts a nil
+// Nothing held (a scheduler without cooldown support, or one with nothing
+// queued) is rendered as JSON null under the "cooldown" key.
+func TestServer_HandleAPISwapGrace_NothingHeldIsNull(t *testing.T) {
+	local := newStubRouter(nil, "")
+	s := newTestServer(local, newStubRouter(nil, ""))
+
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api/swap-grace", nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%q", w.Code, w.Body.String())
+	}
+	var body struct {
+		Cooldown *swaputil.Cooldown `json:"cooldown"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if body.Cooldown != nil {
+		t.Errorf("cooldown=%+v want null", body.Cooldown)
+	}
+}
+
+// The endpoint passes the scheduler's single cooldown through and joins the
+// resident's hot slots from the slot-affinity store: the session each slot
+// is being kept warm for, in slot order, one entry per configured slot.
+func TestServer_HandleAPISwapGrace_ReportsCooldownWithHotSlots(t *testing.T) {
+	local := newStubRouter([]string{"cq35"}, "")
+	local.cooldown = &swaputil.Cooldown{EvicteeModel: "cq35", NextModel: "cq35h", Waiting: 2, RemainingSeconds: 90}
+	s := newTestServer(local, newStubRouter(nil, ""))
+	s.cfg = config.Config{Models: map[string]config.ModelConfig{
+		"cq35": {ConcurrencyLimit: 2, SlotAffinity: true},
+	}}
+	s.slotAffinity = newSlotAffinityStore(s.cfg)
+	s.slotAffinity.learn("cq35", "725558cb-session", 0)
+
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api/swap-grace", nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%q", w.Code, w.Body.String())
+	}
+	var body struct {
+		Cooldown *swaputil.Cooldown `json:"cooldown"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	cd := body.Cooldown
+	if cd == nil || cd.EvicteeModel != "cq35" || cd.NextModel != "cq35h" || cd.Waiting != 2 {
+		t.Fatalf("cooldown=%+v want evictee=cq35 next=cq35h waiting=2", cd)
+	}
+	if len(cd.Slots) != 2 {
+		t.Fatalf("slots=%+v want one entry per configured slot (2)", cd.Slots)
+	}
+	if cd.Slots[0].Slot != 0 || cd.Slots[0].SessionID != "725558cb-session" {
+		t.Errorf("slot 0=%+v want owned by 725558cb-session", cd.Slots[0])
+	}
+	if cd.Slots[1].Slot != 1 || cd.Slots[1].SessionID != "" {
+		t.Errorf("slot 1=%+v want free", cd.Slots[1])
+	}
+}
+
+// POST /api/swap-grace/finish ends the singleton cooldown: no model in the
+// path, nothing to resolve, always 200 (a no-op finish is harmless).
+func TestServer_SwapGraceFinish_CallsFinishCooldown(t *testing.T) {
+	local := newStubRouter([]string{"cq35"}, "")
+	s := newTestServer(local, newStubRouter(nil, ""))
+
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/api/swap-grace/finish", nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%q", w.Code, w.Body.String())
+	}
+	if local.finishCalls != 1 {
+		t.Errorf("finishCalls=%d want 1", local.finishCalls)
+	}
+}

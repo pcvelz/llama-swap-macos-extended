@@ -47,6 +47,11 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 		CaptureBuffer:      5,
 		GlobalTTL:          0,
 		UnloadTimeout:      DEFAULT_UNLOAD_TIMEOUT,
+		// Long enough to ride out a restart gap between the listener binding
+		// and the first real-model request starting a load (measured ~4 s on
+		// 2026-09-08), short enough that idle-time housekeeping calls on a
+		// cold box are not held for long.
+		ResidentAliasGraceSeconds: 15,
 		UI: UIConfig{Activity: UIActivityConfig{SessionID: []string{
 			"X-Session-ID",
 			"X-Litellm-Session-Id",
@@ -97,6 +102,14 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 
 	if config.SwapGraceSeconds < 0 {
 		return Config{}, fmt.Errorf("swapGraceSeconds must be >= 0")
+	}
+	if config.ResidentAliasGraceSeconds < 0 {
+		return Config{}, fmt.Errorf("residentAliasGraceSeconds must be >= 0")
+	}
+
+	// -1 is the documented "valve off" sentinel; anything below it is a typo.
+	if config.SwapStarvationSeconds < -1 {
+		return Config{}, fmt.Errorf("swapStarvationSeconds must be >= -1 (-1 disables the starvation valve)")
 	}
 
 	if config.UnloadTimeout < 0 {

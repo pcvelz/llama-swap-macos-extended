@@ -205,6 +205,77 @@ func (s *Server) handleAPIActivityStats(w http.ResponseWriter, r *http.Request) 
 	json.NewEncoder(w).Encode(stats)
 }
 
+// handleAPICapacity reports per-model serving-slot occupancy: granted (holding
+// a slot), limit (the ceiling), and queued (parked waiting for one).
+//
+// This exists because the tracked in-flight count cannot answer "can a new
+// request be served right now". That count includes parked requests, so it
+// reads high precisely when nothing is being served, and consumers that treat
+// it as queue depth report a busy queue on an idle box.
+//
+// A consumer deciding whether to send more work wants granted >= limit. A
+// model absent from the list has neither occupancy nor waiters.
+//
+// Mounted on apiChain, so it is a control-plane path: it never enters
+// admission and never appears as a queue entry of its own.
+func (s *Server) handleAPICapacity(w http.ResponseWriter, r *http.Request) {
+	capacity := s.local.Capacity()
+	if capacity == nil {
+		capacity = []swaputil.ModelCapacity{}
+	}
+	sort.Slice(capacity, func(i, j int) bool { return capacity[i].Model < capacity[j].Model })
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{"capacity": capacity})
+}
+
+// handleAPISwapGrace reports currently active swap-grace holds: for each
+// (requested model, evictee) pair with a request queued behind a swap-grace
+// window, how many requests are waiting and how many seconds remain before
+// the hold ends on its own. Plain GET/JSON (no SSE) so curl and the
+// menu-bar helper can poll it directly.
+//
+// Mounted on apiChain, so it is a control-plane path: it never enters
+// admission and never appears as a queue entry of its own.
+func (s *Server) handleAPISwapGrace(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{"cooldown": s.currentCooldown()})
+}
+
+// currentCooldown is the scheduler's cooldown joined with the resident's
+// hot slots: which session each slot is being kept warm for. The scheduler
+// knows the cooldown; the slot-affinity store knows the slots. Nil (JSON
+// null) when nothing is held. Slots is always a list, never null, so a
+// consumer can iterate it without a nil check.
+func (s *Server) currentCooldown() *swaputil.Cooldown {
+	cd := s.local.Cooldown()
+	if cd == nil {
+		return nil
+	}
+	cd.Slots = []swaputil.HotSlot{}
+	if s.slotAffinity != nil {
+		if mc, ok := s.cfg.Models[cd.EvicteeModel]; ok {
+			cd.Slots = s.slotAffinity.hotSlots(cd.EvicteeModel, mc.ConcurrencyLimit)
+		}
+	}
+	return cd
+}
+
+// handleAPISwapGraceFinish manually ends the current cooldown: the queued
+// swap proceeds at the next scheduling pass (normally within ~1s) instead of
+// waiting out the resident's remaining grace. This is the action behind the
+// menu-bar helper's cooldown row click.
+//
+// Always reports success: FinishCooldown is a no-op when nothing is held,
+// and a client polling /api/swap-grace to decide whether to show the row
+// already knows whether a cooldown exists, so a stricter error path here
+// would only add a race window to check for. There is no model to name:
+// the cooldown is a singleton on the resident.
+func (s *Server) handleAPISwapGraceFinish(w http.ResponseWriter, r *http.Request) {
+	s.local.FinishCooldown()
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"msg": "cooldown finished"})
+}
+
 func parseActivityLimit(raw string) (int, error) {
 	limit, err := strconv.Atoi(raw)
 	if err != nil {
@@ -425,6 +496,7 @@ const (
 	msgTypeInFlight    messageType = "inflight"
 	msgTypeUIConfig    messageType = "uiConfig"
 	msgTypeProfile     messageType = "profileChanged"
+	msgTypeSwapGrace   messageType = "swapGrace"
 )
 
 type messageEnvelope struct {
@@ -502,8 +574,17 @@ func (s *Server) handleAPIEvents(w http.ResponseWriter, r *http.Request) {
 			send(messageEnvelope{Type: msgTypeProfile, Data: string(j)})
 		}
 	}
+	// sendSwapGrace pushes the current cooldown (see handleAPISwapGrace for
+	// the shape). A sibling event to modelStatus rather than a field on it,
+	// since it changes on its own 1s tick (the countdown), not just on
+	// process-state transitions.
+	sendSwapGrace := func() {
+		if j, err := json.Marshal(map[string]any{"cooldown": s.currentCooldown()}); err == nil {
+			send(messageEnvelope{Type: msgTypeSwapGrace, Data: string(j)})
+		}
+	}
 
-	defer event.On(func(e swaputil.ProcessStateChangeEvent) { sendModels() })()
+	defer event.On(func(e swaputil.ProcessStateChangeEvent) { sendModels(); sendSwapGrace() })()
 	defer event.On(func(e swaputil.ConfigFileChangedEvent) { sendModels() })()
 	defer event.On(func(e swaputil.ProfileChangedEvent) {
 		sendProfile()
@@ -521,6 +602,14 @@ func (s *Server) handleAPIEvents(w http.ResponseWriter, r *http.Request) {
 	sendUIConfig()
 	sendProfile()
 	sendInFlight(s.inflight.Current())
+	sendSwapGrace()
+
+	// Swap-grace holds carry a countdown (RemainingSeconds), which drifts
+	// even with no state-change event to hang a push off of -- so tick it on
+	// a timer, matching the router's own 1s OnTick cadence (base.go
+	// graceTick) that lets a grace-deferred swap re-evaluate.
+	graceTicker := time.NewTicker(time.Second)
+	defer graceTicker.Stop()
 
 	for {
 		select {
@@ -528,6 +617,8 @@ func (s *Server) handleAPIEvents(w http.ResponseWriter, r *http.Request) {
 			return
 		case <-s.shutdownCtx.Done():
 			return
+		case <-graceTicker.C:
+			sendSwapGrace()
 		case msg := <-sendBuffer:
 			data, err := json.Marshal(msg)
 			if err != nil {

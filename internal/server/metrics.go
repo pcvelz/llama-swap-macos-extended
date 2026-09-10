@@ -51,6 +51,10 @@ type metricsMonitor struct {
 	logger         *logmon.Monitor
 	enableCaptures bool
 	captureCache   *cache.Cache // zstd-compressed CBOR of ReqRespCapture
+
+	// affinity, when set, learns (session_id -> slot_id) from every finished
+	// entry for models with slotAffinity enabled (slot_affinity.go). nil-safe.
+	affinity *slotAffinityStore
 }
 
 func newMetricsMonitor(logger *logmon.Monitor, maxMetrics int, captureBufferMB int, st *store.Store) *metricsMonitor {
@@ -236,6 +240,10 @@ func (mp *metricsMonitor) record(modelID string, r *http.Request, recorder *resp
 	} else {
 		mp.logger.Warnf("metrics: invalid JSON in response body path=%s, recording minimal metrics", r.URL.Path)
 	}
+
+	// Slot affinity learns from the finished entry: model + session_id (from
+	// the request context) + slot_id (merged from the response above).
+	mp.affinity.learnFromEntry(tm)
 
 	stored, ok := mp.queueMetrics(tm)
 	if !ok {

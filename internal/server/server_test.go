@@ -33,6 +33,9 @@ type stubRouter struct {
 	loggers       map[string]*logmon.Monitor
 	lastUseMap    map[string]time.Time
 	pinned        map[string]time.Time // deadline; zero value = permanent pin
+	capacity      []swaputil.ModelCapacity
+	cooldown      *swaputil.Cooldown
+	finishCalls   int
 }
 
 func newStubRouter(models []string, response string) *stubRouter {
@@ -68,6 +71,11 @@ func (s *stubRouter) ProcessLogger(modelID string) (*logmon.Monitor, bool) {
 	}
 	return nil, false
 }
+
+// capacity is what Capacity() returns; nil models a scheduler that does not
+// report capacity, which is a valid state the handler must render as empty.
+func (s *stubRouter) Capacity() []swaputil.ModelCapacity { return s.capacity }
+
 func (s *stubRouter) ProcessLastUse(modelID string) (time.Time, bool) {
 	if s.lastUseMap != nil {
 		if t, ok := s.lastUseMap[modelID]; ok {
@@ -107,6 +115,19 @@ func (s *stubRouter) PinExpiry(modelID string) (time.Time, bool) {
 	return s.pinned[modelID], true
 }
 
+// cooldown is what Cooldown() returns; nil models a scheduler that does not
+// report cooldowns or holds nothing, which the handler renders as null.
+func (s *stubRouter) Cooldown() *swaputil.Cooldown {
+	if s.cooldown == nil {
+		return nil
+	}
+	c := *s.cooldown
+	return &c
+}
+
+// FinishCooldown just counts the call so tests can assert on it.
+func (s *stubRouter) FinishCooldown() { s.finishCalls++ }
+
 // newTestServer wires a Server with stub routers and a built mux.
 func newTestServer(local router.LocalRouter, peer router.Router) *Server {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -128,6 +149,8 @@ func newTestServer(local router.LocalRouter, peer router.Router) *Server {
 		shutdownCtx: ctx,
 		shutdownFn:  cancel,
 	}
+	s.slotAffinity = newSlotAffinityStore(s.cfg)
+	s.metrics.affinity = s.slotAffinity
 	s.routes()
 	return s
 }

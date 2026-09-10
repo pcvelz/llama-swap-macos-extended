@@ -153,6 +153,23 @@ type Config struct {
 	// the resident drains (upstream behaviour).
 	SwapGraceSeconds int `yaml:"swapGraceSeconds"`
 
+	// SwapStarvationSeconds sets the swap-grace starvation valve: how long a
+	// request parked behind a resident's swapGraceSeconds may wait before the
+	// grace is deemed served and the resident is evicted at the next drain gap
+	// even though it has NOT been idle for its grace. Without the valve a
+	// consumer whose request cadence is shorter than the grace defers every
+	// cross-model request forever (witnessed 2026-07-15). Without a knob the
+	// valve evicts a hot interactive session the instant its turn ends once a
+	// parked request has aged past the grace (witnessed 2026-09-08: a pinned
+	// cq35h lost its 116k-token KV to a background request that then failed).
+	//   0 (default) = the valve opens after the evictee's own grace (historic)
+	//  -1           = the valve never opens: a resident inside its grace is
+	//                 never evicted while it keeps serving
+	//   N > 0       = the valve opens once the parked request has waited N s
+	// Global only, on purpose: a per-model asymmetry is exactly what made
+	// swapGraceSeconds bite (llama-cm llama-swap.yaml, swapGraceSeconds note).
+	SwapStarvationSeconds int `yaml:"swapStarvationSeconds"`
+
 	Models    map[string]ModelConfig    `yaml:"models"` /* key is model ID */
 	Profiles  map[string]ProfileConfig  `yaml:"profiles"`
 	Selectors map[string]SelectorConfig `yaml:"selectors"`
@@ -193,6 +210,17 @@ type Config struct {
 	// as before. Patterns may not collide with a real model id or static
 	// alias — a shadowed resident alias would be dead config.
 	ResidentAliases []string `yaml:"residentAliases"`
+
+	// ResidentAliasGraceSeconds: how long a resident-alias request waits for
+	// SOME model to become resident or start loading before it is refused
+	// with the 404. Without it a restart hiccup of a few seconds killed a
+	// Claude Code subagent whose parent survived: the parent's turn names a
+	// real model and triggers the load, the subagent's claude-haiku-* turn
+	// arrived one second earlier, saw nothing resident, and got a 0 ms 404
+	// that Claude Code treats as fatal (witnessed 2026-09-08 19:13:46).
+	// The wait never loads anything itself; an idle box still 404s once the
+	// window closes. Default 15; 0 = refuse immediately (historic).
+	ResidentAliasGraceSeconds int `yaml:"residentAliasGraceSeconds"`
 
 	// menu-bar (macOS) / system-tray (Windows, Linux) helper; accepts a bool
 	// (legacy) or a mapping with `enabled` and `bars`, see MenuBarConfig.

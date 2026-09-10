@@ -1205,3 +1205,90 @@ func TestFIFO_KVAdmission_OversizedSingleRequestAdmittedAlone(t *testing.T) {
 		t.Fatalf("nothing should have parked, len=%d", len(s.queued))
 	}
 }
+
+// withLargePrefillThreshold lowers the package-level largePrefillThreshold for a
+// test and restores it after, so the large-prefill serialization gate can be
+// exercised with small token counts. Tests in this package run serially (none
+// call t.Parallel), so mutating the global here is safe.
+func withLargePrefillThreshold(t *testing.T, v int) {
+	t.Helper()
+	prev := largePrefillThreshold
+	largePrefillThreshold = v
+	t.Cleanup(func() { largePrefillThreshold = prev })
+}
+
+// TestFIFO_KVAdmission_TwoLargePrefillsSerialize covers case (a): two LARGE
+// prefills never co-schedule even when their summed estimate fits the pool
+// (the OOM/cache-thrash case). The second parks until the first frees, then is
+// granted. Pool here is huge on purpose: the summed-token check alone would
+// admit both, so it is the serialization gate — not the pool sum — that parks
+// the second.
+func TestFIFO_KVAdmission_TwoLargePrefillsSerialize(t *testing.T) {
+	withLargePrefillThreshold(t, 100)
+	eff := newFakeEffects()
+	eff.states["cq27"] = process.StateReady
+	s := newFIFOKV(eff, map[string]int{"cq27": 1_000_000})
+
+	s.OnRequest(reqTokens("cq27", 200)) // first large -> admitted (nothing in flight)
+	if got := eff.served("cq27"); got != 1 {
+		t.Fatalf("first large prefill should be admitted, served=%d want 1", got)
+	}
+
+	s.OnRequest(reqTokens("cq27", 200)) // second large -> must serialize (park) despite fitting the pool
+	if got := eff.served("cq27"); got != 1 {
+		t.Fatalf("second large prefill must park (serialize), served=%d want 1", got)
+	}
+	if len(s.queued) != 1 {
+		t.Fatalf("parked large request should sit in the normal queue, len=%d want 1", len(s.queued))
+	}
+
+	s.OnServeDone(ServeDoneEvent{ModelID: "cq27", EstimatedTokens: 200})
+	if got := eff.served("cq27"); got != 2 {
+		t.Fatalf("parked large request should forward once the first frees, served=%d want 2", got)
+	}
+	if len(s.queued) != 0 {
+		t.Fatalf("queue should have drained, len=%d want 0", len(s.queued))
+	}
+}
+
+// TestFIFO_KVAdmission_LargePlusSmallStayConcurrent covers case (b): while a
+// large prefill holds a slot, a SMALL request still rides the second slot
+// concurrently — the serialization gate applies only to large arrivals.
+func TestFIFO_KVAdmission_LargePlusSmallStayConcurrent(t *testing.T) {
+	withLargePrefillThreshold(t, 100)
+	eff := newFakeEffects()
+	eff.states["cq27"] = process.StateReady
+	s := newFIFOKV(eff, map[string]int{"cq27": 1_000_000})
+
+	s.OnRequest(reqTokens("cq27", 200)) // large, admitted
+	s.OnRequest(reqTokens("cq27", 10))  // small (< threshold) -> concurrent, not parked
+
+	if got := eff.served("cq27"); got != 2 {
+		t.Fatalf("small request must ride the second slot concurrently, served=%d want 2", got)
+	}
+	if len(s.queued) != 0 {
+		t.Fatalf("nothing should have parked, len=%d want 0", len(s.queued))
+	}
+}
+
+// TestFIFO_KVAdmission_LargeSerializationClearsAfterRelease guards the
+// grant/release symmetry of the large-prefill counter: once the first large
+// prefill is released, a subsequent large arrival is admitted immediately
+// (the counter returned to 0), not parked forever.
+func TestFIFO_KVAdmission_LargeSerializationClearsAfterRelease(t *testing.T) {
+	withLargePrefillThreshold(t, 100)
+	eff := newFakeEffects()
+	eff.states["cq27"] = process.StateReady
+	s := newFIFOKV(eff, map[string]int{"cq27": 1_000_000})
+
+	s.OnRequest(reqTokens("cq27", 300))                                  // large, admitted
+	s.OnServeDone(ServeDoneEvent{ModelID: "cq27", EstimatedTokens: 300}) // frees; counter back to 0
+
+	s.OnRequest(reqTokens("cq27", 300)) // next large must NOT be blocked by a stale counter
+	if got := eff.served("cq27"); got != 2 {
+		t.Fatalf("large request after a clean release must be admitted, served=%d want 2", got)
+	}
+	if len(s.queued) != 0 {
+		t.Fatalf("nothing should have parked, len=%d want 0", len(s.queued))
+	}
+}

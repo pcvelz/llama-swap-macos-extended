@@ -26,6 +26,25 @@ import (
 // router. It is an alias for swaputil.ErrNoLocalModelFound.
 var ErrModelNotFound = swaputil.ErrNoLocalModelFound
 
+// Park reasons, stamped on a queued request's live in-flight entry as
+// `park_reason` (see FIFO.markParked) so a PARKED row can say why. One per
+// enqueue decision in OnRequest/drainQueue; the vocabulary is the set of
+// states observed by hand on the live box (llama-cm
+// docs/research/2026-09-10-cooldown-dogfood-ledger.md).
+const (
+	ParkCap           = "cap"            // the model's concurrency limit is reached
+	ParkKV            = "kv"             // the KV-pool admission holds it
+	ParkBusy          = "busy"           // the resident it would evict has requests in flight
+	ParkCooldown      = "cooldown"       // the resident it would evict is idle inside its swap-grace
+	ParkLoading       = "loading"        // its model's swap is in progress; it joined the waiters
+	ParkRank          = "rank"           // a higher-rank request is queued ahead (rank barrier)
+	ParkSwapCollision = "swap-collision" // collides with another model's in-flight swap
+)
+
+// ErrModelNotLoaded is granted to a ConcurrencyExempt (status read) request
+// whose model is neither ready nor loading: a read never queues a swap.
+var ErrModelNotLoaded = swaputil.ErrModelNotLoaded
+
 // Swapper is the eviction policy: it decides which running models must be
 // stopped before a target can serve. It is orthogonal to the scheduling
 // strategy — any Scheduler works with any Swapper.
@@ -108,7 +127,9 @@ func New(conf config.Config, name string, logger *logmon.Monitor, planner Swappe
 	}
 	switch use {
 	case "fifo":
-		return NewFIFO(name, logger, planner, conf.Routing.Scheduler.Settings.Fifo, conf.Models, eff), nil
+		s := NewFIFO(name, logger, planner, conf.Routing.Scheduler.Settings.Fifo, conf.Models, eff)
+		s.SetSwapStarvationSeconds(conf.SwapStarvationSeconds)
+		return s, nil
 	default:
 		return nil, fmt.Errorf("unsupported scheduler type: %q", use)
 	}
@@ -143,6 +164,19 @@ type HandlerReq struct {
 	// count_tokens calls, which hold no model slot. Set by
 	// baseRouter.ServeHTTP; false for every ordinary inference request.
 	ConcurrencyExempt bool
+
+	// StatusRead marks a GET/HEAD status read (/slots, /props, /metrics,
+	// /health under /upstream/<model>/). Such a read is answered only by a
+	// model that is ready or already loading; it is never allowed to queue
+	// or win a swap (OnRequest step 1a). Set by baseRouter.ServeHTTP.
+	StatusRead bool
+
+	// parkReason is the last reason stamped on this request's in-flight
+	// entry (one of the Park* constants, "" when granted or never parked).
+	// Kept on the queued value so markParked stamps only on CHANGE: every
+	// stamp is an SSE upsert, and drainQueue revisits every queued request
+	// once a second.
+	parkReason string
 
 	// Preempted, when non-nil, is set to true by Preempt just before it
 	// cancels this request's serving context. Only populated on requests

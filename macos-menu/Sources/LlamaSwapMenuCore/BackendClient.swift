@@ -42,8 +42,10 @@ public final class BackendClient: ObservableObject {
     /// sessionTitlesPath overrides where cm-menu's published titles are read
     /// from; the default is the one path cm-menu writes. Tests point it at a
     /// temporary file.
-    public init(baseURL: URL? = nil, sessionTitlesPath: String? = nil) {
+    public init(baseURL: URL? = nil, sessionTitlesPath: String? = nil,
+                laneLingerSeconds: TimeInterval = BackendClient.defaultLaneLingerSeconds) {
         self.baseURL = baseURL ?? Self.defaultBaseURL()
+        self.laneLingerSeconds = laneLingerSeconds
         self.titleStore = SessionTitleStore(path: sessionTitlesPath)
         self.bars = BarMetric.parseList(ProcessInfo.processInfo.environment["LLAMA_SWAP_MENU_BARS"])
         // Size the initial bar values to the configured bar count so the icon
@@ -217,6 +219,33 @@ public final class BackendClient: ObservableObject {
     /// holds on purpose: the user sees one readout, not two fields.
     private static let rateHoldSeconds: TimeInterval = 5.0
 
+    /// How long a lane's ROW stays on screen after its last request is
+    /// removed. A Claude Code session in its tool loop has exactly one
+    /// request on the proxy per turn: it ends, the client runs a tool for
+    /// 1-3s (measured on the live box 2026-09-09, /slots at 1Hz), then the
+    /// next turn's request arrives. Without this window the lane empties, the
+    /// row vanishes, and it is re-appended and re-sorted a beat later - rows
+    /// disappearing and reappearing on every single turn. 10s covers an
+    /// ordinary Bash/Read tool call with headroom; a longer absence means the
+    /// session genuinely left the box and the row SHOULD go, so this is
+    /// deliberately not generous. The holds above cover the readout NUMBERS
+    /// across the same gap; this one covers the row's existence.
+    public static let defaultLaneLingerSeconds: TimeInterval = 10.0
+    /// Injectable so tests can exercise expiry without sleeping the real
+    /// window; production always uses the default above.
+    public let laneLingerSeconds: TimeInterval
+
+    /// Lanes with no in-flight request that are still being rendered, with
+    /// the row as it last looked and the moment its last request went away.
+    private var lingeringLanes: [String: (row: SessionRow, since: Date)] = [:]
+    /// The last row each lane rendered, so a lane that empties has something
+    /// to linger WITH (position, origin, model, tier, title, parent/agent).
+    private var lastRowByLane: [String: SessionRow] = [:]
+    /// Fires the expiry sweep even when no further SSE event arrives - a
+    /// session that left the box produces no events at all, so an
+    /// event-driven sweep alone would strand its row forever.
+    private var lingerTimer: Timer?
+
     private final class EventSourceDelegate: NSObject, URLSessionDataDelegate {
         var onEvent: (String) -> Void
         var reconnect: (() -> Void)?
@@ -279,8 +308,8 @@ public final class BackendClient: ObservableObject {
             }
         case "swapGrace":
             if let inner = envelope.data.data(using: .utf8),
-               let payload = try? JSONDecoder().decode(SwapGracePayload.self, from: inner) {
-                menuState.graceHolds = payload.holds
+               let payload = try? JSONDecoder().decode(CooldownPayload.self, from: inner) {
+                menuState.cooldown = payload.cooldown
             }
         default:
             break
@@ -327,7 +356,21 @@ public final class BackendClient: ObservableObject {
             if let current = newestByLane[lane], (Int(current.id) ?? 0) >= id { continue }
             newestByLane[lane] = entry
         }
-        laneOrder.removeAll { newestByLane[$0] == nil }
+        // LANE LINGER. A lane that just lost its last request is between
+        // turns, not gone: keep it in laneOrder (so it holds its position and
+        // nothing re-sorts) with the row it last rendered, until the window
+        // expires. A lane whose request came back stops lingering at once and
+        // is rendered from live data again - the row is reused in place, so
+        // the user never sees a removal or an append. Applies to "snapshot"
+        // too: a snapshot that no longer lists a lane is the same event as a
+        // remove, just delivered wholesale.
+        for lane in laneOrder where newestByLane[lane] == nil && lingeringLanes[lane] == nil {
+            guard let row = lastRowByLane[lane] else { continue }
+            lingeringLanes[lane] = (row: row, since: now)
+        }
+        for lane in newestByLane.keys { lingeringLanes[lane] = nil }
+        expireLingeringLanes(now: now)
+        laneOrder.removeAll { newestByLane[$0] == nil && lingeringLanes[$0] == nil }
         // A lane new to the list joins in the order it first APPEARED (its
         // oldest open request), not by its newest request - otherwise a
         // parent whose next turn arrived after its subagent's would jump
@@ -337,8 +380,19 @@ public final class BackendClient: ObservableObject {
             laneOrder.append(lane)
         }
         menuState.sessionRows = laneOrder
-            .compactMap { newestByLane[$0] }
-            .map { entry in
+            .compactMap { lane -> SessionRow? in
+                // A lingering lane has no entry to classify: re-render the
+                // row it last showed, with the honest between-turns word and
+                // whatever readout it carried. Its position in laneOrder is
+                // untouched, so the row does not move.
+                guard let entry = newestByLane[lane] else {
+                    guard let held = lingeringLanes[lane]?.row else { return nil }
+                    return SessionRow(
+                        id: held.id, origin: held.origin, model: held.model,
+                        tier: held.tier, word: ThroughputWord.turn.rawValue,
+                        detail: held.detail, hasSession: held.hasSession,
+                        title: held.title, parent: held.parent, agent: held.agent)
+                }
                 let meta = entry.metadata ?? [:]
                 let sessionID = meta["session_id"]
                 let origin = SessionOrigin.label(
@@ -368,7 +422,11 @@ public final class BackendClient: ObservableObject {
                 // request never seeds a stale sample that would misclassify
                 // it the moment it is granted and starts producing bytes.
                 guard meta["kv_parked"] != "1", meta["slot_granted"] == "1" else {
-                    return row(ThroughputWord.parked.rawValue, nil)
+                    // The reason the scheduler stamped (park_reason), so the
+                    // row says "PARKED · slots full" / "· cooldown" / "·
+                    // loading" instead of a bare PARKED nobody can act on.
+                    return row(ThroughputWord.parked.rawValue,
+                               MenuState.parkDetail(reason: meta["park_reason"], kvParked: meta["kv_parked"] == "1"))
                 }
                 let word = throughputTracker.word(
                     forRequestID: entry.id, respBytes: entry.respBytes, elapsedMs: entry.elapsedMs, now: now)
@@ -382,7 +440,70 @@ public final class BackendClient: ObservableObject {
         // id, same lane) re-shows the lane's last readout instead of a blank
         // until the next /slots poll answers.
         refreshSlotDetails(now: now)
+        recordLaneRows()
+        scheduleLingerSweep()
         syncSlotPolling()
+    }
+
+    /// Remembers each rendered row against its lane so a lane that empties
+    /// has something to linger WITH. A lane already lingering is skipped: its
+    /// stored row is the last LIVE one, and re-storing the TURN row would
+    /// make that word stick to the lane after its next turn starts.
+    private func recordLaneRows() {
+        guard laneOrder.count == menuState.sessionRows.count else { return }
+        for (lane, row) in zip(laneOrder, menuState.sessionRows) where lingeringLanes[lane] == nil {
+            lastRowByLane[lane] = row
+        }
+        let known = Set(laneOrder)
+        lastRowByLane = lastRowByLane.filter { known.contains($0.key) }
+    }
+
+    /// Drops lanes whose linger window has run out. Silent when nothing has
+    /// expired, so it is safe to call on every event and every sweep tick.
+    private func expireLingeringLanes(now: Date) {
+        lingeringLanes = lingeringLanes.filter { now.timeIntervalSince($0.value.since) <= laneLingerSeconds }
+    }
+
+    /// Expiry must fire with NO further SSE events: a session that left the
+    /// box stops producing events entirely, so an event-driven sweep alone
+    /// would strand its row on screen forever. The timer only exists while
+    /// something is lingering, and stops as soon as the last one resolves.
+    private func scheduleLingerSweep() {
+        guard !lingeringLanes.isEmpty else {
+            lingerTimer?.invalidate()
+            lingerTimer = nil
+            return
+        }
+        guard lingerTimer == nil else { return }
+        // Sub-window ticks so a row disappears close to the window rather
+        // than up to a whole window late. .common for the same reason as the
+        // slot timer: an open menu's tracking loop does not run .default.
+        let interval = max(0.2, laneLingerSeconds / 4)
+        let timer = Timer(timeInterval: interval, repeats: true) { [weak self] _ in
+            self?.sweepLingeringLanes()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        lingerTimer = timer
+    }
+
+    private func sweepLingeringLanes() {
+        let before = Set(lingeringLanes.keys)
+        expireLingeringLanes(now: Date())
+        defer { scheduleLingerSweep() }
+        guard before != Set(lingeringLanes.keys) else { return }
+        guard laneOrder.count == menuState.sessionRows.count else { return }
+        let live = Set(inflightEntries.values.map { Self.laneKey(for: $0) })
+        var keptLanes: [String] = []
+        var keptRows: [SessionRow] = []
+        for (lane, row) in zip(laneOrder, menuState.sessionRows)
+        where live.contains(lane) || lingeringLanes[lane] != nil {
+            keptLanes.append(lane)
+            keptRows.append(row)
+        }
+        laneOrder = keptLanes
+        menuState.sessionRows = keptRows
+        let known = Set(laneOrder)
+        lastRowByLane = lastRowByLane.filter { known.contains($0.key) }
     }
 
     /// Poll `/slots` only while there is inflight work; one GET per distinct
@@ -440,7 +561,12 @@ public final class BackendClient: ObservableObject {
     }
 
     private func pollSlots() {
-        let models = Set(inflightEntries.values.map { Self.slotModel(for: $0) })
+        // Only entries that hold a slot have slots to read. A PARKED entry's
+        // model is by definition not resident; polling its /slots is answered
+        // 503 by the proxy now, and before that fix every such poll sat in
+        // the scheduler queue as a swap request for 2-4s (2026-09-10). Not
+        // sending it at all keeps the swap log clean.
+        let models = Set(inflightEntries.values.filter { !Self.isParked($0) }.map { Self.slotModel(for: $0) })
         for model in models {
             let escaped = model.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? model
             let url = baseURL.appendingPathComponent("/upstream/\(escaped)/slots")
@@ -476,7 +602,11 @@ public final class BackendClient: ObservableObject {
     private func refreshSlotDetails(now: Date = Date()) {
         menuState.sessionRows = menuState.sessionRows.map { row in
             guard let entry = inflightEntries[row.id] else { return row }
-            let detail = slotDetail(for: entry, word: row.word, now: now)
+            // A PARKED row's detail is its park reason, not a slot readout:
+            // keep it, there is no slot to read for it.
+            let detail = row.word == ThroughputWord.parked.rawValue
+                ? row.detail
+                : slotDetail(for: entry, word: row.word, now: now)
             var word = row.word
             if word == ThroughputWord.prefill.rawValue || word == ThroughputWord.decode.rawValue,
                let phase = slotPhases[Self.laneKey(for: entry)] {
@@ -638,32 +768,31 @@ public final class BackendClient: ObservableObject {
         URLSession.shared.dataTask(with: request) { _, _, _ in }.resume()
     }
 
-    /// Ends `reqModel`'s current swap-grace hold immediately - the menu's
-    /// cooldown row click. The row clears optimistically the moment the click
-    /// lands (the click IS the operator unarming the hold; waiting for the
-    /// next swapGrace SSE tick reads as a dead click), and SSE re-adds it
-    /// within ~1s if the hold genuinely persists. A failed POST restores the
-    /// row and surfaces the error: a dead click and a successful one must
-    /// never look identical (witnessed 2026-09-09).
-    public func finishGrace(reqModel: String) {
-        let removed = menuState.graceHolds.filter { $0.requestedModel == reqModel }
-        menuState.graceHolds.removeAll { $0.requestedModel == reqModel }
+    /// Ends the current cooldown immediately - the menu's cooldown row click.
+    /// The row clears optimistically the moment the click lands (the click IS
+    /// the operator ending the cooldown; waiting for the next swapGrace SSE
+    /// tick reads as a dead click), and SSE re-adds it within ~1s if the
+    /// cooldown genuinely persists. A failed POST restores the row and
+    /// surfaces the error: a dead click and a successful one must never look
+    /// identical (witnessed 2026-09-09). There is no model to name: the
+    /// cooldown is a singleton on the resident.
+    public func finishCooldown() {
+        let removed = menuState.cooldown
+        menuState.cooldown = nil
 
-        let escaped = reqModel.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? reqModel
-        var request = URLRequest(url: baseURL.appendingPathComponent("/api/swap-grace/finish/\(escaped)"))
+        var request = URLRequest(url: baseURL.appendingPathComponent("/api/swap-grace/finish"))
         request.httpMethod = "POST"
         URLSession.shared.dataTask(with: request) { [weak self] _, response, error in
             let status = (response as? HTTPURLResponse)?.statusCode ?? 0
             let failed = error != nil || status < 200 || status >= 300
             guard failed, let self else { return }
             DispatchQueue.main.async {
-                // Restore only what this click removed and only if SSE has not
-                // already re-published the hold in the meantime.
-                let stillMissing = removed.filter { gone in
-                    !self.menuState.graceHolds.contains { $0.id == gone.id }
+                // Restore only if SSE has not already re-published a cooldown
+                // in the meantime.
+                if self.menuState.cooldown == nil {
+                    self.menuState.cooldown = removed
                 }
-                self.menuState.graceHolds.append(contentsOf: stillMissing)
-                self.menuState.lastSwitchError = "unarm cooldown for \(reqModel) failed"
+                self.menuState.lastSwitchError = "finish cooldown failed"
             }
         }.resume()
     }

@@ -96,8 +96,8 @@ final class InflightRequestsTests: XCTestCase {
         return cond()
     }
 
-    private func makeClient() -> BackendClient {
-        let client = BackendClient(baseURL: stub.baseURL)
+    private func makeClient(laneLingerSeconds: TimeInterval = BackendClient.defaultLaneLingerSeconds) -> BackendClient {
+        let client = BackendClient(baseURL: stub.baseURL, laneLingerSeconds: laneLingerSeconds)
         XCTAssertTrue(waitUntil { self.stub.hasEventClient },
                       "client never opened the /api/events stream")
         return client
@@ -176,8 +176,13 @@ final class InflightRequestsTests: XCTestCase {
                       "expected a clean PARKED->DECODE transition once granted with bytes, got \(client.menuState.sessionRows.first?.word ?? "<none>")")
     }
 
-    func testRemoveOperationClearsSessionRow() {
-        let client = makeClient()
+    /// A removed request no longer clears its row INSTANTLY: the lane lingers
+    /// for a window first, because a Claude Code client's turn boundary
+    /// removes the lane's only request for 1-3s while it runs a tool (see
+    /// LaneLingerTests). The row must still be gone once the window expires -
+    /// that is what this test pins, with a short injected window.
+    func testRemoveOperationLingersThenClearsSessionRow() {
+        let client = makeClient(laneLingerSeconds: 0.6)
         let upsertInner = """
         {"total":1,"operation":"upsert",\
         "request":{"id":"9","timestamp":"2026-09-02T13:21:00Z","model":"cq35",\
@@ -191,8 +196,11 @@ final class InflightRequestsTests: XCTestCase {
         {"total":0,"operation":"remove","id":"9"}
         """
         stub.pushEvent(type: "inflight", inner: removeInner)
+        RunLoop.main.run(until: Date().addingTimeInterval(0.1))
+        XCTAssertEqual(client.menuState.sessionRows.first?.word, "TURN",
+                       "the lane lingers as between-turns first, got \(client.menuState.sessionRows.map(\.displayLine))")
         XCTAssertTrue(waitUntil { client.menuState.sessionRows.isEmpty },
-                      "a removed request must not linger in sessionRows")
+                      "a removed request must not outlive the linger window")
         XCTAssertTrue(client.menuState.queueRows.isEmpty)
     }
 

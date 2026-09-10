@@ -91,20 +91,27 @@ public struct MenuView: View {
                 .disabled(true)
         }
 
-        // One row per active swap-grace hold (llama-cm llama-swap.yaml
-        // swapGraceSeconds) - a request parked waiting for a resident model
-        // to finish its grace window before it can be evicted. Clicking ends
-        // the hold immediately (BackendClient.finishGrace) instead of making
-        // the operator wait it out or guess why a model switch is stuck.
-        // Hidden entirely when nothing is held - state.graceHolds is empty
-        // the overwhelming majority of the time.
-        ForEach(state.graceHolds) { hold in
+        // The cooldown (llama-cm llama-swap.yaml swapGraceSeconds): the
+        // resident is idle inside its grace, and the swap to the next model
+        // waits for it. ONE row, naming the model that is cooling down and
+        // the one that loads next. Clicking ends the cooldown immediately
+        // (BackendClient.finishCooldown) instead of making the operator wait
+        // it out or guess why a model switch is stuck. Beneath it, the
+        // resident's slots with the session each is kept warm for - the
+        // cooldown exists to protect exactly those, so they must stay visible
+        // like an active slot would be. Hidden entirely when nothing is held.
+        if let cd = state.cooldown {
             Button {
-                client.finishGrace(reqModel: hold.requestedModel)
+                client.finishCooldown()
             } label: {
-                Text("Cooldown: \(modelLabel(for: hold.requestedModel, in: state.models))"
-                    + " waiting for \(modelLabel(for: hold.evicteeModel, in: state.models))"
-                    + "  (\(CompactFormatter.countdown(hold.remainingSeconds)))")
+                Text(MenuState.cooldownLabel(cd,
+                                             resident: modelLabel(for: cd.evicteeModel, in: state.models),
+                                             next: modelLabel(for: cd.nextModel, in: state.models)))
+            }
+            ForEach(cd.slots) { slot in
+                Text(MenuState.hotSlotLabel(slot))
+                    .foregroundStyle(slot.sessionId.isEmpty ? .secondary : .primary)
+                    .disabled(true)
             }
         }
 
