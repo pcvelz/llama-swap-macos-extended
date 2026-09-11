@@ -558,8 +558,8 @@ func TestProcessCommand_TTL_StopsAfterIdle(t *testing.T) {
 		t.Fatalf("expected StateReady, got %s", got)
 	}
 
-	// Make one request to prime the last-use timestamp.
-	req := httptest.NewRequest("GET", "/", nil)
+	// Make one real (POST) request to prime the last-use timestamp.
+	req := httptest.NewRequest("POST", "/", nil)
 	rr := httptest.NewRecorder()
 	p.ServeHTTP(rr, req)
 	if rr.Code != http.StatusOK {
@@ -617,10 +617,12 @@ func TestProcessCommand_TTL_ResetsOnRequest(t *testing.T) {
 	}()
 
 	// Keep sending requests for 1.5s — past the 1s TTL — and verify
-	// the process never stops while traffic is flowing.
+	// the process never stops while traffic is flowing. POST: a GET is a
+	// status read and deliberately does not reset the TTL
+	// (status_read_ttl_test.go).
 	stopAt := time.Now().Add(1500 * time.Millisecond)
 	for time.Now().Before(stopAt) {
-		req := httptest.NewRequest("GET", "/", nil)
+		req := httptest.NewRequest("POST", "/", nil)
 		rr := httptest.NewRecorder()
 		p.ServeHTTP(rr, req)
 		if rr.Code != http.StatusOK {

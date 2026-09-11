@@ -900,9 +900,17 @@ func (p *ProcessCommand) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		(*fn)(w, r)
 		return
 	}
+	// A status read still counts in flight for its milliseconds, so the TTL
+	// never stops the process mid-response, but it is not use: stamping
+	// lastUse for it let every /slots or /health poller hold an idle model
+	// past its TTL indefinitely (the scheduler's cooldown clock ignores the
+	// same reads, see swaputil.IsStatusRead).
+	statusRead := swaputil.IsStatusRead(r)
 	p.inflight.Add(1)
 	defer func() {
-		p.lastUse.Store(time.Now().UnixNano())
+		if !statusRead {
+			p.lastUse.Store(time.Now().UnixNano())
+		}
 		p.inflight.Add(-1)
 	}()
 	(*fn)(w, r)

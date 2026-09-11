@@ -1115,8 +1115,7 @@ func (b *baseRouter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 			// and must never queue a swap (2026-09-10).
 			// A websocket upgrade is a GET but is a real session that may
 			// start a model (TestBaseRouter_WebsocketStartsModelWhenCompatDisabled).
-			StatusRead: (attemptReq.Method == http.MethodGet || attemptReq.Method == http.MethodHead) &&
-				!swaputil.IsWebSocketUpgrade(attemptReq),
+			StatusRead: swaputil.IsStatusRead(attemptReq),
 			// Inert unless the target model has a KVPoolTokens budget configured
 			// (see scheduler.FIFO.kvAdmit) — see swaputil.EstimateTokens for the
 			// estimation rule.

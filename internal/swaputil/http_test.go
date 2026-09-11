@@ -874,6 +874,38 @@ func TestIsWebSocketUpgrade(t *testing.T) {
 	}
 }
 
+// IsStatusRead is the one definition of "an observation, not use" that the
+// scheduler (never queue a swap, never restart the cooldown) and the process
+// (never reset the idle TTL) share, so the two clocks cannot drift apart.
+func TestIsStatusRead(t *testing.T) {
+	tests := []struct {
+		name      string
+		method    string
+		path      string
+		websocket bool
+		want      bool
+	}{
+		{name: "GET slots", method: http.MethodGet, path: "/slots", want: true},
+		{name: "HEAD health", method: http.MethodHead, path: "/health", want: true},
+		{name: "GET metrics", method: http.MethodGet, path: "/metrics", want: true},
+		{name: "POST chat", method: http.MethodPost, path: "/v1/chat/completions"},
+		{name: "POST count_tokens is part of a real turn", method: http.MethodPost, path: "/v1/messages/count_tokens"},
+		{name: "websocket upgrade is a session", method: http.MethodGet, path: "/socket", websocket: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := httptest.NewRequest(tt.method, tt.path, nil)
+			if tt.websocket {
+				r.Header.Set("Connection", "Upgrade")
+				r.Header.Set("Upgrade", "websocket")
+			}
+			if got := IsStatusRead(r); got != tt.want {
+				t.Errorf("IsStatusRead(%s %s) = %v, want %v", tt.method, tt.path, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestFetchContext_UpstreamPath(t *testing.T) {
 	cfg := config.Config{
 		Models: map[string]config.ModelConfig{

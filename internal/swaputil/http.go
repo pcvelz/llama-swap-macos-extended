@@ -75,6 +75,16 @@ func IsWebSocketUpgrade(r *http.Request) bool {
 		headerContainsToken(r.Header.Values("Upgrade"), "websocket")
 }
 
+// IsStatusRead reports whether r only observes a model (GET/HEAD /slots,
+// /props, /metrics, /health) rather than using it. Such a read must never
+// queue a swap, restart the cooldown, or reset the idle TTL; one predicate
+// for all three keeps the cooldown clock and the unload clock agreeing on
+// what counts as use. A websocket upgrade is a GET but is a real session.
+// count_tokens is a POST and part of a real turn, so it is use.
+func IsStatusRead(r *http.Request) bool {
+	return (r.Method == http.MethodGet || r.Method == http.MethodHead) && !IsWebSocketUpgrade(r)
+}
+
 func headerContainsToken(values []string, token string) bool {
 	for _, value := range values {
 		for part := range strings.SplitSeq(value, ",") {
