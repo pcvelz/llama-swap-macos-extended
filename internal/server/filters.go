@@ -21,6 +21,8 @@ import (
 //   - StripParams removal (issue #174)
 //   - SetParams injection (issue #453)
 //   - SetParamsByID per-alias overrides
+//   - image content blocks replaced by a text note for models whose declared
+//     capabilities lack image input (filters_image.go)
 //
 // Non-JSON requests (GET, multipart forms) pass through untouched. The buffered
 // body is re-attached with Content-Length / Transfer-Encoding cleanup so the
@@ -44,6 +46,7 @@ func CreateFilterMiddleware(cfg config.Config) chain.Middleware {
 				next.ServeHTTP(w, r)
 				return
 			}
+			textOnly := modelRejectsImages(cfg, data.Model)
 
 			// FetchContext already buffered the body once; reuse it instead of
 			// reading r.Body again here. Fall back to a direct read only if
@@ -62,6 +65,13 @@ func CreateFilterMiddleware(cfg config.Config) chain.Middleware {
 			if err != nil {
 				swaputil.SendResponse(w, r, http.StatusInternalServerError, err.Error())
 				return
+			}
+			if textOnly {
+				body, err = replaceImageBlocks(body, data.Model)
+				if err != nil {
+					swaputil.SendResponse(w, r, http.StatusInternalServerError, err.Error())
+					return
+				}
 			}
 
 			r.Body = io.NopCloser(bytes.NewReader(body))
@@ -121,6 +131,19 @@ func CreateFormFilterMiddleware(cfg config.Config) chain.Middleware {
 			next.ServeHTTP(w, updated)
 		})
 	}
+}
+
+// modelRejectsImages reports whether a requested LOCAL model has declared
+// capabilities that leave out image input. Undeclared capabilities and peers
+// return false: the proxy only acts on an explicit statement, never a guess
+// (see replaceImageBlocks).
+func modelRejectsImages(cfg config.Config, requested string) bool {
+	realName, found := cfg.RealModelName(requested)
+	if !found {
+		return false
+	}
+	caps := cfg.Models[realName].Capabilities
+	return !caps.Empty() && !contains(caps.In, "image")
 }
 
 // resolveFilters returns the filter settings for a requested model. UseModelName
