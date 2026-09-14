@@ -151,10 +151,19 @@ public enum SessionOrigin {
     /// User-Agent happened to start with. "other" carries no more information
     /// than the agent string does, so it defers to the agent path below,
     /// which also covers entries from a proxy predating the client key.
-    public static func label(sessionID: String?, client: String?, userAgent: String?) -> String {
+    ///
+    /// metadata.purpose (the caller's X-Caller-Purpose) says what the request
+    /// is FOR, which beats a client family on a session-less row ("curl" says
+    /// nothing about which automation holds the slot) and rides beside the
+    /// id on a session row.
+    public static func label(sessionID: String?, client: String?, userAgent: String?,
+                             purpose: String? = nil) -> String {
+        let purpose = (purpose ?? "").isEmpty ? nil : purpose
         if let sessionID, !sessionID.isEmpty {
-            return String(sessionID.prefix(8))
+            let id = String(sessionID.prefix(8))
+            return purpose.map { id + " " + $0 } ?? id
         }
+        if let purpose { return purpose }
         if let client, !client.isEmpty, client != "other" {
             return client
         }

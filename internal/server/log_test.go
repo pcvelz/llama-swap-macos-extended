@@ -178,6 +178,32 @@ func TestServer_RequestLogMiddleware_Termination(t *testing.T) {
 	})
 }
 
+// TestServer_RequestLogMiddleware_Purpose covers the `purpose=` field: a
+// caller that sends X-Caller-Purpose is named on its access-log line (so the
+// log answers "what was hitting the box" without a forensic pass), and a
+// request without it leaves the line exactly as before.
+func TestServer_RequestLogMiddleware_Purpose(t *testing.T) {
+	ok := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) })
+
+	t.Run("purpose header appears as purpose=", func(t *testing.T) {
+		proxylog := logmon.NewWriter(io.Discard)
+		req := httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+		req.Header.Set("X-Caller-Purpose", "commit subject")
+		CreateRequestLogMiddleware(proxylog)(ok).ServeHTTP(httptest.NewRecorder(), req)
+		if line := string(proxylog.GetHistory()); !strings.Contains(line, " purpose=commit-subject") {
+			t.Errorf("log line %q missing sanitized purpose=commit-subject", line)
+		}
+	})
+
+	t.Run("no purpose header leaves the line unchanged", func(t *testing.T) {
+		proxylog := logmon.NewWriter(io.Discard)
+		CreateRequestLogMiddleware(proxylog)(ok).ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/messages", nil))
+		if line := string(proxylog.GetHistory()); strings.Contains(line, "purpose=") {
+			t.Errorf("log line %q should not contain purpose= without the header", line)
+		}
+	})
+}
+
 // TestServer_RequestLogMiddleware_WebSocketUpgrade verifies that the access-log
 // middleware (which wraps responses in statusRecorder) does not break websocket
 // upgrades proxied through httputil.ReverseProxy. ReverseProxy requires the

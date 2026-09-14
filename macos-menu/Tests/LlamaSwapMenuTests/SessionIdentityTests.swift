@@ -217,6 +217,19 @@ final class SessionOriginClientTests: XCTestCase {
         XCTAssertEqual(origin, "3bf85c8c")
     }
 
+    /// X-Caller-Purpose (metadata.purpose) says WHAT a request is for, which
+    /// is what an operator needs on a row that is otherwise a bare "curl".
+    /// A session row keeps its id and appends the purpose.
+    func testCallerPurposeNamesTheRow() {
+        XCTAssertEqual(SessionOrigin.label(
+            sessionID: nil, client: "curl", userAgent: "curl/8.7.1", purpose: "commit-subject"), "commit-subject")
+        XCTAssertEqual(SessionOrigin.label(
+            sessionID: "3bf85c8c-1234-4321-aaaa-bbbbccccdddd", client: "claude-code", userAgent: nil,
+            purpose: "hermes-gate"), "3bf85c8c hermes-gate")
+        XCTAssertEqual(SessionOrigin.label(
+            sessionID: nil, client: "curl", userAgent: "curl/8.7.1", purpose: ""), "curl")
+    }
+
     func testClientFamilyLabelsASessionLessRow() {
         XCTAssertEqual(SessionOrigin.label(sessionID: nil, client: "curl", userAgent: "curl/8.7.1"), "curl")
         XCTAssertEqual(SessionOrigin.label(sessionID: nil, client: "python-sdk", userAgent: nil), "python-sdk")

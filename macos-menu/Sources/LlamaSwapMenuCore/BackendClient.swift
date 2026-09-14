@@ -406,7 +406,7 @@ public final class BackendClient: ObservableObject {
                 let sessionID = meta["session_id"]
                 let origin = SessionOrigin.label(
                     sessionID: sessionID, client: meta["client"],
-                    userAgent: entry.reqHeaders?["User-Agent"])
+                    userAgent: entry.reqHeaders?["User-Agent"], purpose: meta["purpose"])
                 // model_alias is the operator-facing name for the model that
                 // actually serves; the raw model id is the fallback for an
                 // entry from a proxy that predates the key.
@@ -775,6 +775,36 @@ public final class BackendClient: ObservableObject {
         var request = URLRequest(url: baseURL.appendingPathComponent("/api/models/unload"))
         request.httpMethod = "POST"
         URLSession.shared.dataTask(with: request) { _, _, _ in }.resume()
+    }
+
+    /// Evicts one in-flight/queued request - the menu's per-request row click.
+    /// The backend's POST /api/inflight/<id>/cancel cancels the request's
+    /// context; for a PARKED request that drops it out of the scheduler's
+    /// queue (the router watches ctx.Done while parked), for a granted one it
+    /// aborts the generation - either way the row's slot is evicted. Same
+    /// optimistic-clear / restore-on-failure contract as finishCooldown: the
+    /// click IS the operator evicting the row, so it clears at once and a
+    /// failed POST brings it back with an error line (a dead click and a
+    /// successful one must never look identical).
+    public func cancelInflight(id: String) {
+        let removed = menuState.sessionRows
+        menuState.sessionRows.removeAll { $0.id == id }
+
+        var request = URLRequest(url: baseURL.appendingPathComponent("/api/inflight/\(id)/cancel"))
+        request.httpMethod = "POST"
+        URLSession.shared.dataTask(with: request) { [weak self] _, response, error in
+            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+            let failed = error != nil || status < 200 || status >= 300
+            guard failed, let self else { return }
+            DispatchQueue.main.async {
+                // Restore only if SSE has not already re-published the row
+                // (the cancel raced a grant and the request is still live).
+                if !self.menuState.sessionRows.contains(where: { $0.id == id }) {
+                    self.menuState.sessionRows = removed
+                }
+                self.menuState.lastSwitchError = "evict failed"
+            }
+        }.resume()
     }
 
     /// Ends the current cooldown immediately - the menu's cooldown row click.

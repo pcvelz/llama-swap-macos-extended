@@ -40,7 +40,7 @@
   import ModelLink from "./activity-table/ModelLink.svelte";
   import MiddleEllipsis from "./activity-table/MiddleEllipsis.svelte";
   import { formatDuration, formatSpeed, formatRelativeTime } from "../lib/format";
-  import { formatBytes, liveElapsedMs, requestHeader, sessionID } from "../lib/inflight";
+  import { callerPurpose, formatBytes, liveElapsedMs, requestHeader, sessionID } from "../lib/inflight";
 
   interface Props {
     metrics: ActivityLogEntry[];
@@ -180,6 +180,7 @@
       { id: "identity", label: "Address", defaultVisible: true },
       { id: "user_agent", label: "User Agent", defaultVisible: true },
       { id: "session_id", label: "Session ID", defaultVisible: true },
+      { id: "purpose", label: "Purpose", defaultVisible: true },
       { id: "bytes_received", label: "Bytes Received", defaultVisible: true }
     );
     return cols;
@@ -674,6 +675,8 @@
                   {:else if columnId === "session_id"}
                     {@const session = sessionID(request.req_headers, $uiConfig.activity.session_id)}
                     <MiddleEllipsis value={session} tailLength={8} className="max-w-[14rem] font-mono text-xs" />
+                  {:else if columnId === "purpose"}
+                    <MiddleEllipsis value={callerPurpose(request)} tailLength={8} className="max-w-[14rem] font-mono text-xs" />
                   {:else if columnId === "bytes_received"}
                     <span class="font-mono text-xs tabular-nums">{formatBytes(request.resp_bytes)}</span>
                   {/if}

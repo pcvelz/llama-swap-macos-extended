@@ -260,8 +260,16 @@ func CreateRequestLogMiddleware(proxylog *logmon.Monitor) chain.Middleware {
 				cut = " cut=" + rec.termination
 			}
 
-			proxylog.Infof("Request %s \"%s %s %s\" %d %d \"%s\" %v tier=%s%s",
-				ip, method, path, proto, rec.status, rec.size, ua, time.Since(start), tier, cut)
+			// purpose= appears only when the caller sent X-Caller-Purpose, so a
+			// line without it stays byte-identical for every existing parser.
+			// The value is already sanitized to a space-free token.
+			purpose := ""
+			if p := swaputil.CallerPurposeFromHeader(r); p != "" {
+				purpose = " purpose=" + p
+			}
+
+			proxylog.Infof("Request %s \"%s %s %s\" %d %d \"%s\" %v tier=%s%s%s",
+				ip, method, path, proto, rec.status, rec.size, ua, time.Since(start), tier, cut, purpose)
 		})
 	}
 }

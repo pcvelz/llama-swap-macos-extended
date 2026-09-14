@@ -1,7 +1,13 @@
 import { describe, expect, it } from "vitest";
-import { formatBytes, liveElapsedMs, requestHeader, sessionID } from "./inflight";
+import { callerPurpose, formatBytes, liveElapsedMs, requestHeader, sessionID } from "./inflight";
 
 describe("inflight helpers", () => {
+  it("reads the proxy-sanitized caller purpose, not the raw header", () => {
+    const headers = { "X-Caller-Purpose": "raw value" };
+    expect(callerPurpose({ metadata: { purpose: "commit-subject" }, req_headers: headers })).toBe("commit-subject");
+    expect(callerPurpose({ req_headers: headers })).toBe("");
+  });
+
   it("looks up headers case-insensitively", () => {
     expect(requestHeader({ "User-Agent": "agent" }, "user-agent")).toBe("agent");
   });

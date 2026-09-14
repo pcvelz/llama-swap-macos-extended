@@ -598,6 +598,37 @@ func agentIDFromHeader(r *http.Request) string {
 	return v
 }
 
+// callerPurposeHeader lets any caller say WHAT a request is for
+// (commit-subject, mm-plan-writer, cm-launch-prewarm, ...). Session headers
+// say WHO; without a purpose every curl/SDK request is an anonymous row, and
+// naming the automated callers holding the box took a forensic pass over
+// three logs.
+const callerPurposeHeader = "X-Caller-Purpose"
+
+// CallerPurposeMaxLen caps the sanitized purpose: long enough for a
+// "tool:variant" slug, short enough to fit a queue row and a log line.
+const CallerPurposeMaxLen = 48
+
+// callerPurposeDisallowed matches every run of characters outside the token
+// alphabet. The value is free text from any local process and lands in the
+// access log, Metadata and the UI, so a quote, space or '=' must never
+// survive to forge a log field or break a renderer.
+var callerPurposeDisallowed = regexp.MustCompile(`[^A-Za-z0-9._:/-]+`)
+
+// CallerPurposeFromHeader returns the sanitized callerPurposeHeader value:
+// disallowed runs collapse to one '-', edge punctuation is trimmed, and the
+// result is capped at CallerPurposeMaxLen. Unlike the session headers it is
+// cleaned rather than dropped, because "mm plan writer" is a legitimate
+// purpose, not a malformed id. "" when absent or nothing usable remains.
+func CallerPurposeFromHeader(r *http.Request) string {
+	v := callerPurposeDisallowed.ReplaceAllString(r.Header.Get(callerPurposeHeader), "-")
+	v = strings.Trim(v, "-.:/")
+	if len(v) > CallerPurposeMaxLen {
+		v = strings.TrimRight(v[:CallerPurposeMaxLen], "-.:/")
+	}
+	return v
+}
+
 // Client families reported in the `client` metadata key. The set is closed so
 // a renderer can switch on it instead of displaying a raw user-agent string,
 // which is what a session-less queue row used to surface.
@@ -658,6 +689,9 @@ func sessionMetadata(r *http.Request, userID string) map[string]string {
 	}
 	if agentID := agentIDFromHeader(r); agentID != "" {
 		metadata["agent_id"] = agentID
+	}
+	if purpose := CallerPurposeFromHeader(r); purpose != "" {
+		metadata["purpose"] = purpose
 	}
 	metadata["client"] = clientFamily(r, fromHeader)
 	return metadata

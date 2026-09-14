@@ -46,8 +46,13 @@ public struct MenuView: View {
         // session-identity contract fixes for both renderers - the row text
         // itself lives on SessionRow.displayLine, so cm-menu and this menu
         // can never disagree about how a request is described.
+        // Each row is a Button: clicking evicts the request - a PARKED one
+        // drops out of the scheduler's queue, a granted one aborts
+        // (BackendClient.cancelInflight -> POST /api/inflight/<id>/cancel).
         ForEach(state.sessionRows) { row in
-            Text(row.displayLine)
+            Button(row.displayLine) {
+                client.cancelInflight(id: row.id)
+            }
         }
 
         // The scheduler's own wait list - "Queue: idle" when nothing is

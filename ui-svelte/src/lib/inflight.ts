@@ -10,6 +10,16 @@ export function requestHeader(
   return "";
 }
 
+// The caller's X-Caller-Purpose as the proxy sanitized it into metadata.
+// The raw header is deliberately not read: it is unbounded free text, while
+// metadata.purpose is the capped token the log line and menu bar also show.
+export function callerPurpose(request: {
+  metadata?: Record<string, string>;
+  req_headers?: Record<string, string>;
+}): string {
+  return request.metadata?.purpose ?? "";
+}
+
 export function sessionID(
   headers: Record<string, string> | undefined,
   sessionHeaders: string[]
