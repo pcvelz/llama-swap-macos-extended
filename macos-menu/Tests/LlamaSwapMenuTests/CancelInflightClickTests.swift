@@ -52,7 +52,7 @@ final class CancelInflightClickTests: XCTestCase {
     func testClickPostsCancelAndClearsRowImmediately() {
         stub.responder = { _, _ in (200, "{}") }
         let client = makeClient()
-        client.menuState.sessionRows = rows
+        client.rawRows = rows
 
         client.cancelInflight(id: "41")
 
@@ -74,7 +74,7 @@ final class CancelInflightClickTests: XCTestCase {
             return (200, "{}")
         }
         let client = makeClient()
-        client.menuState.sessionRows = rows
+        client.rawRows = rows
 
         client.cancelInflight(id: "41")
 

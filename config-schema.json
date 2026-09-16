@@ -643,6 +643,12 @@
                         "default": 0,
                         "description": "Overrides allowed number of active parallel requests to a model. 0 uses internal default of 10. >0 overrides default. Requests exceeding limit get HTTP 429."
                     },
+                    "maxParallelLargePrefill": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "default": 1,
+                        "description": "Only with a routing.scheduler.settings.fifo.kvPoolTokens budget for this model. At most this many large requests (estimated >= 8192 tokens) of the model are forwarded at once; a further large request waits in the queue even if the pool would fit it. Small requests are not counted. 1 serializes large requests. 0, or a value >= concurrencyLimit, sets no separate cap. concurrencyLimit stays the outer cap on all requests and the kvPoolTokens check still applies."
+                    },
                     "sendLoadingState": {
                         "type": "boolean",
                         "description": "Overrides the global sendLoadingState for this model. Ommitting this property will use the global setting."

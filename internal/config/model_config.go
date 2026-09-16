@@ -14,6 +14,10 @@ const (
 
 	// ComfyUIModelID identifies the model used by the /comfyui endpoint.
 	ComfyUIModelID = "comfyui_auto"
+
+	// MODEL_CONFIG_DEFAULT_MAX_PARALLEL_LARGE_PREFILL is maxParallelLargePrefill
+	// when a model leaves it unset: large requests serialize.
+	MODEL_CONFIG_DEFAULT_MAX_PARALLEL_LARGE_PREFILL = 1
 )
 
 var validModalities = map[string]struct{}{
@@ -145,6 +149,21 @@ type ModelConfig struct {
 	// internal/server/slot_affinity.go.
 	SlotAffinity bool `yaml:"slotAffinity"`
 
+	// MaxParallelLargePrefill caps how many LARGE requests (estimated at or
+	// above the scheduler's large-prefill threshold, 8192 tokens) of this model
+	// may be granted at the same time. It sits inside ConcurrencyLimit, which
+	// stays the outer cap on all requests, and next to the kvPoolTokens sum
+	// check, which still applies. WHY a separate count: on a --kv-unified
+	// multi-slot child the pool sum can admit two large requests whose
+	// concurrent prefill compute buffers still exhaust GPU memory on one model
+	// (a 27B dense model OOMs Metal), while another model's slots run large
+	// turns in parallel fine. Parallelism is a property of the model, so it is
+	// configured per model. Unset = MODEL_CONFIG_DEFAULT_MAX_PARALLEL_LARGE_PREFILL
+	// (1: large requests serialize, the safe default for a new model); 0 or a
+	// value >= ConcurrencyLimit = no separate cap. Only consulted for models
+	// with a kvPoolTokens budget.
+	MaxParallelLargePrefill int `yaml:"maxParallelLargePrefill"`
+
 	// Copy of HealthCheckTimeout from global config
 	HealthCheckTimeout int `yaml:"healthCheckTimeout"`
 }
@@ -177,6 +196,8 @@ func (m *ModelConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
 			IdleConn:       90,
 		},
 	}
+
+	defaults.MaxParallelLargePrefill = MODEL_CONFIG_DEFAULT_MAX_PARALLEL_LARGE_PREFILL
 
 	// the default cmdStop to taskkill /f /t /pid ${PID}
 	if runtime.GOOS == "windows" {

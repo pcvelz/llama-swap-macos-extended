@@ -98,6 +98,12 @@ type FIFO struct {
 	// releaseKV.
 	kvLargeInFlight map[string]int
 
+	// maxLarge is the per-model large-request cap (config
+	// maxParallelLargePrefill) that kvAdmit compares kvLargeInFlight against;
+	// see maxLargeFor for models absent here. concurrencyLimit (limits) stays
+	// the outer cap on all requests.
+	maxLarge map[string]int
+
 	// grace maps a model ID to its swap-grace duration: a request for a
 	// different model is held in the queue until this model has been idle
 	// (in-flight 0) for at least this long before it may be evicted. Absent or
@@ -155,6 +161,16 @@ type FIFO struct {
 	// nextArrivalSeq hands out HandlerReq.arrivalSeq — see its doc comment.
 	// Plain uint64, not atomic: only ever touched on the run loop.
 	nextArrivalSeq uint64
+
+	// lastServedTier records, per model, the tier of the most recently granted
+	// (in-flight) request — the same entry that is popped from granted[] in
+	// OnServeDone at the same spot where idleSince is reset. A freshly swapped-
+	// in model that has not yet served a request has no entry here. Used by the
+	// rank-aware grace-break rule: the cooldown exists to serve the traffic
+	// associated with this tier, and a strictly higher-rank arrival whose tier
+	// contract is "boots lower-rank work" (Preempts) outranks it. Side-effect
+	// free for cooldownSnapshot — that function is a pure observer.
+	lastServedTier map[string]swaputil.Tier
 }
 
 // NewFIFO builds a FIFO scheduler. Both per-model tables are derived from
@@ -164,7 +180,9 @@ type FIFO struct {
 func NewFIFO(name string, logger *logmon.Monitor, planner Swapper, cfg config.FifoConfig, models map[string]config.ModelConfig, eff Effects) *FIFO {
 	limits := make(map[string]int, len(models))
 	grace := make(map[string]time.Duration, len(models))
+	maxLarge := make(map[string]int, len(models))
 	for id, mc := range models {
+		maxLarge[id] = mc.MaxParallelLargePrefill
 		limit := defaultConcurrencyLimit
 		if mc.ConcurrencyLimit > 0 {
 			limit = mc.ConcurrencyLimit
@@ -187,9 +205,11 @@ func NewFIFO(name string, logger *logmon.Monitor, planner Swapper, cfg config.Fi
 		granted:         make(map[string][]*grantedReq),
 		kvInFlight:      make(map[string]int),
 		kvLargeInFlight: make(map[string]int),
+		maxLarge:        maxLarge,
 		grace:           grace,
 		idleSince:       make(map[string]time.Time),
 		now:             time.Now,
+		lastServedTier:  make(map[string]swaputil.Tier),
 	}
 }
 
@@ -354,7 +374,12 @@ func (s *FIFO) OnRequest(req HandlerReq) {
 	// out brief request gaps (an agent pausing to run a tool) instead of being
 	// evicted the instant it drains. OnServeDone (new traffic) or OnTick (pure
 	// idle) retries; the swap proceeds once the grace elapses.
-	if s.deferredByGrace(evict) {
+	//
+	// Rank-aware: if no queued request for the evictee model has rank >= this
+	// arrival's rank, the cooldown is protecting traffic that doesn't include
+	// anyone as important as the waiter — skip the deferral (2026-09-14 high-
+	// prio waits out low-prio cooldown).
+	if s.deferredByGrace(req, evict) {
 		s.logger.Debugf("%s: queuing request for model %s (evictee still within swap-grace)", s.name, req.Model)
 		markParked(&req, ParkCooldown)
 		s.enqueue(req)
@@ -574,12 +599,38 @@ func (s *FIFO) noteGraceDeferral() {
 // finish (FinishCooldown / POST /api/swap-grace/finish) before falling back
 // to the normal idle-streak + starvation-valve check in withinGrace, and
 // records the deferral for the valve on a true return.
-func (s *FIFO) deferredByGrace(evict []string) bool {
+//
+// Rank-aware grace-break (2026-09-14): if lastServedTier[m] exists for an
+// evictee m and its tier rank is STRICTLY LOWER than req's AND req's tier
+// contract says "boots lower-rank work" (Preempts), the cooldown is protecting
+// traffic that outranks nobody waiting here — skip the deferral and let the
+// higher-prio arrival proceed. A partial order (queue rank yes, grace rank no)
+// creates the temporary deadlock observed in the incident.
+//
+// Deliberately does NOT use swaputil.CanPreempt: its victim.Preemptible clause
+// would let DEFAULT-rank arrivals break BACKGROUND (interactive cq*) sessions'
+// grace, re-opening the 2026-09-08 cq35h incident that swapStarvationSeconds:-1
+// exists to prevent. Only a tier whose contract is "boots lower-rank work"
+// (preempts:true) breaks a grace. Same-rank or lower-rank arrivals keep the hold.
+func (s *FIFO) deferredByGrace(req HandlerReq, evict []string) bool {
 	if !s.withinGrace(evict) {
 		return false
 	}
 	if s.consumeForced() {
 		return false
+	}
+	// Rank-aware grace-break: check lastServedTier for each evictee.
+	for _, m := range evict {
+		st, ok := s.lastServedTier[m]
+		if !ok {
+			// No request has served on this model yet — no cooldown to break.
+			continue
+		}
+		if st.Rank < req.Tier.Rank && req.Tier.Preempts {
+			s.logger.Debugf("%s: grace broken by higher-rank arrival (evictee %s lastServedTier=%s/%d, arrival tier=%s/%d)",
+				s.name, m, st.Name, st.Rank, req.Tier.Name, req.Tier.Rank)
+			return false
+		}
 	}
 	s.noteGraceDeferral()
 	return true
@@ -723,6 +774,13 @@ func (s *FIFO) grantHandler(req HandlerReq, modelID string) {
 		if req.Preempt != nil {
 			s.granted[modelID] = append(s.granted[modelID], &grantedReq{tier: req.Tier, preempt: req.Preempt})
 		}
+		// lastServedTier records the tier of the most recently granted request
+		// for this model. It powers the rank-aware grace-break rule: the cooldown
+		// exists to serve traffic associated with this tier, and a strictly
+		// higher-rank arrival whose tier contract is "boots lower-rank work"
+		// (Preempts) outranks it. Nil Tier (the default) means no entry in the
+		// map — grace holds until a real request has served.
+		s.lastServedTier[modelID] = req.Tier
 		s.publishCapacity()
 		s.publishGrace()
 	}
@@ -845,9 +903,10 @@ func (s *FIFO) tryPreempt(req HandlerReq, evict []string, limit int) bool {
 //     rejected outright for being "too big" — only ever parked behind
 //     others; when it's the only one, there's nothing for it to collide
 //     with, so let it through and let llama.cpp be the final arbiter.
-//   - a LARGE arrival (estimate >= largePrefillThreshold) is parked whenever a
-//     large request is already in flight for the model, so large prefills
-//     serialize; small requests are unaffected.
+//   - a LARGE arrival (estimate >= largePrefillThreshold) is parked whenever
+//     the model already has its per-model maxParallelLargePrefill large
+//     requests in flight (default 1, so large prefills serialize; 0 = no
+//     separate cap); small requests are unaffected.
 //   - otherwise -> admit only if the combined estimate still fits the pool.
 func (s *FIFO) kvAdmit(model string, estimate int) bool {
 	pool := s.cfg.KVPoolTokens[model]
@@ -858,21 +917,31 @@ func (s *FIFO) kvAdmit(model string, estimate int) bool {
 	if inflight <= 0 {
 		return true
 	}
-	// SERIALIZE LARGE PREFILLS: a large arrival must not co-schedule with a
-	// large request already in flight on this model, independent of the
-	// summed-token pool check below. Two concurrent large Metal prefill
-	// compute-buffers oversubscribe GPU memory (OOM) and thrash the shared
-	// --kv-unified cache into endless re-prefills even when their summed
-	// estimate still fits the pool (100k+100k < a 262k pool). Small requests
-	// (estimate < largePrefillThreshold) skip this and still ride the second
-	// slot concurrently. The parked large request is granted when the
-	// in-flight one frees (releaseKV -> drainQueue re-checks) or its client
-	// disconnects (the base router drops it from the queue), so this never
-	// deadlocks.
-	if estimate >= largePrefillThreshold && s.kvLargeInFlight[model] > 0 {
+	// CAP PARALLEL LARGE PREFILLS: a large arrival parks while the model
+	// already has maxLargeFor(model) large requests granted, independent of the
+	// summed-token pool check below. On some models two concurrent large Metal
+	// prefill compute-buffers oversubscribe GPU memory (OOM) and thrash the
+	// shared --kv-unified cache into endless re-prefills even when their summed
+	// estimate still fits the pool (100k+100k < a 262k pool); others run large
+	// turns on every slot fine, so the cap is per model. Small requests
+	// (estimate < largePrefillThreshold) skip this and still ride a free slot.
+	// The parked large request is granted when an in-flight one frees
+	// (releaseKV -> drainQueue re-checks) or its client disconnects (the base
+	// router drops it from the queue), so this never deadlocks.
+	if n := s.maxLargeFor(model); n > 0 && estimate >= largePrefillThreshold && s.kvLargeInFlight[model] >= n {
 		return false
 	}
 	return inflight+estimate <= pool
+}
+
+// maxLargeFor returns model's maxParallelLargePrefill: the configured value,
+// or the config default for a model the scheduler has no config for. 0 means
+// no separate cap (concurrencyLimit and the pool decide alone).
+func (s *FIFO) maxLargeFor(model string) int {
+	if n, ok := s.maxLarge[model]; ok {
+		return n
+	}
+	return config.MODEL_CONFIG_DEFAULT_MAX_PARALLEL_LARGE_PREFILL
 }
 
 // markKVParked stamps kv_parked=1 onto req's LIVE in-flight entry, so a
@@ -1107,7 +1176,7 @@ func (s *FIFO) drainQueue() {
 			stick(req)
 			continue
 		}
-		if s.deferredByGrace(evict) {
+		if s.deferredByGrace(req, evict) {
 			markParked(&req, ParkCooldown)
 			stick(req)
 			continue

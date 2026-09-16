@@ -40,7 +40,9 @@ final class SlotPhaseWordTests: XCTestCase {
     }
 
     private func makeClient() -> BackendClient {
-        let client = BackendClient(baseURL: stub.baseURL)
+        // Hold 0: the phase override is judged per instant; the visual hold is
+        // RowWordSteadinessTests' contract.
+        let client = BackendClient(baseURL: stub.baseURL, rowWordHoldSeconds: 0)
         XCTAssertTrue(waitUntil { self.stub.hasEventClient },
                       "client never opened the /api/events stream")
         return client

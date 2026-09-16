@@ -356,15 +356,20 @@ func TestSlotAffinityStore_AssignIgnoresStaleSessions(t *testing.T) {
 	require.True(t, ok)
 	assert.Equal(t, 0, slot)
 
-	now = now.Add(20 * time.Minute) // A's entry ages out of the active window
+	now = now.Add(20 * time.Minute) // A is long quiet: no longer live
 
+	// Neither slot has a live session. B takes the one used longest ago -
+	// the never-used slot 1 - so slot 0 keeps quiet A's KV prefix in case A
+	// comes back (incident llama-cm 2026-09-16-two-live-sessions-pinned-
+	// same-slot-cache-thrash; the old rule tied to the lowest id here).
 	slot, ok = s.assign("m", "B", 2)
 	require.True(t, ok, "A no longer counts against slot 0")
-	assert.Equal(t, 0, slot)
+	assert.Equal(t, 1, slot)
 
+	// B is live on slot 1, A is not live on slot 0: C avoids the live slot.
 	slot, ok = s.assign("m", "C", 2)
 	require.True(t, ok)
-	assert.Equal(t, 1, slot)
+	assert.Equal(t, 0, slot)
 }
 
 func TestSlotAffinityStore_AssignRefusesSingleSlotAndDisabled(t *testing.T) {

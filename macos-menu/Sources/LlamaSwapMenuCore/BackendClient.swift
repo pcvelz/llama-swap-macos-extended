@@ -43,9 +43,11 @@ public final class BackendClient: ObservableObject {
     /// from; the default is the one path cm-menu writes. Tests point it at a
     /// temporary file.
     public init(baseURL: URL? = nil, sessionTitlesPath: String? = nil,
-                laneLingerSeconds: TimeInterval = BackendClient.defaultLaneLingerSeconds) {
+                laneLingerSeconds: TimeInterval = BackendClient.defaultLaneLingerSeconds,
+                rowWordHoldSeconds: TimeInterval = BackendClient.defaultRowWordHoldSeconds) {
         self.baseURL = baseURL ?? Self.defaultBaseURL()
         self.laneLingerSeconds = laneLingerSeconds
+        self.rowWordStabilizer = RowWordStabilizer(holdSeconds: rowWordHoldSeconds)
         self.titleStore = SessionTitleStore(path: sessionTitlesPath)
         self.bars = BarMetric.parseList(ProcessInfo.processInfo.environment["LLAMA_SWAP_MENU_BARS"])
         // Size the initial bar values to the configured bar count so the icon
@@ -248,6 +250,51 @@ public final class BackendClient: ObservableObject {
     /// window; production always uses the default above.
     public let laneLingerSeconds: TimeInterval
 
+    /// How long a new PREFILL/DECODE/TURN word must persist before a row
+    /// shows it - see RowWordStabilizer. @user-gated (user, 2026-09-16: a
+    /// visual staleness hold so a purely cosmetic flip does not start a
+    /// debugging session): the value is the user's to set, through
+    /// LLAMA_SWAP_MENU_ROW_HOLD_MS (milliseconds; 0 shows every instant). An
+    /// agent may not change the default or remove the hold on its own.
+    /// Default 5 s: above a live tool gap (1-3 s) and most turn-boundary
+    /// prefills (0.4-5.5 s, 28-1522 tokens, measured 2026-09-16 on two cq35h
+    /// tool loops); a real long prefill or a lane that went idle still shows
+    /// a few seconds later.
+    public static var defaultRowWordHoldSeconds: TimeInterval {
+        let raw = ProcessInfo.processInfo.environment["LLAMA_SWAP_MENU_ROW_HOLD_MS"] ?? ""
+        guard let ms = Double(raw), ms >= 0 else {
+            return 5.0 // @user-gated: default visual hold; only the user changes it
+        }
+        return ms / 1000.0 // @user-gated: LLAMA_SWAP_MENU_ROW_HOLD_MS, the user's own setting
+    }
+    private let rowWordStabilizer: RowWordStabilizer
+
+    /// The rows as classified from live data, before the word hold. Every
+    /// internal reader and writer works on these (the slot refresh re-derives
+    /// words from them, and must never re-read a held word as if it were
+    /// live); the published menuState.sessionRows is always the held view.
+    /// Internal (not private) so tests seed rows at the source of truth, the
+    /// same place the SSE path writes them.
+    var rawRows: [SessionRow] = [] {
+        didSet { publishHeldRows() }
+    }
+    private var rowHoldTimer: Timer?
+
+    private func publishHeldRows() {
+        menuState.sessionRows = rowWordStabilizer.apply(rawRows, now: Date())
+        // A pending word must be able to land with NO further data: an idle
+        // lane sends no events and stops slot polling, so re-apply once the
+        // hold has run. .common so an open menu's tracking loop still fires it.
+        guard rowWordStabilizer.hasPending, rowHoldTimer == nil else { return }
+        let timer = Timer(timeInterval: rowWordStabilizer.holdSeconds + 0.1, repeats: false) { [weak self] _ in
+            guard let self else { return }
+            self.rowHoldTimer = nil
+            self.publishHeldRows()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        rowHoldTimer = timer
+    }
+
     /// Lanes with no in-flight request that are still being rendered, with
     /// the row as it last looked and the moment its last request went away.
     private var lingeringLanes: [String: (row: SessionRow, since: Date)] = [:]
@@ -401,7 +448,7 @@ public final class BackendClient: ObservableObject {
         where !laneOrder.contains(lane) {
             laneOrder.append(lane)
         }
-        menuState.sessionRows = laneOrder
+        rawRows = laneOrder
             .compactMap { lane -> SessionRow? in
                 // A lingering lane has no entry to classify: re-render the
                 // row it last showed, with the honest between-turns word and
@@ -478,8 +525,8 @@ public final class BackendClient: ObservableObject {
     /// stored row is the last LIVE one, and re-storing the TURN row would
     /// make that word stick to the lane after its next turn starts.
     private func recordLaneRows() {
-        guard laneOrder.count == menuState.sessionRows.count else { return }
-        for (lane, row) in zip(laneOrder, menuState.sessionRows) where lingeringLanes[lane] == nil {
+        guard laneOrder.count == rawRows.count else { return }
+        for (lane, row) in zip(laneOrder, rawRows) where lingeringLanes[lane] == nil {
             lastRowByLane[lane] = row
         }
         let known = Set(laneOrder)
@@ -519,17 +566,17 @@ public final class BackendClient: ObservableObject {
         expireLingeringLanes(now: Date())
         defer { scheduleLingerSweep() }
         guard before != Set(lingeringLanes.keys) else { return }
-        guard laneOrder.count == menuState.sessionRows.count else { return }
+        guard laneOrder.count == rawRows.count else { return }
         let live = Set(inflightEntries.values.map { Self.laneKey(for: $0) })
         var keptLanes: [String] = []
         var keptRows: [SessionRow] = []
-        for (lane, row) in zip(laneOrder, menuState.sessionRows)
+        for (lane, row) in zip(laneOrder, rawRows)
         where live.contains(lane) || lingeringLanes[lane] != nil {
             keptLanes.append(lane)
             keptRows.append(row)
         }
         laneOrder = keptLanes
-        menuState.sessionRows = keptRows
+        rawRows = keptRows
         let known = Set(laneOrder)
         lastRowByLane = lastRowByLane.filter { known.contains($0.key) }
     }
@@ -640,7 +687,7 @@ public final class BackendClient: ObservableObject {
     /// verdict from the byte clock that a moving counter would have
     /// prevented anyway. Tracker samples are left exactly as events made them.
     private func refreshSlotDetails(now: Date = Date()) {
-        menuState.sessionRows = menuState.sessionRows.map { row in
+        rawRows = rawRows.map { row in
             guard let entry = inflightEntries[row.id] else { return row }
             // THE SLOT OUTRANKS THE PROXY'S PARK FLAGS. A row classified
             // PARKED whose lane is in fact generating on its own slot (see
@@ -870,8 +917,8 @@ public final class BackendClient: ObservableObject {
     /// failed POST brings it back with an error line (a dead click and a
     /// successful one must never look identical).
     public func cancelInflight(id: String) {
-        let removed = menuState.sessionRows
-        menuState.sessionRows.removeAll { $0.id == id }
+        let removed = rawRows
+        rawRows.removeAll { $0.id == id }
 
         var request = URLRequest(url: baseURL.appendingPathComponent("/api/inflight/\(id)/cancel"))
         request.httpMethod = "POST"
@@ -882,8 +929,8 @@ public final class BackendClient: ObservableObject {
             DispatchQueue.main.async {
                 // Restore only if SSE has not already re-published the row
                 // (the cancel raced a grant and the request is still live).
-                if !self.menuState.sessionRows.contains(where: { $0.id == id }) {
-                    self.menuState.sessionRows = removed
+                if !self.rawRows.contains(where: { $0.id == id }) {
+                    self.rawRows = removed
                 }
                 self.menuState.lastSwitchError = "evict failed"
             }

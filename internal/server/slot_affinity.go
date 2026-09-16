@@ -107,9 +107,87 @@ const slotAffinityMinInjectBodyBytes = 16384
 // cannot permanently skew the least-loaded pick.
 const slotAffinityActiveWindow = 15 * time.Minute
 
+// slotAffinityLiveWindow is how long after its last request started or ended
+// a session still counts as LIVE for slot placement. A Claude Code tool loop
+// is silent on the proxy only while the client runs a tool: seconds for a
+// Read/Bash call, a couple of minutes for a build or a test run. Beyond that
+// the session is paused (the user is reading, a question is open) and its
+// slot may go to a session that is actually working - but only when no slot
+// is free (assign/repair below prefer a slot with no live session at all).
+// The 15-min activeWindow is kept for what it was built for (hotSlots, the
+// cooldown's per-slot display); it is far too long to decide placement: it
+// counted a session silent for 4 minutes as occupying its slot, tied it with
+// a live one and put a newcomer on the live session's slot (incident llama-cm
+// 2026-09-16-two-live-sessions-pinned-same-slot-cache-thrash).
+const slotAffinityLiveWindow = 2 * time.Minute
+
 type slotAffinityEntry struct {
 	slot int
 	seen time.Time
+	// assigned is when this session was first placed on its current slot.
+	// Repair moves the NEWER of two live sessions sharing a slot, so the
+	// longer conversation - usually the bigger KV prefix - keeps its cache.
+	assigned time.Time
+	// inflight counts this lane's full-turn requests currently being served
+	// through the middleware; lastEnd is when the last one finished. A
+	// 5-minute decode must count as live although seen (its start) is old.
+	inflight int
+	lastEnd  time.Time
+}
+
+// liveLocked reports whether e's session is working right now: a request in
+// flight, or one started or finished within liveWindow. Called with mu held.
+func (s *slotAffinityStore) liveLocked(e slotAffinityEntry, now time.Time) bool {
+	if e.inflight > 0 {
+		return true
+	}
+	last := e.seen
+	if e.lastEnd.After(last) {
+		last = e.lastEnd
+	}
+	return now.Sub(last) <= s.liveWindow
+}
+
+// slotLoadLocked describes one slot for placement: how many OTHER sessions
+// (not exclude) are live on it, and when any session last used it (zero =
+// never). Called with mu held.
+func (s *slotAffinityStore) slotLoadLocked(sessions map[string]slotAffinityEntry, exclude string, nSlots int, now time.Time) (live []int, lastUsed []time.Time) {
+	live = make([]int, nSlots)
+	lastUsed = make([]time.Time, nSlots)
+	for key, e := range sessions {
+		if e.slot < 0 || e.slot >= nSlots {
+			continue
+		}
+		last := e.seen
+		if e.lastEnd.After(last) {
+			last = e.lastEnd
+		}
+		if last.After(lastUsed[e.slot]) {
+			lastUsed[e.slot] = last
+		}
+		if key != exclude && s.liveLocked(e, now) {
+			live[e.slot]++
+		}
+	}
+	return live, lastUsed
+}
+
+// pickSlotLocked chooses the placement for a session: the fewest live
+// sessions first; among equals the slot used longest ago (a never-used slot
+// first), because the most recently used slot most likely still holds a
+// conversation that will be back; remaining ties to the lowest id. Called
+// with mu held.
+func pickSlotLocked(live []int, lastUsed []time.Time) int {
+	best := 0
+	for id := 1; id < len(live); id++ {
+		switch {
+		case live[id] < live[best]:
+			best = id
+		case live[id] == live[best] && lastUsed[id].Before(lastUsed[best]):
+			best = id
+		}
+	}
+	return best
 }
 
 // slotAffinityStore remembers, per model, which slot last served each
@@ -121,6 +199,7 @@ type slotAffinityStore struct {
 	minLearnInputTokens int
 	minInjectBodyBytes  int
 	activeWindow        time.Duration
+	liveWindow          time.Duration
 	byModel             map[string]map[string]slotAffinityEntry
 	now                 func() time.Time
 	unsubscribe         context.CancelFunc
@@ -170,6 +249,7 @@ func newSlotAffinityStore(cfg config.Config) *slotAffinityStore {
 		minLearnInputTokens: slotAffinityMinLearnInputTokens,
 		minInjectBodyBytes:  slotAffinityMinInjectBodyBytes,
 		activeWindow:        slotAffinityActiveWindow,
+		liveWindow:          slotAffinityLiveWindow,
 		byModel:             make(map[string]map[string]slotAffinityEntry),
 		now:                 time.Now,
 	}
@@ -210,10 +290,16 @@ func (s *slotAffinityStore) learn(modelID, sessionID string, slot int) {
 		sessions = make(map[string]slotAffinityEntry)
 		s.byModel[modelID] = sessions
 	}
-	if _, exists := sessions[sessionID]; !exists && len(sessions) >= s.maxSessions {
+	now := s.now()
+	e, exists := sessions[sessionID]
+	if !exists && len(sessions) >= s.maxSessions {
 		s.evictOldestLocked(sessions)
 	}
-	sessions[sessionID] = slotAffinityEntry{slot: slot, seen: s.now()}
+	if !exists || e.slot != slot {
+		e.assigned = now
+	}
+	e.slot, e.seen = slot, now
+	sessions[sessionID] = e
 }
 
 // evictOldestLocked removes the least-recently-seen entry. Called with mu
@@ -283,26 +369,93 @@ func (s *slotAffinityStore) assign(modelID, sessionID string, nSlots int) (slot 
 		return e.slot, true
 	}
 
-	counts := make(map[int]int, nSlots)
-	cutoff := now.Add(-s.activeWindow)
-	for _, e := range sessions {
-		if e.seen.After(cutoff) {
-			counts[e.slot]++
-		}
-	}
-
-	best, bestCount := 0, counts[0]
-	for id := 1; id < nSlots; id++ {
-		if c := counts[id]; c < bestCount {
-			best, bestCount = id, c
-		}
-	}
+	// Placement on what is LIVE, not on 15-min history - see
+	// slotAffinityLiveWindow and pickSlotLocked.
+	live, lastUsed := s.slotLoadLocked(sessions, sessionID, nSlots, now)
+	best := pickSlotLocked(live, lastUsed)
 
 	if len(sessions) >= s.maxSessions {
 		s.evictOldestLocked(sessions)
 	}
-	sessions[sessionID] = slotAffinityEntry{slot: best, seen: now}
+	sessions[sessionID] = slotAffinityEntry{slot: best, seen: now, assigned: now}
 	return best, true
+}
+
+// lookupRepair is lookup for a request about to be served: it returns the
+// session's slot and refreshes its recency like lookup, but first repairs a
+// collision. When another LIVE session shares this session's slot and was
+// placed there first, while some slot has no live session at all, this
+// session moves to that slot: one re-prefill once, instead of both sessions
+// throwing away each other's KV prefix on every turn switch (incident llama-cm
+// 2026-09-16-two-live-sessions-pinned-same-slot-cache-thrash). The older
+// session never moves, so the pair cannot ping-pong, and nothing moves when
+// every slot is live - there is nowhere better to go.
+func (s *slotAffinityStore) lookupRepair(modelID, sessionID string, nSlots int) (slot int, ok bool) {
+	if !s.enabled(modelID) || sessionID == "" {
+		return 0, false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sessions := s.byModel[modelID]
+	e, ok := sessions[sessionID]
+	if !ok {
+		return 0, false
+	}
+	now := s.now()
+	if nSlots > 1 && e.slot >= 0 && e.slot < nSlots {
+		sharedWithOlder := false
+		for key, other := range sessions {
+			if key == sessionID || other.slot != e.slot || !s.liveLocked(other, now) {
+				continue
+			}
+			// Equal placement times break by key so exactly one side moves.
+			if other.assigned.Before(e.assigned) || (other.assigned.Equal(e.assigned) && key < sessionID) {
+				sharedWithOlder = true
+				break
+			}
+		}
+		if sharedWithOlder {
+			live, lastUsed := s.slotLoadLocked(sessions, sessionID, nSlots, now)
+			if target := pickSlotLocked(live, lastUsed); live[target] == 0 && target != e.slot {
+				e.slot = target
+				e.assigned = now
+			}
+		}
+	}
+	e.seen = now
+	sessions[sessionID] = e
+	return e.slot, true
+}
+
+// begin and end bracket a full-turn request of sessionID being served, so a
+// long stream keeps its session live (liveLocked) however long ago it began.
+func (s *slotAffinityStore) begin(modelID, sessionID string) {
+	s.adjustInflight(modelID, sessionID, +1)
+}
+
+func (s *slotAffinityStore) end(modelID, sessionID string) {
+	s.adjustInflight(modelID, sessionID, -1)
+}
+
+func (s *slotAffinityStore) adjustInflight(modelID, sessionID string, delta int) {
+	if s == nil || sessionID == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	e, ok := s.byModel[modelID][sessionID]
+	if !ok {
+		// Forgotten meanwhile (model stopped, entry evicted): nothing to track.
+		return
+	}
+	e.inflight += delta
+	if e.inflight < 0 {
+		e.inflight = 0
+	}
+	if delta < 0 {
+		e.lastEnd = s.now()
+	}
+	s.byModel[modelID][sessionID] = e
 }
 
 // hotSlots reports, for the cooling resident modelID, which session each of
@@ -353,17 +506,22 @@ func (s *slotAffinityStore) scratchSlot(modelID string, nSlots int) (slot int, o
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	// Live sessions first (same liveness as placement), then the 15-min
+	// activity count, ties to the highest id: a housekeeping call must avoid
+	// a working session's slot above all, and a paused one's where it can.
+	now := s.now()
+	live, _ := s.slotLoadLocked(s.byModel[modelID], "", nSlots, now)
 	counts := make(map[int]int, nSlots)
-	cutoff := s.now().Add(-s.activeWindow)
+	cutoff := now.Add(-s.activeWindow)
 	for _, e := range s.byModel[modelID] {
 		if e.seen.After(cutoff) {
 			counts[e.slot]++
 		}
 	}
-	best, bestCount := nSlots-1, counts[nSlots-1]
+	best := nSlots - 1
 	for id := nSlots - 2; id >= 0; id-- {
-		if c := counts[id]; c < bestCount {
-			best, bestCount = id, c
+		if live[id] < live[best] || (live[id] == live[best] && counts[id] < counts[best]) {
+			best = id
 		}
 	}
 	return best, true
@@ -490,8 +648,9 @@ func CreateSlotAffinityMiddleware(store *slotAffinityStore, cfg config.Config) c
 				nSlots = mc.ConcurrencyLimit
 			}
 			var (
-				slot int
-				ok   bool
+				slot      int
+				ok        bool
+				sessionID string
 			)
 			if len(body) < store.minInjectBodyBytes {
 				// A body this small is a housekeeping call (a session's own
@@ -503,8 +662,8 @@ func CreateSlotAffinityMiddleware(store *slotAffinityStore, cfg config.Config) c
 				// 900-token prompt. Pin it to the scratch slot instead.
 				slot, ok = store.scratchSlot(modelID, nSlots)
 			} else {
-				sessionID := affinityLaneKey(data.Metadata)
-				slot, ok = store.lookup(modelID, sessionID)
+				sessionID = affinityLaneKey(data.Metadata)
+				slot, ok = store.lookupRepair(modelID, sessionID, nSlots)
 				if !ok {
 					slot, ok = store.assign(modelID, sessionID, nSlots)
 				}
@@ -542,6 +701,13 @@ func CreateSlotAffinityMiddleware(store *slotAffinityStore, cfg config.Config) c
 			// through the setter.
 			stampInflightMetadata(r, slotAffinityMetadataKey, strconv.Itoa(slot))
 
+			// A full turn keeps its session live for placement while it is
+			// served, however long it streams (sessionID is empty for the
+			// scratch path, which is not a lane).
+			if sessionID != "" {
+				store.begin(modelID, sessionID)
+				defer store.end(modelID, sessionID)
+			}
 			next.ServeHTTP(w, r)
 		})
 	}

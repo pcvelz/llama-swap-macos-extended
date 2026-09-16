@@ -1292,3 +1292,119 @@ func TestFIFO_KVAdmission_LargeSerializationClearsAfterRelease(t *testing.T) {
 		t.Fatalf("nothing should have parked, len=%d want 0", len(s.queued))
 	}
 }
+
+// newFIFOKVModels is newFIFOKV with per-model configs, for the per-model
+// scheduler keys (maxParallelLargePrefill).
+func newFIFOKVModels(eff Effects, pool map[string]int, models map[string]config.ModelConfig) *FIFO {
+	cfg := config.FifoConfig{KVPoolTokens: pool}
+	return NewFIFO("test", logmon.NewWriter(io.Discard), &stubPlanner{}, cfg, models, eff)
+}
+
+// TestFIFO_KVAdmission_MaxParallelLargePrefillPoolStillApplies: a large cap
+// above 1 does not bypass the summed-token pool check.
+func TestFIFO_KVAdmission_MaxParallelLargePrefillPoolStillApplies(t *testing.T) {
+	withLargePrefillThreshold(t, 100)
+	eff := newFakeEffects()
+	eff.states["m"] = process.StateReady
+	s := newFIFOKVModels(eff, map[string]int{"m": 1_000},
+		map[string]config.ModelConfig{"m": {ConcurrencyLimit: 4, MaxParallelLargePrefill: 4}})
+
+	s.OnRequest(reqTokens("m", 200))
+	s.OnRequest(reqTokens("m", 200))
+	if got := eff.served("m"); got != 2 {
+		t.Fatalf("two large requests within the pool must be granted, served=%d want 2", got)
+	}
+	s.OnRequest(reqTokens("m", 700))
+	if got := eff.served("m"); got != 2 {
+		t.Fatalf("pool overflow must still park under a large cap of 4, served=%d want 2", got)
+	}
+}
+
+// TestFIFO_KVAdmission_MaxParallelLargePrefillOne: n=1 parks the second large
+// request even though the pool fits both; a small request still rides the
+// second slot, and the parked large one is granted when the first frees.
+func TestFIFO_KVAdmission_MaxParallelLargePrefillOne(t *testing.T) {
+	withLargePrefillThreshold(t, 100)
+	eff := newFakeEffects()
+	eff.states["m"] = process.StateReady
+	s := newFIFOKVModels(eff, map[string]int{"m": 1_000_000},
+		map[string]config.ModelConfig{"m": {ConcurrencyLimit: 2, MaxParallelLargePrefill: 1}})
+
+	s.OnRequest(reqTokens("m", 200))
+	s.OnRequest(reqTokens("m", 200))
+	if got := eff.served("m"); got != 1 {
+		t.Fatalf("n=1 must park the second large request, served=%d want 1", got)
+	}
+	if len(s.queued) != 1 {
+		t.Fatalf("parked request should be queued, len=%d want 1", len(s.queued))
+	}
+	s.OnServeDone(ServeDoneEvent{ModelID: "m", EstimatedTokens: 200})
+	if got := eff.served("m"); got != 2 {
+		t.Fatalf("parked large request should be granted once the first frees, served=%d want 2", got)
+	}
+}
+
+// TestFIFO_KVAdmission_MaxParallelLargePrefillTwo: n=2 grants two large
+// requests together and parks the third while the pool still fits it.
+func TestFIFO_KVAdmission_MaxParallelLargePrefillTwo(t *testing.T) {
+	withLargePrefillThreshold(t, 100)
+	eff := newFakeEffects()
+	eff.states["m"] = process.StateReady
+	s := newFIFOKVModels(eff, map[string]int{"m": 1_000_000},
+		map[string]config.ModelConfig{"m": {ConcurrencyLimit: 4, MaxParallelLargePrefill: 2}})
+
+	s.OnRequest(reqTokens("m", 200))
+	s.OnRequest(reqTokens("m", 200))
+	if got := eff.served("m"); got != 2 {
+		t.Fatalf("n=2 must grant two large requests together, served=%d want 2", got)
+	}
+	s.OnRequest(reqTokens("m", 200))
+	if got := eff.served("m"); got != 2 {
+		t.Fatalf("n=2 must park the third large request, served=%d want 2", got)
+	}
+	if len(s.queued) != 1 {
+		t.Fatalf("third large request should be queued, len=%d want 1", len(s.queued))
+	}
+	s.OnRequest(reqTokens("m", 10)) // small: not counted against n
+	if got := eff.served("m"); got != 3 {
+		t.Fatalf("a small request must still be granted under the large cap, served=%d want 3", got)
+	}
+	s.OnServeDone(ServeDoneEvent{ModelID: "m", EstimatedTokens: 200})
+	if got := eff.served("m"); got != 4 {
+		t.Fatalf("parked third large request should be granted once one frees, served=%d want 4", got)
+	}
+}
+
+// TestFIFO_KVAdmission_MaxParallelLargePrefillUnsetDefaultsToOne: a model the
+// scheduler has no config for gets config.MODEL_CONFIG_DEFAULT_MAX_PARALLEL_LARGE_PREFILL.
+func TestFIFO_KVAdmission_MaxParallelLargePrefillUnsetDefaultsToOne(t *testing.T) {
+	withLargePrefillThreshold(t, 100)
+	eff := newFakeEffects()
+	eff.states["m"] = process.StateReady
+	s := newFIFOKVModels(eff, map[string]int{"m": 1_000_000}, nil)
+
+	s.OnRequest(reqTokens("m", 200))
+	s.OnRequest(reqTokens("m", 200))
+	if got := eff.served("m"); got != config.MODEL_CONFIG_DEFAULT_MAX_PARALLEL_LARGE_PREFILL {
+		t.Fatalf("unset must default to %d parallel large requests, served=%d",
+			config.MODEL_CONFIG_DEFAULT_MAX_PARALLEL_LARGE_PREFILL, got)
+	}
+}
+
+// TestFIFO_KVAdmission_MaxParallelLargePrefillZeroLeavesConcurrencyLimit: n=0
+// sets no separate large cap, so concurrencyLimit (the outer cap) and the pool
+// decide alone.
+func TestFIFO_KVAdmission_MaxParallelLargePrefillZeroLeavesConcurrencyLimit(t *testing.T) {
+	withLargePrefillThreshold(t, 100)
+	eff := newFakeEffects()
+	eff.states["m"] = process.StateReady
+	s := newFIFOKVModels(eff, map[string]int{"m": 1_000_000},
+		map[string]config.ModelConfig{"m": {ConcurrencyLimit: 3, MaxParallelLargePrefill: 0}})
+
+	for i := 0; i < 4; i++ {
+		s.OnRequest(reqTokens("m", 200))
+	}
+	if got := eff.served("m"); got != 3 {
+		t.Fatalf("n=0 must leave only concurrencyLimit 3 in force, served=%d want 3", got)
+	}
+}

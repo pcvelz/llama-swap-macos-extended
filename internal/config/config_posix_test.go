@@ -225,6 +225,8 @@ groups:
 				Timeouts:           defaultTimeout,
 				HealthCheckTimeout: 15,
 				UnloadTimeout:      DEFAULT_UNLOAD_TIMEOUT,
+
+				MaxParallelLargePrefill: MODEL_CONFIG_DEFAULT_MAX_PARALLEL_LARGE_PREFILL,
 			},
 			"model2": {
 				Cmd:                "path/to/server --arg1 one",
@@ -236,6 +238,8 @@ groups:
 				Timeouts:           defaultTimeout,
 				HealthCheckTimeout: 15,
 				UnloadTimeout:      DEFAULT_UNLOAD_TIMEOUT,
+
+				MaxParallelLargePrefill: MODEL_CONFIG_DEFAULT_MAX_PARALLEL_LARGE_PREFILL,
 			},
 			"model3": {
 				Cmd:                "path/to/cmd --arg1 one",
@@ -247,6 +251,8 @@ groups:
 				Timeouts:           defaultTimeout,
 				HealthCheckTimeout: 15,
 				UnloadTimeout:      DEFAULT_UNLOAD_TIMEOUT,
+
+				MaxParallelLargePrefill: MODEL_CONFIG_DEFAULT_MAX_PARALLEL_LARGE_PREFILL,
 			},
 			"model4": {
 				Cmd:                "path/to/cmd --arg1 one",
@@ -258,6 +264,8 @@ groups:
 				Timeouts:           defaultTimeout,
 				HealthCheckTimeout: 15,
 				UnloadTimeout:      DEFAULT_UNLOAD_TIMEOUT,
+
+				MaxParallelLargePrefill: MODEL_CONFIG_DEFAULT_MAX_PARALLEL_LARGE_PREFILL,
 			},
 		},
 		HealthCheckTimeout: 15,

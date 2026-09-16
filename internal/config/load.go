@@ -229,6 +229,10 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 			modelConfig.UnloadTimeout = config.UnloadTimeout
 		}
 
+		if modelConfig.MaxParallelLargePrefill < 0 {
+			return Config{}, fmt.Errorf("model %s: invalid maxParallelLargePrefill value %d", modelId, modelConfig.MaxParallelLargePrefill)
+		}
+
 		if err := modelConfig.Capabilities.Validate(); err != nil {
 			return Config{}, fmt.Errorf("model %s: %w", modelId, err)
 		}

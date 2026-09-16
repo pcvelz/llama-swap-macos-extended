@@ -46,7 +46,10 @@ final class SlotTruthRowWordTests: XCTestCase {
     }
 
     private func makeClient(laneLingerSeconds: TimeInterval = BackendClient.defaultLaneLingerSeconds) -> BackendClient {
-        let client = BackendClient(baseURL: stub.baseURL, laneLingerSeconds: laneLingerSeconds)
+        // Hold 0: slot truth is judged per instant; the visual hold is
+        // RowWordSteadinessTests' contract.
+        let client = BackendClient(baseURL: stub.baseURL, laneLingerSeconds: laneLingerSeconds,
+                                   rowWordHoldSeconds: 0)
         XCTAssertTrue(waitUntil { self.stub.hasEventClient },
                       "client never opened the /api/events stream")
         return client
