@@ -149,18 +149,31 @@ public final class BackendClient: ObservableObject {
     private var slotSamples: [String: SlotSample] = [:]
     private var slotTimer: Timer?
 
-    private struct SlotInfo: Decodable {
-        // llama-server's /slots wraps next_token in a single-element array,
-        // not a bare object; decoding it as an object throws on every
-        // response and silently drops the whole payload upstream (`try?`).
-        struct NextToken: Decodable { let n_decoded: Int? }
+    // Decodable shape of the control-plane `GET /api/slots` endpoint
+    // (internal/server/apigroup.go handleAPISlots), one GET per poll tick
+    // for ALL models rather than one GET per model - see pollSlots(). Given
+    // internal (not private) access so the test target can decode it
+    // directly (@testable import).
+    struct ApiSlotsResponse: Decodable {
+        let models: [ApiModelSlots]
+    }
+
+    struct ApiModelSlots: Decodable {
+        let model: String
+        let state: String
+        let slots: [SlotInfo]
+        let error: String?
+    }
+
+    struct SlotInfo: Decodable {
+        // Unlike llama-server's own /slots (which wraps the decoded-token
+        // counter in a single-element next_token array), the proxy's
+        // /api/slots already unwraps it: n_decoded is flat on the slot.
         let id: Int
         let is_processing: Bool
         let n_prompt_tokens: Int?
         let n_prompt_tokens_processed: Int?
-        let next_token: [NextToken]?
-
-        var nextTokenInfo: NextToken? { next_token?.first }
+        let n_decoded: Int?
     }
 
     /// Tracks BOTH slot counters independently rather than a single `value`
@@ -396,10 +409,16 @@ public final class BackendClient: ObservableObject {
                 // untouched, so the row does not move.
                 guard let entry = newestByLane[lane] else {
                     guard let held = lingeringLanes[lane]?.row else { return nil }
+                    // The rate is dropped, the context total kept: a lane
+                    // with no request is on no slot, so a "t/s" here claims
+                    // generation that is not happening (user report
+                    // 2026-09-16, "TURN · 106.6k · 20.0 t/s" beside a
+                    // DECODE row that carried no rate). The total is still
+                    // true - it is the lane's context as it last stood.
                     return SessionRow(
                         id: held.id, origin: held.origin, model: held.model,
                         tier: held.tier, word: ThroughputWord.turn.rawValue,
-                        detail: held.detail, hasSession: held.hasSession,
+                        detail: Self.readoutWithoutRate(held.detail), hasSession: held.hasSession,
                         title: held.title, parent: held.parent, agent: held.agent)
                 }
                 let meta = entry.metadata ?? [:]
@@ -515,8 +534,9 @@ public final class BackendClient: ObservableObject {
         lastRowByLane = lastRowByLane.filter { known.contains($0.key) }
     }
 
-    /// Poll `/slots` only while there is inflight work; one GET per distinct
-    /// model per tick. Everything lands back on main before touching state.
+    /// Poll `/api/slots` only while there is inflight work; one GET per
+    /// tick for all resident models. Everything lands back on main before
+    /// touching state.
     private func syncSlotPolling() {
         guard !inflightEntries.isEmpty else {
             DispatchQueue.main.async {
@@ -560,34 +580,45 @@ public final class BackendClient: ObservableObject {
         return session
     }
 
-    /// The model whose /slots answer for this entry. A resident-alias request
-    /// (claude-haiku-*, default) keeps the alias as entry.model, and an alias
-    /// has no /upstream route - polling it 404s every tick and the row's slot
-    /// readout vanishes. The proxy stamps metadata.resolved_model with the
-    /// model that serves; follow it when present.
+    /// The model whose /api/slots entry answers for this entry. A
+    /// resident-alias request (claude-haiku-*, default) keeps the alias as
+    /// entry.model, and an alias is not itself a resident model - it never
+    /// appears as a "model" key in /api/slots, so joining on the alias finds
+    /// nothing and the row's slot readout vanishes. The proxy stamps
+    /// metadata.resolved_model with the model that serves; follow it when
+    /// present.
     static func slotModel(for entry: InflightRequestEntry) -> String {
         entry.metadata?["resolved_model"] ?? entry.model
     }
 
     private func pollSlots() {
-        // Only entries that hold a slot have slots to read. A PARKED entry's
-        // model is by definition not resident; polling its /slots is answered
-        // 503 by the proxy now, and before that fix every such poll sat in
-        // the scheduler queue as a swap request for 2-4s (2026-09-10). Not
-        // sending it at all keeps the swap log clean.
-        let models = Set(inflightEntries.values.filter { !Self.isParked($0) }.map { Self.slotModel(for: $0) })
-        for model in models {
-            let escaped = model.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? model
-            let url = baseURL.appendingPathComponent("/upstream/\(escaped)/slots")
-            URLSession.shared.dataTask(with: url) { [weak self] data, _, _ in
-                guard let self, let data,
-                      let slots = try? JSONDecoder().decode([SlotInfo].self, from: data) else { return }
-                DispatchQueue.main.async {
-                    self.slotCache[model] = slots
-                    self.refreshSlotDetails()
+        // Only bother with the round trip when at least one entry actually
+        // holds a slot. Keyed on the GRANT, not on !isParked: a request is
+        // stamped slot_granted one upsert before its kv_parked flag is
+        // cleared (internal/router/base.go), and that granted-but-still-
+        // flagged request is on a resident model whose slot the row must be
+        // able to read - see slotHeldByLane.
+        guard inflightEntries.values.contains(where: { $0.metadata?["slot_granted"] == "1" }) else { return }
+        // One GET for every resident model's slots, not one GET per granted
+        // model - the proxy's control-plane /api/slots (internal/server/
+        // apigroup.go handleAPISlots) answers all of them in a single call,
+        // so the menu and the ccstatusline status line now read the same
+        // source with the same join rules.
+        let url = baseURL.appendingPathComponent("/api/slots")
+        URLSession.shared.dataTask(with: url) { [weak self] data, _, _ in
+            guard let self, let data,
+                  let response = try? JSONDecoder().decode(ApiSlotsResponse.self, from: data) else { return }
+            DispatchQueue.main.async {
+                // Upsert EVERY model in the response, including one with an
+                // empty slots array, so a model that just went idle replaces
+                // its stale cache entry instead of leaving the last
+                // is_processing snapshot behind.
+                for model in response.models {
+                    self.slotCache[model.model] = model.slots
                 }
-            }.resume()
-        }
+                self.refreshSlotDetails()
+            }
+        }.resume()
     }
 
     /// Which slot counter last MOVED for a lane: .decode when n_decoded
@@ -611,12 +642,20 @@ public final class BackendClient: ObservableObject {
     private func refreshSlotDetails(now: Date = Date()) {
         menuState.sessionRows = menuState.sessionRows.map { row in
             guard let entry = inflightEntries[row.id] else { return row }
-            // A PARKED row's detail is its park reason, not a slot readout:
-            // keep it, there is no slot to read for it.
-            let detail = row.word == ThroughputWord.parked.rawValue
+            // THE SLOT OUTRANKS THE PROXY'S PARK FLAGS. A row classified
+            // PARKED whose lane is in fact generating on its own slot (see
+            // slotHeldByLane) is active, not parked: the flags lag the slot
+            // around every hand-off, and the user watched a decoding session
+            // read PARKED (2026-09-16). Its word comes from the slot's own
+            // phase once a counter has moved, DECODE until then - the slot is
+            // processing for a granted request, which is past admission.
+            let activeDespiteParkFlag = row.word == ThroughputWord.parked.rawValue && slotHeldByLane(entry)
+            // A genuinely PARKED row's detail is its park reason, not a slot
+            // readout: keep it, there is no slot to read for it.
+            let detail = row.word == ThroughputWord.parked.rawValue && !activeDespiteParkFlag
                 ? row.detail
                 : slotDetail(for: entry, word: row.word, now: now)
-            var word = row.word
+            var word = activeDespiteParkFlag ? ThroughputWord.decode.rawValue : row.word
             if word == ThroughputWord.prefill.rawValue || word == ThroughputWord.decode.rawValue,
                let phase = slotPhases[Self.laneKey(for: entry)] {
                 word = phase.rawValue
@@ -638,6 +677,46 @@ public final class BackendClient: ObservableObject {
         return meta["kv_parked"] == "1" || meta["slot_granted"] != "1"
     }
 
+    /// True when `entry`'s LANE is generating on the slot it is pinned to -
+    /// the slot-truth override for a request whose own park flags say
+    /// otherwise. All three must hold, each closing a known false positive:
+    /// 1. The pinned slot (metadata.slot_affinity, stable per session) reports
+    ///    is_processing.
+    /// 2. The lane holds a GRANTED request (this one or an older one still
+    ///    streaming). Without it a lane that merely waits would borrow a
+    ///    slot that is busy for nobody in view - e.g. a /slots answer cached
+    ///    a tick before the lane's previous request was removed
+    ///    (ParkedRowSlotJoinTests.testLaneGoingParkedDropsTheHeldReadoutImmediately).
+    /// 3. No granted request of ANOTHER lane is pinned to that slot or
+    ///    carries no pin at all. Subagents share their parent's affinity, so
+    ///    a parked subagent must not claim the parent's busy slot
+    ///    (ParkedRowSlotJoinTests.testParkedRowsDoNotBorrowTheGrantedSlotsReadout);
+    ///    an unpinned granted request (a session-less curl) could be the one
+    ///    on the slot, so the claim is ambiguous and stays PARKED.
+    private func slotHeldByLane(_ entry: InflightRequestEntry) -> Bool {
+        guard let affinity = entry.metadata?["slot_affinity"], let slotID = Int(affinity) else { return false }
+        let model = Self.slotModel(for: entry)
+        guard slotCache[model]?.first(where: { $0.id == slotID })?.is_processing == true else { return false }
+        let lane = Self.laneKey(for: entry)
+        let granted = inflightEntries.values.filter {
+            $0.metadata?["slot_granted"] == "1" && Self.slotModel(for: $0) == model
+        }
+        guard granted.contains(where: { Self.laneKey(for: $0) == lane }) else { return false }
+        return !granted.contains { other in
+            guard Self.laneKey(for: other) != lane else { return false }
+            let pin = other.metadata?["slot_affinity"]
+            return pin == nil || pin == affinity
+        }
+    }
+
+    /// Drops the rate from a "total · rate" readout, keeping the total. Used
+    /// for a lane lingering between turns, which holds no slot.
+    static func readoutWithoutRate(_ detail: String?) -> String? {
+        guard let detail else { return nil }
+        let kept = detail.components(separatedBy: " · ").filter { !$0.hasSuffix("t/s") }
+        return kept.isEmpty ? nil : kept.joined(separator: " · ")
+    }
+
     private func joinedSlot(for entry: InflightRequestEntry) -> SlotInfo? {
         guard let slots = slotCache[Self.slotModel(for: entry)] else { return nil }
         let meta = entry.metadata ?? [:]
@@ -651,7 +730,9 @@ public final class BackendClient: ObservableObject {
         // with one slot processing and one idle). The fallback branch has the
         // same hole whenever exactly one slot is processing. Same flags as
         // the PARKED classification in applyInflightEntries.
-        guard !Self.isParked(entry) else { return nil }
+        // ...unless the lane is provably on its own slot despite the flag
+        // (slotHeldByLane closes exactly the borrow described above).
+        guard !Self.isParked(entry) || slotHeldByLane(entry) else { return nil }
         if let affinity = meta["slot_affinity"], let id = Int(affinity),
            let slot = slots.first(where: { $0.id == id }) { return slot }
         if let sid = meta["slot_id"], let id = Int(sid),
@@ -693,7 +774,9 @@ public final class BackendClient: ObservableObject {
         // 19:25). Dropping the hold (and the rate sample, whose counters
         // restart on the next grant anyway) makes the row go bare the moment
         // the lane parks; the next grant rebuilds both from a real join.
-        if Self.isParked(entry) {
+        // A flag the slot contradicts is not a known park (slotHeldByLane):
+        // keep the lane's samples so its rate survives the hand-off.
+        if Self.isParked(entry) && !slotHeldByLane(entry) {
             slotReadoutHolds[lane] = nil
             slotRateHolds[lane] = nil
             slotSamples[lane] = nil
@@ -714,7 +797,7 @@ public final class BackendClient: ObservableObject {
     private func freshSlotDetail(for entry: InflightRequestEntry, lane: String, now: Date) -> String? {
         guard let slot = joinedSlot(for: entry) else { return nil }
         let prompt = slot.n_prompt_tokens ?? 0
-        let decoded = slot.nextTokenInfo?.n_decoded ?? 0
+        let decoded = slot.n_decoded ?? 0
         let context = CompactFormatter.tokens(prompt + decoded)
         guard slot.is_processing else { return context }
         let prefillProcessed = slot.n_prompt_tokens_processed ?? prompt

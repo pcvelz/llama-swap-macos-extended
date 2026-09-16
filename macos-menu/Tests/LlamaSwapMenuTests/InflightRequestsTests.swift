@@ -211,14 +211,19 @@ final class InflightRequestsTests: XCTestCase {
     }
 
     /// Slot polling for a resident-alias row. The in-flight entry keeps the id
-    /// the caller asked for (claude-haiku-4-5-20251001), which has no /upstream
-    /// route: polling /upstream/<alias>/slots 404s every tick and the row loses
+    /// the caller asked for (claude-haiku-4-5-20251001), which never shows up
+    /// as a "model" key in /api/slots - only the resident model it resolved
+    /// to does, so joining on the alias id finds nothing and the row loses
     /// its slot readout (witnessed 2026-09-08, "slots disappear" while only a
     /// subagent turn is in flight). The proxy stamps metadata.resolved_model;
-    /// the poll must follow it, and the row must carry the agent's short id.
+    /// the join must follow it, and the row must carry the agent's short id.
     func testSlotPollFollowsResolvedModelNotTheAliasId() {
         stub.responder = { _, path in
-            if path.hasSuffix("/slots") { return (200, "[]") }
+            if path == "/api/slots" {
+                return (200, """
+                {"models":[{"model":"Qwen3.6-35B-A3B-APEX-I-Balanced-384K","state":"ready","slots":[]}]}
+                """)
+            }
             return (200, "{}")
         }
         let client = makeClient()
@@ -234,10 +239,8 @@ final class InflightRequestsTests: XCTestCase {
         stub.pushEvent(type: "inflight", inner: inner)
 
         XCTAssertTrue(waitUntil {
-            self.stub.recorded.contains { $0.path == "/upstream/Qwen3.6-35B-A3B-APEX-I-Balanced-384K/slots" }
-        }, "slot poll must target the resolved model; recorded: \(stub.recorded.map(\.path))")
-        XCTAssertFalse(stub.recorded.contains { $0.path == "/upstream/claude-haiku-4-5-20251001/slots" },
-                       "the alias id has no upstream route and must never be polled")
+            self.stub.recorded.contains { $0.path == "/api/slots" }
+        }, "slot poll must hit the single /api/slots endpoint; recorded: \(stub.recorded.map(\.path))")
         XCTAssertEqual(client.menuState.sessionRows.first?.agent, "a4c4e94e")
     }
 

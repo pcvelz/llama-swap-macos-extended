@@ -68,8 +68,9 @@ final class SlotPhaseWordTests: XCTestCase {
             lock.lock(); polls += 1; let n = polls; lock.unlock()
             let decoded = n <= 1 ? 100 : 300
             return (200, """
-            [{"id":0,"is_processing":true,"n_prompt_tokens":110000,\
-            "n_prompt_tokens_processed":110000,"next_token":[{"n_decoded":\(decoded)}]}]
+            {"models":[{"model":"cq35","state":"ready","slots":[\
+            {"id":0,"is_processing":true,"n_prompt_tokens":110000,\
+            "n_prompt_tokens_processed":110000,"n_decoded":\(decoded)}]}]}
             """)
         }
         let client = makeClient()
@@ -96,8 +97,9 @@ final class SlotPhaseWordTests: XCTestCase {
             lock.lock(); polls += 1; let n = polls; lock.unlock()
             let processed = n <= 1 ? 15000 : 17048
             return (200, """
-            [{"id":0,"is_processing":true,"n_prompt_tokens":40000,\
-            "n_prompt_tokens_processed":\(processed),"next_token":[{"n_decoded":0}]}]
+            {"models":[{"model":"cq35","state":"ready","slots":[\
+            {"id":0,"is_processing":true,"n_prompt_tokens":40000,\
+            "n_prompt_tokens_processed":\(processed),"n_decoded":0}]}]}
             """)
         }
         let client = makeClient()

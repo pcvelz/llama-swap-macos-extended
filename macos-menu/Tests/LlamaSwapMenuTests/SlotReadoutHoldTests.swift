@@ -71,13 +71,16 @@ final class SlotReadoutHoldTests: XCTestCase {
             let decoded = n <= 1 ? 100 : 300
             let session = """
             {"id":1,"is_processing":true,"n_prompt_tokens":15000,\
-            "n_prompt_tokens_processed":15000,"next_token":[{"n_decoded":\(decoded)}]}
+            "n_prompt_tokens_processed":15000,"n_decoded":\(decoded)}
             """
             let peer = """
             {"id":0,"is_processing":true,"n_prompt_tokens":700,\
-            "n_prompt_tokens_processed":700,"next_token":[{"n_decoded":5}]}
+            "n_prompt_tokens_processed":700,"n_decoded":5}
             """
-            return (200, n <= 2 ? "[\(session)]" : "[\(session),\(peer)]")
+            let slots = n <= 2 ? "[\(session)]" : "[\(session),\(peer)]"
+            return (200, """
+            {"models":[{"model":"cq35","state":"ready","slots":\(slots)}]}
+            """)
         }
 
         let client = makeClient()
@@ -131,8 +134,9 @@ final class SlotReadoutHoldTests: XCTestCase {
             lock.unlock()
             let processed = n <= 1 ? 1000 : (n <= 5 ? 3048 : 5096)
             return (200, """
-            [{"id":0,"is_processing":true,"n_prompt_tokens":20000,\
-            "n_prompt_tokens_processed":\(processed),"next_token":[{"n_decoded":0}]}]
+            {"models":[{"model":"cq35","state":"ready","slots":[\
+            {"id":0,"is_processing":true,"n_prompt_tokens":20000,\
+            "n_prompt_tokens_processed":\(processed),"n_decoded":0}]}]}
             """)
         }
 

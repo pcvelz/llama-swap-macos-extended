@@ -9,9 +9,10 @@ import Foundation
 public struct ThroughputSample: Equatable {
     public var respBytes: Int64
     public var sampledAt: Date
-    /// Pinned the first time respBytes > 0 is observed, then carried forward
-    /// unchanged while the stream continues - anchors FLAT's "N seconds since
-    /// first byte" clock, same as the bash reader's first_byte_epoch.
+    /// Pinned the first time respBytes > 0 is observed and moved to the
+    /// sample time on every byte increase - anchors FLAT's "N seconds since
+    /// the last output byte" clock, same as the bash reader's
+    /// first_byte_epoch (the name is kept for parity with that field).
     public var firstByteAt: Date?
     /// The elapsed_ms this sample carried - the PREFILL-advance proxy (see
     /// classify's resp_bytes==0 branch). This reader has no access to the
@@ -60,7 +61,11 @@ public enum ThroughputWord: String {
 public enum SessionThroughput {
     /// Mirrors SESSION_THROUGHPUT_PREFILL_BUDGET_S's default (900s).
     public static let prefillBudgetSeconds: TimeInterval = 900
-    /// Mirrors SESSION_THROUGHPUT_FLAT_S's default (60s).
+    /// Mirrors SESSION_THROUGHPUT_FLAT_S's default (60s), measured from the
+    /// LAST progress. Doubles as the minimum DECODE hold: 60s is far above
+    /// any healthy inter-token gap (even a slow cq27 decode emits every few
+    /// seconds) yet short enough that a real stall still surfaces within a
+    /// minute, and matching the bash reader keeps both surfaces in agreement.
     public static let flatWindowSeconds: TimeInterval = 60
 
     public static func classify(
@@ -97,6 +102,17 @@ public enum SessionThroughput {
             firstByteAt = now
             word = .decode
         } else if let previous, respBytes > previous.respBytes {
+            // Progress resets the flat clock, so firstByteAt tracks the LAST
+            // output byte and FLAT means "no byte for the whole window", same
+            // as the bash reader's first_byte_epoch reset. This IS the
+            // minimum DECODE hold: once a row reads DECODE it cannot read
+            // FLAT until flatWindowSeconds pass with no further progress.
+            // Without it, BackendClient re-classifying this entry on another
+            // request's SSE event (bytes unchanged since its own last upsert)
+            // read FLAT once the request was 60s old, and its next upsert
+            // DECODE again - a DECODE/FLAT/DECODE flicker that re-alerts
+            // every status consumer (2026-09-16).
+            firstByteAt = now
             word = .decode
         } else if let previous, respBytes == previous.respBytes,
                   let pinnedFirstByte = firstByteAt,

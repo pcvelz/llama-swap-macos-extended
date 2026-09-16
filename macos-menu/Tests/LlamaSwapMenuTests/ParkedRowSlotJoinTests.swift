@@ -58,10 +58,11 @@ final class ParkedRowSlotJoinTests: XCTestCase {
         stub.responder = { _, path in
             guard path.hasSuffix("/slots") else { return (200, "{}") }
             return (200, """
-            [{"id":0,"is_processing":true,"n_prompt_tokens":97613,\
-            "n_prompt_tokens_processed":97613,"next_token":[{"n_decoded":0}]},\
+            {"models":[{"model":"Qwen3.6-35B-A3B-APEX-I-Balanced-384K","state":"ready","slots":[\
+            {"id":0,"is_processing":true,"n_prompt_tokens":97613,\
+            "n_prompt_tokens_processed":97613,"n_decoded":0},\
             {"id":1,"is_processing":false,"n_prompt_tokens":65047,\
-            "n_prompt_tokens_processed":65047,"next_token":[{"n_decoded":0}]}]
+            "n_prompt_tokens_processed":65047,"n_decoded":0}]}]}
             """)
         }
 
@@ -122,8 +123,9 @@ final class ParkedRowSlotJoinTests: XCTestCase {
         stub.responder = { _, path in
             guard path.hasSuffix("/slots") else { return (200, "{}") }
             return (200, """
-            [{"id":0,"is_processing":true,"n_prompt_tokens":109600,\
-            "n_prompt_tokens_processed":109600,"next_token":[{"n_decoded":40}]}]
+            {"models":[{"model":"Qwen3.6-35B-A3B-APEX-I-Balanced-384K","state":"ready","slots":[\
+            {"id":0,"is_processing":true,"n_prompt_tokens":109600,\
+            "n_prompt_tokens_processed":109600,"n_decoded":40}]}]}
             """)
         }
         let client = makeClient()

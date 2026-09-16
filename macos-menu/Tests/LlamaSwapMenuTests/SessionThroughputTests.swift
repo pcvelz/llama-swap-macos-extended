@@ -58,7 +58,7 @@ final class SessionThroughputTests: XCTestCase {
         let result = SessionThroughput.classify(
             respBytes: 800, elapsedMs: 7_000, previous: prev, now: t0.addingTimeInterval(5))
         XCTAssertEqual(result.word, .decode)
-        XCTAssertEqual(result.sample.firstByteAt, t0, "first byte epoch carries forward unchanged while the stream continues")
+        XCTAssertEqual(result.sample.firstByteAt, t0.addingTimeInterval(5), "progress moves the flat clock to the latest byte, same as the bash reader's first_byte_epoch")
     }
 
     // MARK: - flat bytes
@@ -86,6 +86,43 @@ final class SessionThroughputTests: XCTestCase {
             respBytes: 100, elapsedMs: 1_000, previous: prev, now: now)
         XCTAssertEqual(result.word, .decode)
         XCTAssertEqual(result.sample.firstByteAt, now, "a byte-count drop must re-pin first_byte rather than stay stale")
+    }
+
+    // MARK: - DECODE hold: the flat clock runs from the LAST progress, not the first byte
+    //
+    // BackendClient re-classifies EVERY in-flight entry on EVERY inflight SSE
+    // event, including events about other requests, so a steadily decoding
+    // request is routinely sampled with bytes unchanged since its own last
+    // upsert. With the clock pinned at the first byte, any such sample once
+    // the request was 60s old read FLAT and its next own upsert read DECODE:
+    // DECODE/FLAT/DECODE flicker (2026-09-16, cq35h session e221c13d).
+
+    func testUnrelatedResampleOfLongDecodeWithEqualBytesStaysDecode() {
+        let tracker = SessionThroughputTracker()
+        XCTAssertEqual(tracker.word(forRequestID: "a", respBytes: 100, elapsedMs: 1_000, now: t0), .decode)
+        XCTAssertEqual(tracker.word(forRequestID: "a", respBytes: 5_000, elapsedMs: 50_000, now: t0.addingTimeInterval(50)), .decode)
+        XCTAssertEqual(tracker.word(forRequestID: "a", respBytes: 9_000, elapsedMs: 70_000, now: t0.addingTimeInterval(70)), .decode)
+        XCTAssertEqual(tracker.word(forRequestID: "a", respBytes: 9_000, elapsedMs: 72_000, now: t0.addingTimeInterval(72)), .decode,
+                       "equal bytes 2s after real progress (another request's event) must not read FLAT just because the request is >60s old")
+    }
+
+    func testDecodeHeldForFlatWindowAfterLastProgress() {
+        let tracker = SessionThroughputTracker()
+        _ = tracker.word(forRequestID: "a", respBytes: 100, elapsedMs: 1_000, now: t0)
+        _ = tracker.word(forRequestID: "a", respBytes: 9_000, elapsedMs: 70_000, now: t0.addingTimeInterval(70))
+        for s in stride(from: 72.0, through: 129.0, by: 2.0) {
+            XCTAssertEqual(tracker.word(forRequestID: "a", respBytes: 9_000, elapsedMs: Int64(s * 1000), now: t0.addingTimeInterval(s)), .decode,
+                           "within the hold window after the last progress (t=70s) the word must stay DECODE, sampled at t=\(s)s")
+        }
+    }
+
+    func testGenuineStallStillBecomesFlatAfterHold() {
+        let tracker = SessionThroughputTracker()
+        _ = tracker.word(forRequestID: "a", respBytes: 100, elapsedMs: 1_000, now: t0)
+        _ = tracker.word(forRequestID: "a", respBytes: 9_000, elapsedMs: 70_000, now: t0.addingTimeInterval(70))
+        _ = tracker.word(forRequestID: "a", respBytes: 9_000, elapsedMs: 100_000, now: t0.addingTimeInterval(100))
+        XCTAssertEqual(tracker.word(forRequestID: "a", respBytes: 9_000, elapsedMs: 130_000, now: t0.addingTimeInterval(130)), .flat,
+                       "no progress for the full window since the last byte is a real stall and must surface")
     }
 }
 

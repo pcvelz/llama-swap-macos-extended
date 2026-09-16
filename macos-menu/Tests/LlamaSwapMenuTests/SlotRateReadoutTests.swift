@@ -60,8 +60,9 @@ final class SlotRateReadoutTests: XCTestCase {
             // 400 tokens further along, decoded still 0 throughout.
             let prompt = n <= 1 ? 15000 : 15400
             return (200, """
-            [{"id":0,"is_processing":true,"n_prompt_tokens":\(prompt),\
-            "n_prompt_tokens_processed":\(prompt),"next_token":[{"n_decoded":0}]}]
+            {"models":[{"model":"cq35","state":"ready","slots":[\
+            {"id":0,"is_processing":true,"n_prompt_tokens":\(prompt),\
+            "n_prompt_tokens_processed":\(prompt),"n_decoded":0}]}]}
             """)
         }
 
@@ -123,8 +124,9 @@ final class SlotRateReadoutTests: XCTestCase {
             // and later: still 300 - one quiet tick in a live decode.
             let decoded = n <= 1 ? 100 : 300
             return (200, """
-            [{"id":0,"is_processing":true,"n_prompt_tokens":15000,\
-            "n_prompt_tokens_processed":15000,"next_token":[{"n_decoded":\(decoded)}]}]
+            {"models":[{"model":"cq35","state":"ready","slots":[\
+            {"id":0,"is_processing":true,"n_prompt_tokens":15000,\
+            "n_prompt_tokens_processed":15000,"n_decoded":\(decoded)}]}]}
             """)
         }
 
