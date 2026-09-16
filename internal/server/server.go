@@ -530,6 +530,7 @@ func (s *Server) routes() {
 	mux.Handle("POST /api/models/unpin/{model}", apiChain.ThenFunc(s.handleAPIUnpin))
 	mux.Handle("GET /api/swap-grace", apiChain.ThenFunc(s.handleAPISwapGrace))
 	mux.Handle("POST /api/swap-grace/finish", apiChain.ThenFunc(s.handleAPISwapGraceFinish))
+	mux.Handle("GET /api/slots", apiChain.ThenFunc(s.handleAPISlots))
 	mux.Handle("GET /api/state-trace", apiChain.ThenFunc(s.handleAPIStateTrace))
 
 	s.mux = mux

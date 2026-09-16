@@ -213,6 +213,7 @@ func (mp *metricsMonitor) record(modelID string, r *http.Request, recorder *resp
 			tm.Tokens = parsed.Tokens
 			tm.DurationMs = parsed.DurationMs
 			mergeSlotID(&tm, parsed)
+			stampLiveSlotID(r, tm.Metadata["slot_id"])
 		}
 	} else if gjson.ValidBytes(body) {
 		parsed := gjson.ParseBytes(body)
@@ -235,6 +236,7 @@ func (mp *metricsMonitor) record(modelID string, r *http.Request, recorder *resp
 				tm.Tokens = parsedMetrics.Tokens
 				tm.DurationMs = parsedMetrics.DurationMs
 				mergeSlotID(&tm, parsedMetrics)
+				stampLiveSlotID(r, tm.Metadata["slot_id"])
 			}
 		}
 	} else {
@@ -564,6 +566,27 @@ func mergeSlotID(tm *ActivityLogEntry, parsed ActivityLogEntry) {
 		tm.Metadata = make(map[string]string, 1)
 	}
 	tm.Metadata["slot_id"] = slotID
+}
+
+// stampLiveSlotID pushes the child's serving slot onto the request's LIVE
+// in-flight entry while it is still tracked (record() runs before the
+// inflight middleware removes it). A renderer joining /api/events rows to
+// /upstream/<model>/slots needs the number mid-stream; previously it only
+// landed on the COMPLETED activity entry, post-hoc. The affinity middleware
+// already stamps slot_affinity at admission for opted-in models, but that
+// covers neither non-opted-in models nor the child's own reassignment, so
+// this is the authoritative stamp where the response carries id_slot.
+// No-op when the request never passed through the inflight middleware or
+// the response carried no slot number.
+func stampLiveSlotID(r *http.Request, slotID string) {
+	if slotID == "" {
+		return
+	}
+	setter, ok := swaputil.InflightMetadataSetterFromContext(r.Context())
+	if !ok {
+		return
+	}
+	setter("slot_id", slotID)
 }
 
 // decompressBody decompresses the body based on the Content-Encoding header.

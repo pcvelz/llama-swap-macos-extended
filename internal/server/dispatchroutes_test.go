@@ -30,6 +30,7 @@ func TestIsModelDispatchedRequest_ExcludesControlPlane(t *testing.T) {
 		{http.MethodGet, "/api/events"},
 		{http.MethodGet, "/api/capacity"},
 		{http.MethodGet, "/api/swap-grace"},
+		{http.MethodGet, "/api/slots"},
 		{http.MethodPost, "/api/swap-grace/finish/m1"},
 		{http.MethodGet, "/api/metrics/stats"},
 		{http.MethodGet, "/api/metrics/activity"},

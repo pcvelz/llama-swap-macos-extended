@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"sort"
 	"strconv"
@@ -13,6 +14,7 @@ import (
 	"github.com/mostlygeek/llama-swap/internal/config"
 	"github.com/mostlygeek/llama-swap/internal/event"
 	"github.com/mostlygeek/llama-swap/internal/perf"
+	"github.com/mostlygeek/llama-swap/internal/process"
 	"github.com/mostlygeek/llama-swap/internal/store"
 	"github.com/mostlygeek/llama-swap/internal/swaputil"
 )
@@ -239,6 +241,169 @@ func (s *Server) handleAPICapacity(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleAPISwapGrace(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{"cooldown": s.currentCooldown()})
+}
+
+// handleAPISlots serves the per-model serving-slot view a renderer needs to
+// show one line per slot: which slots exist, which are processing, and what
+// each slot's llama.cpp counters read. It is the proxy-side twin of polling
+// /upstream/<model>/slots per model - ONE control-plane GET instead of N
+// upstream round trips (each of which costs a swap-queue round trip when the
+// model is not resident), and it answers for models that have NO in-flight
+// request at all, which is exactly when a per-inflight-request join has
+// nothing to hang off.
+//
+// The counters are raw llama.cpp values (n_prompt_tokens_processed,
+// n_decoded): phase and rate are the RENDERER's job, measured across its own
+// polls - the proxy samples once per request and cannot time a rate. A
+// renderer that polls at ~1-2s computes "whichever counter moved" exactly
+// like the menu-bar helper does off /upstream/<model>/slots.
+//
+// Slot count: ConcurrencyLimit when configured (it must match the child's
+// --parallel), else 0 = unknown - the child was started without a declared
+// geometry and no slot row is invented for it.
+//
+// Mounted on apiChain, so it is a control-plane path: it never enters
+// admission and never appears as a queue entry of its own.
+func (s *Server) handleAPISlots(w http.ResponseWriter, r *http.Request) {
+	running := s.local.RunningModels()
+	out := make([]apiModelSlots, 0, len(running))
+	for id, state := range running {
+		mc := s.cfg.Models[id]
+		ms := apiModelSlots{
+			Model: id,
+			State: string(state),
+			Slots: []apiSlot{},
+		}
+		if mc.ConcurrencyLimit > 0 && state == process.StateReady {
+			body, err := fetchUpstreamSlots(s.cfg, id)
+			if err != nil {
+				ms.Error = err.Error()
+			} else if slots, ok := parseUpstreamSlots(body); ok {
+				ms.Slots = slots
+			} else {
+				ms.Error = "unparseable /slots response"
+			}
+		}
+		out = append(out, ms)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Model < out[j].Model })
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{"models": out})
+}
+
+// apiSlot is one serving slot's counters as the child reports them. The
+// values are raw llama.cpp numbers: phase (PREFILL/DECODE) and rate (t/s)
+// are the RENDERER's job, measured across its own polls - the proxy samples
+// once per request and cannot time a rate. A renderer polling at ~1-2s
+// computes "whichever counter moved" exactly like the menu-bar helper does
+// off /upstream/<model>/slots.
+type apiSlot struct {
+	ID                     int  `json:"id"`
+	IsProcessing           bool `json:"is_processing"`
+	NPromptTokens          int  `json:"n_prompt_tokens"`
+	NPromptTokensProcessed int  `json:"n_prompt_tokens_processed"`
+	NDecoded               int  `json:"n_decoded"`
+}
+
+// apiModelSlots is one model's slot view: its process state, the slots it
+// serves (empty when unknown or not ready), and a fetch error when the child
+// could not be read this tick.
+type apiModelSlots struct {
+	Model string    `json:"model"`
+	State string    `json:"state"`
+	Slots []apiSlot `json:"slots"`
+	Error string    `json:"error,omitempty"`
+}
+
+// fetchUpstreamSlots GETs /slots on the model's child. Bounded: a stalled
+// child must not hold the control-plane endpoint open.
+func fetchUpstreamSlots(cfg config.Config, modelID string) ([]byte, error) {
+	proxy := childProxyURL(cfg, modelID)
+	if proxy == "" {
+		return nil, fmt.Errorf("no resolvable upstream URL for %s", modelID)
+	}
+	client := &http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Get(proxy + "/slots")
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("/slots -> HTTP %d", resp.StatusCode)
+	}
+	return io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+}
+
+// childProxyURL resolves the URL a model's child listens on from the SAME
+// config the router was built from: the model's `proxy` value with its macros
+// substituted (the ${PORT} auto-allocation happens at config load and is not
+// recoverable afterwards, so this mirrors that substitution). Unresolvable
+// (empty, or a placeholder left unsubstituted) returns "".
+func childProxyURL(cfg config.Config, modelID string) string {
+	mc, ok := cfg.Models[modelID]
+	if !ok || mc.Proxy == "" {
+		return ""
+	}
+	macros := config.MacroList{{Name: "MODEL_ID", Value: modelID}}
+	for _, entry := range cfg.Macros {
+		macros = append(macros, entry)
+	}
+	for _, entry := range mc.Macros {
+		found := false
+		for i, existing := range macros {
+			if existing.Name == entry.Name {
+				macros[i] = entry
+				found = true
+				break
+			}
+		}
+		if !found {
+			macros = append(macros, entry)
+		}
+	}
+	resolved := config.SubstituteMacros(mc.Proxy, macros).(string)
+	if resolved == "" || strings.Contains(resolved, "${") {
+		return ""
+	}
+	return strings.TrimSuffix(resolved, "/")
+}
+
+// parseUpstreamSlots decodes llama-server's /slots body. Current llama.cpp
+// answers {"slots":[...]}; the bare-array form is accepted too so a pinned
+// older child does not read as an error. n_decoded comes from the slot's
+// next_token[0] (llama.cpp wraps it in a single-element array).
+func parseUpstreamSlots(body []byte) ([]apiSlot, bool) {
+	type rawSlot struct {
+		ID                     int  `json:"id"`
+		IsProcessing           bool `json:"is_processing"`
+		NPromptTokens          int  `json:"n_prompt_tokens"`
+		NPromptTokensProcessed int  `json:"n_prompt_tokens_processed"`
+		NextToken              []struct {
+			NDecoded int `json:"n_decoded"`
+		} `json:"next_token"`
+	}
+	var wrap struct {
+		Slots []rawSlot `json:"slots"`
+	}
+	var slots []rawSlot
+	if err := json.Unmarshal(body, &wrap); err == nil && wrap.Slots != nil {
+		slots = wrap.Slots
+	} else if err := json.Unmarshal(body, &slots); err != nil || slots == nil {
+		return nil, false
+	}
+	out := make([]apiSlot, len(slots))
+	for i, sl := range slots {
+		out[i] = apiSlot{
+			ID:                     sl.ID,
+			IsProcessing:           sl.IsProcessing,
+			NPromptTokens:          sl.NPromptTokens,
+			NPromptTokensProcessed: sl.NPromptTokensProcessed,
+		}
+		if len(sl.NextToken) > 0 {
+			out[i].NDecoded = sl.NextToken[0].NDecoded
+		}
+	}
+	return out, true
 }
 
 // currentCooldown is the scheduler's cooldown joined with the resident's

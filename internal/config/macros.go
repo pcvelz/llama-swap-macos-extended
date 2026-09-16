@@ -261,6 +261,13 @@ func substituteMacroList(resolved any, macros MacroList) any {
 	return resolved
 }
 
+// SubstituteMacros is the exported form of substituteMacroList for callers
+// outside the config load path (e.g. the server resolving a model's proxy URL
+// at request time). Same last-entry-wins semantics.
+func SubstituteMacros(resolved any, macros MacroList) any {
+	return substituteMacroList(resolved, macros)
+}
+
 func substituteSetParamsByIDKeys(model map[string]any, macros MacroList) error {
 	filters, ok := model["filters"].(map[string]any)
 	if !ok {

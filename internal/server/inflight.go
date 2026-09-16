@@ -154,7 +154,8 @@ func (t *inflightTracker) Add(r *http.Request, cancel context.CancelFunc) string
 		RespHeaders: map[string]string{},
 	}
 	redactHeaders(entry.ReqHeaders)
-	if data, ok := swaputil.ReadContext(r.Context()); ok {
+	data, hasCtx := swaputil.ReadContext(r.Context())
+	if hasCtx {
 		entry.Model = data.ModelID
 		entry.Metadata = copyMetadata(data.Metadata)
 	}
@@ -169,6 +170,17 @@ func (t *inflightTracker) Add(r *http.Request, cancel context.CancelFunc) string
 			entry.Metadata = map[string]string{}
 		}
 		entry.Metadata["tier"] = tier
+	}
+	// Stamp the same child slot the affinity middleware injected at admission
+	// (slot_affinity.go), so a renderer joining this row to
+	// /upstream/<model>/slots has the number from the FIRST event instead of
+	// waiting for the response's id_slot (SetSlotID) - which on the Anthropic
+	// streaming path only arrives once the whole stream has been read. The
+	// response stamp still runs and wins when the child reassigns mid-stream.
+	if hasCtx {
+		if slot := data.Metadata["slot_affinity"]; slot != "" {
+			entry.Metadata["slot_id"] = slot
+		}
 	}
 
 	t.mu.Lock()
@@ -194,6 +206,36 @@ func (t *inflightTracker) Remove(id string) {
 		}
 		t.enqueueLocked(swaputil.InFlightRequestsEvent{Operation: inflightOperationRemove, ID: id})
 	}
+	t.mu.Unlock()
+}
+
+// SetSlotID stamps the child's serving slot number onto the LIVE in-flight
+// entry for id and re-emits an upsert so subscribers see it before the
+// request completes. This is the live twin of the post-hoc `slot_id` that
+// record() lands on the COMPLETED activity entry from the response's
+// id_slot (metrics.go): a renderer joining /api/events rows to
+// /upstream/<model>/slots needs the slot number WHILE the request is in
+// flight, and the affinity middleware's own stamp only covers opted-in
+// models. Idempotent - re-stamping the same number emits nothing. A no-op
+// once the request has already been Remove()d.
+func (t *inflightTracker) SetSlotID(id string, slot int) {
+	value := strconv.Itoa(slot)
+	t.mu.Lock()
+	req, ok := t.requests[id]
+	if !ok {
+		t.mu.Unlock()
+		return
+	}
+	if req.entry.Metadata["slot_id"] == value {
+		t.mu.Unlock()
+		return
+	}
+	if req.entry.Metadata == nil {
+		req.entry.Metadata = map[string]string{}
+	}
+	req.entry.Metadata["slot_id"] = value
+	req.lastEmitted = time.Now()
+	t.enqueueLocked(upsertInflightEvent(req.entry))
 	t.mu.Unlock()
 }
 
