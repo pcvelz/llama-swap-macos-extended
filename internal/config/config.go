@@ -191,6 +191,9 @@ type Config struct {
 	// swapGraceSeconds bite (llama-cm llama-swap.yaml, swapGraceSeconds note).
 	SwapStarvationSeconds int `yaml:"swapStarvationSeconds"`
 
+	// MemoryBrake is the memory emergency brake; see MemoryBrakeConfig.
+	MemoryBrake MemoryBrakeConfig `yaml:"memoryBrake"`
+
 	Models    map[string]ModelConfig    `yaml:"models"` /* key is model ID */
 	Profiles  map[string]ProfileConfig  `yaml:"profiles"`
 	Selectors map[string]SelectorConfig `yaml:"selectors"`
@@ -327,6 +330,45 @@ type TierConfig struct {
 // token deltas long before a write can block. A SIGSTOPped process (cm-menu's
 // session-freeze) does produce it, and today pins the slot for as long as it
 // stays frozen.
+// MemoryBrakeConfig is the memory emergency brake (internal/membrake): a 1 s
+// in-process sampler that SIGKILLs every local child when FILE-BACKED memory
+// grows by GrowthGB within any rolling WindowMinutes window (measured against
+// the window's minimum), once a model has been ready ArmAfterMinutes; then it
+// holds reloads for HoldMinutes. Calibration and why the defaults are what
+// they are: internal/membrake/brake.go and llama-cm docs/intent/llama-swap-
+// fork-customizations.md. Enabled by default: the block being absent means ON.
+//
+// Rename (2026-09-18): the superseded rule's windowSeconds is replaced by
+// windowMinutes; growthGB keeps its key but now measures file-backed growth
+// only. A yaml that still sets windowSeconds loads, the value is ignored and
+// the brake warns about it at startup (LegacyWindowSeconds).
+type MemoryBrakeConfig struct {
+	Enabled             bool    `yaml:"enabled"`
+	SampleIntervalMs    int     `yaml:"sampleIntervalMs"`
+	WindowMinutes       int     `yaml:"windowMinutes"`
+	GrowthGB            float64 `yaml:"growthGB"`
+	ArmAfterMinutes     int     `yaml:"armAfterMinutes"`
+	ConfirmSamples      int     `yaml:"confirmSamples"`
+	HoldMinutes         int     `yaml:"holdMinutes"`
+	MarkerPath          string  `yaml:"markerPath"`
+	LegacyWindowSeconds int     `yaml:"windowSeconds"` // ignored; warned about at startup
+}
+
+// DefaultMemoryBrakeConfig returns the defaults applied when the yaml omits
+// the block or a field. A leading "~/" in MarkerPath is expanded by the brake.
+func DefaultMemoryBrakeConfig() MemoryBrakeConfig {
+	return MemoryBrakeConfig{
+		Enabled:          true,
+		SampleIntervalMs: 1000,
+		WindowMinutes:    5,
+		GrowthGB:         3.5,
+		ArmAfterMinutes:  10,
+		ConfirmSamples:   2,
+		HoldMinutes:      5,
+		MarkerPath:       "~/Library/Logs/llama-cm/LLAMA-SWAP-MEMORY-BRAKE",
+	}
+}
+
 type PeerStallConfig struct {
 	// Enabled turns the guard on. Default true. False gives byte-identical
 	// pre-feature behaviour: no write deadline is ever installed.

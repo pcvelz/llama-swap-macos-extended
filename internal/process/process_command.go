@@ -597,9 +597,11 @@ func (p *ProcessCommand) doStart(startCtx context.Context, healthCheckTimeout ti
 		cmdCancel()
 		return startResult{err: fmt.Errorf("failed to start command '%s': %w", strings.Join(args, " "), err)}
 	}
+	registerLive(p, cmd.Process.Pid)
 
 	go func() {
 		waitErr := cmd.Wait()
+		unregisterLive(p)
 		switch st := p.State(); {
 		case waitErr == nil:
 			p.proxyLogger.Debugf("<%s> process exited cleanly", p.id)

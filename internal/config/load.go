@@ -70,6 +70,10 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 			Enabled:        true,
 			TimeoutSeconds: 180,
 		},
+		// The memory brake is on by default (absent block = ON); fields the
+		// yaml omits keep these defaults because Decode only overwrites keys
+		// that are present.
+		MemoryBrake: DefaultMemoryBrakeConfig(),
 	}
 	if err = node.Decode(&config); err != nil {
 		return Config{}, err
@@ -110,6 +114,11 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 	// -1 is the documented "valve off" sentinel; anything below it is a typo.
 	if config.SwapStarvationSeconds < -1 {
 		return Config{}, fmt.Errorf("swapStarvationSeconds must be >= -1 (-1 disables the starvation valve)")
+	}
+
+	if mb := config.MemoryBrake; mb.SampleIntervalMs <= 0 || mb.WindowMinutes <= 0 ||
+		mb.GrowthGB <= 0 || mb.ArmAfterMinutes < 0 || mb.ConfirmSamples < 1 || mb.HoldMinutes < 0 {
+		return Config{}, fmt.Errorf("memoryBrake: sampleIntervalMs, windowMinutes, growthGB must be > 0, armAfterMinutes >= 0, confirmSamples >= 1, holdMinutes >= 0 (windowSeconds is obsolete and ignored)")
 	}
 
 	if config.UnloadTimeout < 0 {

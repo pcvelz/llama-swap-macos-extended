@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/mostlygeek/llama-swap/internal/config"
 	"github.com/mostlygeek/llama-swap/internal/logmon"
+	"github.com/mostlygeek/llama-swap/internal/membrake"
 	"github.com/mostlygeek/llama-swap/internal/process"
 	"github.com/mostlygeek/llama-swap/internal/router/scheduler"
 	"github.com/mostlygeek/llama-swap/internal/swaputil"
@@ -549,7 +551,18 @@ func (b *baseRouter) doSwap(modelID string, toStop []string) {
 	// process nobody was ever going to start (issue #946). EnsureReady makes
 	// the same decision inside the process, where the state is owned.
 	target := b.processes[modelID]
-	err := target.EnsureReady(b.shutdownCtx, timeout)
+	// Memory brake hold: after the brake SIGKILLed the local children, a load
+	// is parked until the hold expires, so swap-grace, the kv-admission parker
+	// or a waiting client cannot reload into the very condition that tripped
+	// it (internal/membrake). Parking, not refusing: the client keeps its
+	// place and gets its turn when the hold ends.
+	var err error
+	if target.State() != process.StateReady {
+		err = membrake.DefaultHold.Wait(b.shutdownCtx, modelID, b.logger)
+	}
+	if err == nil {
+		err = target.EnsureReady(b.shutdownCtx, timeout)
+	}
 	if err != nil && b.shutdownCtx.Err() == nil {
 		// Quiet during shutdown: every in-flight swap fails at once there, and
 		// that is expected rather than worth a warning per model.
@@ -968,6 +981,11 @@ func (b *baseRouter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	// origBody is the same bytes) and used both for KV admission and for the
 	// deadline check below. See swaputil.EstimateTokens for the estimation rule.
 	estimatedTokens := swaputil.EstimateTokens(origBody)
+	// The session-state snapshot needs the WHOLE prompt size: a child's
+	// /slots n_prompt_tokens only counts what it has reached so far.
+	if setter, ok := swaputil.InflightMetadataSetterFromContext(arrivalCtx); ok && estimatedTokens > 0 {
+		setter("est_tokens", strconv.Itoa(estimatedTokens))
+	}
 
 	for {
 		attempt := replayCount + 1

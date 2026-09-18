@@ -13,6 +13,7 @@ import (
 
 	"github.com/mostlygeek/llama-swap/internal/config"
 	"github.com/mostlygeek/llama-swap/internal/event"
+	"github.com/mostlygeek/llama-swap/internal/membrake"
 	"github.com/mostlygeek/llama-swap/internal/perf"
 	"github.com/mostlygeek/llama-swap/internal/process"
 	"github.com/mostlygeek/llama-swap/internal/store"
@@ -789,6 +790,12 @@ const (
 	msgTypeUIConfig    messageType = "uiConfig"
 	msgTypeProfile     messageType = "profileChanged"
 	msgTypeSwapGrace   messageType = "swapGrace"
+	// msgTypeMemoryBrake carries membrake.Status (enabled, holding, the
+	// hold countdown and the last brake event), pushed on the same 1s tick.
+	msgTypeMemoryBrake messageType = "memoryBrake"
+	// msgTypeSessions carries the session-state snapshot, the same body as
+	// GET /api/sessions (sessions.go), pushed on change at most 1 Hz.
+	msgTypeSessions messageType = "sessions"
 )
 
 // sendDropReportInterval is how often handleAPIEvents reports messages that
@@ -905,7 +912,19 @@ func (s *Server) handleAPIEvents(w http.ResponseWriter, r *http.Request) {
 			send(messageEnvelope{Type: msgTypeSwapGrace, Data: string(j)})
 		}
 	}
+	sendMemoryBrake := func() {
+		if j, err := json.Marshal(membrake.CurrentStatus()); err == nil {
+			send(messageEnvelope{Type: msgTypeMemoryBrake, Data: string(j)})
+		}
+	}
 
+	sendSessions := func(b sessionsBody) {
+		if j, err := json.Marshal(b); err == nil {
+			send(messageEnvelope{Type: msgTypeSessions, Data: string(j)})
+		}
+	}
+
+	defer event.On(func(e SessionsEvent) { sendSessions(e.Body) })()
 	defer event.On(func(e swaputil.ProcessStateChangeEvent) { sendModels(); sendSwapGrace() })()
 	defer event.On(func(e swaputil.ConfigFileChangedEvent) { sendModels() })()
 	defer event.On(func(e swaputil.ProfileChangedEvent) {
@@ -925,6 +944,10 @@ func (s *Server) handleAPIEvents(w http.ResponseWriter, r *http.Request) {
 	sendProfile()
 	sendInFlight(s.inflight.Current())
 	sendSwapGrace()
+	sendMemoryBrake()
+	if s.sessions != nil && s.sessions.cur.Load() != nil {
+		sendSessions(s.sessions.snapshot())
+	}
 
 	// Swap-grace holds carry a countdown (RemainingSeconds), which drifts
 	// even with no state-change event to hang a push off of -- so tick it on
@@ -941,6 +964,7 @@ func (s *Server) handleAPIEvents(w http.ResponseWriter, r *http.Request) {
 			return
 		case <-graceTicker.C:
 			sendSwapGrace()
+			sendMemoryBrake()
 		case msg := <-sendBuffer:
 			data, err := json.Marshal(msg)
 			if err != nil {

@@ -9,6 +9,10 @@ const ModelPreloadedEventID = 0x06
 const InFlightRequestsEventID = 0x07
 const ProfileChangedEventID = 0x08
 
+// SessionsEventID carries a session-state snapshot (server.SessionsEvent,
+// llama-cm docs/intent/session-state-contract.md).
+const SessionsEventID = 0x09
+
 // ProcessStateChangeEvent is emitted whenever a process transitions between
 // lifecycle states. States are carried as strings so this package stays a leaf
 // (no import of internal/process).

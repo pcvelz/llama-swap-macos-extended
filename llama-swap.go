@@ -27,6 +27,7 @@ import (
 	"github.com/mostlygeek/llama-swap/internal/event"
 	"github.com/mostlygeek/llama-swap/internal/hw"
 	"github.com/mostlygeek/llama-swap/internal/logmon"
+	"github.com/mostlygeek/llama-swap/internal/membrake"
 	"github.com/mostlygeek/llama-swap/internal/menubar"
 	"github.com/mostlygeek/llama-swap/internal/perf"
 	"github.com/mostlygeek/llama-swap/internal/process"
@@ -222,6 +223,11 @@ func main() {
 	if err := process.SetupTreeCleanup(); err != nil {
 		proxyLog.Warnf("failed to set up process tree cleanup: %v", err)
 	}
+
+	// Memory emergency brake (internal/membrake). Started once with the boot
+	// config and outlives config reloads: changing memoryBrake needs a
+	// llama-swap restart. On by default when the yaml has no memoryBrake block.
+	membrake.Start(context.Background(), cfg.MemoryBrake, proxyLog)
 
 	// perfMon outlives config reloads; its config is updated in place.
 	var perfMon *perf.Monitor

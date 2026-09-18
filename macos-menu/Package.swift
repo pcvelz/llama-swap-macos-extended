@@ -22,7 +22,8 @@ let package = Package(
         .testTarget(
             name: "LlamaSwapMenuTests",
             dependencies: ["LlamaSwapMenuCore"],
-            path: "Tests/LlamaSwapMenuTests"
+            path: "Tests/LlamaSwapMenuTests",
+            resources: [.copy("Fixtures")]
         )
     ]
 )

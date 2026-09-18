@@ -42,17 +42,21 @@ final class CancelInflightClickTests: XCTestCase {
         return client
     }
 
-    private let rows = [
-        SessionRow(id: "41", origin: "17426df4", model: "cq35", tier: "-",
-                   word: "PARKED", hasSession: true),
-        SessionRow(id: "42", origin: "9bc0de12", model: "cq35", tier: "-",
-                   word: "DECODE", hasSession: true),
-    ]
+    private func row(id: String, phase: String) -> SessionRow {
+        SessionRow(id: id, sessionShort: String(id.prefix(8)), model: "cq35", alias: "cq35",
+                   tier: "-", priority: 0, phase: phase,
+                   context: ContractContext(used: 0, cached: 0, processed: 0, decoded: 0, promptTotal: 0, window: 262144),
+                   rate: ContractRate(kind: nil, tokensPerSecond: nil, windowSeconds: 30))
+    }
+
+    private var rows: [SessionRow] {
+        [row(id: "41", phase: "PARKED"), row(id: "42", phase: "DECODE")]
+    }
 
     func testClickPostsCancelAndClearsRowImmediately() {
         stub.responder = { _, _ in (200, "{}") }
         let client = makeClient()
-        client.rawRows = rows
+        client.menuState.sessionRows = rows
 
         client.cancelInflight(id: "41")
 
@@ -74,7 +78,7 @@ final class CancelInflightClickTests: XCTestCase {
             return (200, "{}")
         }
         let client = makeClient()
-        client.rawRows = rows
+        client.menuState.sessionRows = rows
 
         client.cancelInflight(id: "41")
 

@@ -42,6 +42,10 @@ type Server struct {
 	// slotAffinity pins sessions to the child slot that last served them for
 	// models with slotAffinity: true (slot_affinity.go).
 	slotAffinity *slotAffinityStore
+	// sessions is the session-state snapshot served on /api/sessions and
+	// pushed as the "sessions" SSE event (sessions.go); nil in tests that do
+	// not wire it.
+	sessions *sessionsHub
 	// trace is the box's state machine as a log (state_trace.go); nil in
 	// tests that do not wire it.
 	trace    *stateTrace
@@ -261,7 +265,9 @@ func New(cfg config.Config, muxlog *logmon.Monitor, proxylog *logmon.Monitor, up
 	s.slotAffinity = newSlotAffinityStore(cfg)
 	s.metrics.affinity = s.slotAffinity
 	s.wireStateTrace()
+	s.sessions = newSessionsHub(s)
 	s.routes()
+	go s.sessions.run(s.shutdownCtx)
 	s.startPreload()
 	return s, nil
 }
@@ -586,6 +592,7 @@ func (s *Server) routes() {
 	mux.Handle("GET /api/swap-grace", apiChain.ThenFunc(s.handleAPISwapGrace))
 	mux.Handle("POST /api/swap-grace/finish", apiChain.ThenFunc(s.handleAPISwapGraceFinish))
 	mux.Handle("GET /api/slots", apiChain.ThenFunc(s.handleAPISlots))
+	mux.Handle("GET /api/sessions", apiChain.ThenFunc(s.handleAPISessions))
 	mux.Handle("GET /api/state-trace", apiChain.ThenFunc(s.handleAPIStateTrace))
 
 	// Stateless MCP server exposing llama-swap's own documentation as tools,

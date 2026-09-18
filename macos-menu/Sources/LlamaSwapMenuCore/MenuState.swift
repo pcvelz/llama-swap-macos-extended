@@ -31,16 +31,12 @@ public struct MenuState: Encodable {
     /// Values 0...1 for the configured bar metrics, in configuration order.
     public var barValues: [Double] = [0, 0]
 
-    /// One row per currently in-flight request, derived from the /api/events
-    /// "inflight" snapshot/upsert/remove stream by BackendClient - the same
-    /// per-session throughput vocabulary as llama-cm's cm-menu (see
-    /// SessionThroughput.swift), so the two can never disagree.
+    /// One row per session in the session-state contract's `sessions[]`
+    /// (llama-cm docs/intent/session-state-contract.md), pushed by the
+    /// "sessions" SSE event and decoded straight into `SessionRow` - see
+    /// SessionStateContract.swift. Sorted by the server (priority descending,
+    /// then elapsedMs descending); this menu renders that order as given.
     public var sessionRows: [SessionRow] = []
-    /// The scheduler's ordered wait list (llama-swap's own authoritative
-    /// "no slot granted yet" data, internal/swaputil/events.go QueueEntry) -
-    /// never inferred, since the live inflight entry carries no per-request
-    /// slot signal (see SessionThroughput.swift's header).
-    public var queueRows: [QueueRow] = []
 
     /// The current swap-grace cooldown (llama-cm llama-swap.yaml
     /// swapGraceSeconds; see fifo.go's grace/idleSince/withinGrace): the
@@ -93,23 +89,6 @@ public struct MenuState: Encodable {
         cd.slots.filter { !$0.sessionId.isEmpty }
     }
 
-    /// The phrase a PARKED row shows after the word: the scheduler's
-    /// `park_reason` (internal/router/scheduler Park* constants) in words.
-    /// `kv_parked` is the older flag for the same KV case. Unknown or absent
-    /// renders nothing - never a guess.
-    public static func parkDetail(reason: String?, kvParked: Bool) -> String? {
-        switch reason ?? "" {
-        case "cap": return "slots full"
-        case "kv": return "kv pool"
-        case "busy": return "resident busy"
-        case "cooldown": return "cooldown"
-        case "loading": return "loading"
-        case "rank": return "behind higher rank"
-        case "swap-collision": return "another swap in flight"
-        default: return kvParked ? "kv pool" : nil
-        }
-    }
-
     /// One hot-slot line under the cooldown row: which session the slot is
     /// being kept warm for (the cooldown's whole purpose - a session's slot
     /// and KV cache survive a tool call or an AskUserQuestion pause), shown
@@ -120,12 +99,17 @@ public struct MenuState: Encodable {
     }
 
     /// The "Queue: idle" line the design calls for when nothing is parked,
-    /// else one summary per queued entry.
-    public static func queueSummary(_ rows: [QueueRow]) -> String {
-        guard !rows.isEmpty else { return "Queue: idle" }
-        return rows
-            .sorted { $0.position < $1.position }
-            .map { "\($0.position). \($0.tier)/\($0.model)" }
+    /// else one summary per queued entry - built straight from the contract's
+    /// own `sessions[]` (PARKED rows), the single source `sessionRows`
+    /// already comes from. There is no second "scheduler queue" list to keep
+    /// in sync with it: llama-swap's PARKED entries ARE the wait list, in the
+    /// order it already sorted them (priority descending, then elapsedMs
+    /// descending - session-state-contract.md § "sessions").
+    public static func queueSummary(_ rows: [SessionRow]) -> String {
+        let parked = rows.filter { $0.phase == "PARKED" }
+        guard !parked.isEmpty else { return "Queue: idle" }
+        return parked.enumerated()
+            .map { i, row in "\(i + 1). \(row.tier)/\(row.alias.isEmpty ? row.model : row.alias)" }
             .joined(separator: ", ")
     }
 
@@ -136,11 +120,19 @@ public struct MenuState: Encodable {
     }
 
     /// The waiting-count row text: a per-tier breakdown ("priority 2, default
-    /// 1 waiting") when more than one tier is in play, otherwise the plain
-    /// "N waiting" string unchanged from before tiers existed.
+    /// 1 waiting") when more than one tier actually HAS a waiter, otherwise
+    /// the plain "N waiting" string unchanged from before tiers existed.
+    ///
+    /// `waitingByTier` is the contract's `queue.byTier` verbatim, which lists
+    /// "every configured tier present, zero included" (session-state-
+    /// contract.md) - so with three configured tiers and one waiter it always
+    /// has 3 entries, not 1. The breakdown is only useful once more than one
+    /// of them is actually nonzero; filtering here is display choice, not a
+    /// second count (the numbers themselves are still the contract's own).
     public var waitingSummary: String {
-        if waitingByTier.count > 1 {
-            let parts = waitingByTier.keys.sorted().map { "\($0) \(waitingByTier[$0] ?? 0)" }
+        let nonZero = waitingByTier.filter { $0.value > 0 }
+        if nonZero.count > 1 {
+            let parts = nonZero.keys.sorted().map { "\($0) \(nonZero[$0] ?? 0)" }
             return parts.joined(separator: ", ") + " waiting"
         }
         return "\(waiting) waiting"
@@ -161,7 +153,7 @@ public struct MenuState: Encodable {
     private enum CodingKeys: String, CodingKey {
         case backendOnline, completed, waiting, waitingByTier, models, chosenModelID
         case pendingModelID, lastSwitchError, barValues, activeModelID
-        case sessionRows, queueRows, cooldown
+        case sessionRows, cooldown
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -177,7 +169,6 @@ public struct MenuState: Encodable {
         try c.encodeIfPresent(lastSwitchError, forKey: .lastSwitchError)
         try c.encodeIfPresent(activeModelID, forKey: .activeModelID)
         try c.encode(sessionRows, forKey: .sessionRows)
-        try c.encode(queueRows, forKey: .queueRows)
         try c.encodeIfPresent(cooldown, forKey: .cooldown)
     }
 }
@@ -216,80 +207,115 @@ public struct HotSlotRow: Identifiable, Codable, Equatable {
     }
 }
 
-/// One in-flight request rendered as a menu row: who it belongs to, which
-/// model it hit, and its throughput classification (SessionThroughput.swift).
+/// One row of the session-state contract's `sessions[]`
+/// (docs/intent/session-state-contract.md, llama-cm), rendered as-is: every
+/// field below is copied from the wire body by `SessionRow.init(contract:)`
+/// (SessionStateContract.swift) and `displayLine` only formats them (k-units,
+/// a percent sign, "kind N.n t/s") - it never derives a number the body does
+/// not already contain (invariant 3).
 public struct SessionRow: Identifiable, Encodable, Equatable {
     public let id: String
-    public let origin: String
+    public let sessionShort: String
     public let model: String
-    /// "-" when the live entry carries no per-request tier (the common case
-    /// today - see SessionThroughput.swift's header on why tier isn't
-    /// threaded onto the live inflight entry's metadata).
+    public let alias: String
     public let tier: String
-    public let word: String
-    /// Optional trailing readout, e.g. "98.9k · 12.4 t/s"; nil when no slot can
-    /// be joined confidently for this request.
-    public let detail: String?
-    /// True when the proxy identified a Claude Code session behind this
-    /// request (metadata.session_id). Decides whether `origin` renders as a
-    /// bracketed session id or as a bare client-family name - the two cases
-    /// the row grammar distinguishes.
-    public let hasSession: Bool
-    /// What that session is working on, from cm-menu's published titles
-    /// (SessionTitleStore); nil when no title is known.
-    public let title: String?
-    /// Short id of the session that DISPATCHED this one, when the request is
-    /// a headless child (metadata.parent_session_id).
-    public let parent: String?
-    /// Short id of the Agent-tool SUBAGENT making this turn
-    /// (metadata.agent_id); nil for the session's own turns. A subagent
-    /// reuses its parent's session id, so without this the parent's turn and
-    /// its subagent's render as identical rows.
-    public let agent: String?
+    /// The tier's configured rank; default tier 0, background negative.
+    /// Reserved by the contract for a future per-session override - this
+    /// menu only renders it (see `priorityText`).
+    public let priority: Int
+    /// `PARKED`, `LOADING`, `PREFILL`, `DECODE`, `HOT`, `IDLE`, or any value
+    /// the server has not documented yet - rendered verbatim either way
+    /// (invariant 5), never mapped through a Swift enum that could reject it.
+    public let phase: String
+    /// Set only while `phase == "PARKED"`. Same verbatim rule as `phase`.
+    public let parkReason: String?
+    public let context: ContractContext
+    /// PREFILL only, 0...1; nil otherwise.
+    public let progress: Double?
+    public let rate: ContractRate
 
-    public init(id: String, origin: String, model: String, tier: String, word: String,
-                detail: String? = nil, hasSession: Bool = false, title: String? = nil,
-                parent: String? = nil, agent: String? = nil) {
+    public init(id: String, sessionShort: String, model: String, alias: String, tier: String,
+                priority: Int, phase: String, parkReason: String? = nil,
+                context: ContractContext, progress: Double? = nil, rate: ContractRate) {
         self.id = id
-        self.origin = origin
+        self.sessionShort = sessionShort
         self.model = model
+        self.alias = alias
         self.tier = tier
-        self.word = word
-        self.detail = detail
-        self.hasSession = hasSession
-        self.title = title
-        self.parent = parent
-        self.agent = agent
+        self.priority = priority
+        self.phase = phase
+        self.parkReason = parkReason
+        self.context = context
+        self.progress = progress
+        self.rate = rate
     }
 
-    /// The row as the menu shows it, per llama-cm's session-identity contract
-    /// (docs/intent/session-identity-contract.md):
+    /// Known park reasons in words, the same vocabulary the fork's scheduler
+    /// uses (Park* constants) - session-state-contract.md's `parkReason`
+    /// table. Anything else (a reason the client predates, or none of the
+    /// documented ones) renders VERBATIM rather than being dropped: invariant
+    /// 5 forbids silently swallowing an unknown value.
+    static func parkPhrase(_ reason: String?) -> String? {
+        guard let reason, !reason.isEmpty else { return nil }
+        switch reason {
+        case "cap": return "slots full"
+        case "kv": return "kv pool"
+        case "busy": return "resident busy"
+        case "cooldown": return "cooldown"
+        case "loading": return "loading"
+        case "rank": return "behind higher rank"
+        case "swap-collision": return "another swap in flight"
+        case "memory-brake": return "memory brake"
+        default: return reason
+        }
+    }
+
+    /// PREFILL's progress as a percent, one decimal - nil for every other
+    /// phase (the contract only fills `progress` for PREFILL) or when the
+    /// body carries none yet.
+    private var progressText: String? {
+        guard phase == "PREFILL", let progress else { return nil }
+        return String(format: "%.1f%%", progress * 100)
+    }
+
+    /// "kind N.n t/s", e.g. "prefill 50.7 t/s" / "decode 7.1 t/s"; nil until
+    /// the contract has two samples (rate.kind/tokensPerSecond both nil).
+    private var rateText: String? {
+        guard let kind = rate.kind, let tokensPerSecond = rate.tokensPerSecond else { return nil }
+        return "\(kind) \(String(format: "%.1f", tokensPerSecond)) t/s"
+    }
+
+    /// "P10" / "P-10". The default tier's priority is 0 for almost every
+    /// row today, so printing "P0" on every line would be constant noise for
+    /// zero information; a nonzero priority (a priority-tier jump, a
+    /// background demotion) is exactly the exception a user needs to see, so
+    /// it is the only case this renders.
+    private var priorityText: String? {
+        priority == 0 ? nil : "P\(priority)"
+    }
+
+    /// The row as the menu shows it, purely from contract fields, in the
+    /// order the contract documents them:
     ///
-    ///   `[<sid8>] <model_alias> · <title20> · <WORD>`
-    ///   `[<sid8> > <agent8>] <model_alias> · ...` for a subagent's turn
-    ///   `<client> · <model_alias> · <WORD>` when no session is identified
-    ///   ... ` (child of <parent8>)` when the request was dispatched
+    ///   `[<sessionShort>] <alias> · <PHASE[ (reason)]> · <used>/<window> ·
+    ///   [<progress>%] · [<rate kind> <N.n> t/s] · [P<priority>]`
     ///
-    /// The trailing token/rate readout, when one could be joined, follows the
-    /// word as its own segment. Segments the request cannot supply (no title,
-    /// no slot join) are dropped rather than shown empty, so a sparse row
-    /// stays readable instead of collapsing into separators.
+    /// A segment the body did not supply (no progress, no rate yet, default
+    /// priority) is dropped rather than shown empty.
     public var displayLine: String {
         var segments: [String] = []
-        if hasSession {
-            let bracket = agent.map { "\(origin) > \($0)" } ?? origin
-            segments.append("[\(bracket)] \(model)")
-        } else {
-            segments.append("\(origin) · \(model)")
-        }
-        if let title, !title.isEmpty { segments.append(title) }
-        segments.append(word)
-        if let detail, !detail.isEmpty { segments.append(detail) }
-        var line = segments.joined(separator: " · ")
-        if let parent, !parent.isEmpty {
-            line += " (child of \(parent))"
-        }
-        return line
+        let bracket = sessionShort.isEmpty ? "-" : sessionShort
+        segments.append("[\(bracket)] \(alias.isEmpty ? model : alias)")
+
+        var phaseSegment = phase
+        if let phrase = SessionRow.parkPhrase(parkReason) { phaseSegment += " (\(phrase))" }
+        segments.append(phaseSegment)
+
+        segments.append("\(CompactFormatter.tokens(context.used))/\(CompactFormatter.tokens(context.window))")
+        if let progressText { segments.append(progressText) }
+        if let rateText { segments.append(rateText) }
+        if let priorityText { segments.append(priorityText) }
+        return segments.joined(separator: " · ")
     }
 }
 
@@ -311,22 +337,6 @@ public enum CompactFormatter {
     public static func countdown(_ seconds: Int) -> String {
         let s = max(0, seconds)
         return String(format: "%d:%02d", s / 60, s % 60)
-    }
-}
-
-/// One parked entry from the scheduler's own wait list (llama-swap's
-/// QueueEntry), 1-indexed by grant order.
-public struct QueueRow: Identifiable, Encodable, Equatable {
-    public let id: String
-    public let position: Int
-    public let tier: String
-    public let model: String
-
-    public init(position: Int, tier: String, model: String) {
-        self.id = "\(position)-\(tier)-\(model)"
-        self.position = position
-        self.tier = tier
-        self.model = model
     }
 }
 
@@ -388,55 +398,6 @@ struct ActivityStats: Codable {
 struct EventEnvelope: Codable {
     let type: String
     let data: String
-}
-
-struct InFlightStats: Codable {
-    let total: Int
-    let byTier: [String: Int]?
-    /// "snapshot" | "upsert" | "remove" (internal/server/inflight.go
-    /// inflightOperation*). Optional so the pre-merge minimal payload this
-    /// struct originally decoded still parses.
-    let operation: String?
-    /// Present on a "snapshot" event: every currently tracked request.
-    let requests: [InflightRequestEntry]?
-    /// Present on an "upsert" event: the one request that changed.
-    let request: InflightRequestEntry?
-    /// Present on a "remove" event: the id of the request that finished.
-    let id: String?
-    /// The scheduler's ordered wait list, first-in-line first; nil when no
-    /// tier reporter is wired (single-tier deployments).
-    let queue: [QueueEntry]?
-}
-
-/// Mirrors internal/swaputil/events.go InflightRequestEntry - only the
-/// fields the menu bar's session rows need (id, model, req_path, resp_bytes,
-/// elapsed_ms, metadata, and req_headers for the User-Agent origin fallback).
-/// Unmodeled fields (timestamp, method, resp_headers, remote_ip) are ignored
-/// by Codable, not decoded.
-struct InflightRequestEntry: Codable {
-    let id: String
-    let model: String
-    let reqPath: String
-    let respBytes: Int64
-    let elapsedMs: Int64
-    let metadata: [String: String]?
-    let reqHeaders: [String: String]?
-
-    enum CodingKeys: String, CodingKey {
-        case id, model, metadata
-        case reqPath = "req_path"
-        case respBytes = "resp_bytes"
-        case elapsedMs = "elapsed_ms"
-        case reqHeaders = "req_headers"
-    }
-}
-
-/// Mirrors internal/swaputil/events.go QueueEntry. `arrived` is intentionally
-/// left undecoded - the menu only needs position/tier/model.
-struct QueueEntry: Codable {
-    let position: Int
-    let tier: String
-    let model: String
 }
 
 /// The "swapGrace" SSE event's payload / GET /api/swap-grace's body -

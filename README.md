@@ -27,6 +27,26 @@ menu_bar:
 
 GPU stats come from llama-swap's built-in performance monitor (macOS: native; Linux: LACT, nvidia-smi, rocm-smi or sysfs; Windows: nvidia-smi).
 
+## Memory emergency brake (macOS)
+
+On by default. An in-process sampler reads file-backed memory (`external_page_count`) every second (no fork/exec). One trigger: if file-backed grows by `growthGB` above its MINIMUM within any rolling `windowMinutes` window, on `confirmSamples` consecutive samples, once every local model has been ready for `armAfterMinutes` (a load reads the GGUF into the file cache, so every load or reload restarts that delay; off with no model running), llama-swap SIGKILLs the process group of every local model, logs why, appends a line to `markerPath`, and parks new local-model loads for `holdMinutes`. Any live session on those models loses its KV cache and re-prefills on its next turn - the trade for not kernel-panicking the machine. The state is published on `/api/events` as a `memoryBrake` message.
+
+```yaml
+memoryBrake:              # absent block = enabled with these defaults
+  enabled: true
+  sampleIntervalMs: 1000
+  windowMinutes: 5
+  growthGB: 3.5            # file-backed growth only
+  armAfterMinutes: 10
+  confirmSamples: 2
+  holdMinutes: 5
+  markerPath: ~/Library/Logs/llama-cm/LLAMA-SWAP-MEMORY-BRAKE
+```
+
+Swap, free, pressure and wired are not part of the condition. The marker line records the window minimum, the current file-backed value, the growth and the window span. Renamed 2026-09-18: `windowSeconds` (the superseded wired + file-backed + swap / 30 s rule) is obsolete - a yaml that still sets it loads, the value is ignored and a startup warning names it; `growthGB` keeps its key but now measures file-backed growth only.
+
+The defaults are calibrated on real pre-panic telemetry (`internal/membrake/replay_test.go`). The block is read at startup only: after changing it, restart llama-swap.
+
 ## Tiered entry points
 
 By default every request lands on the same `-listen` port and is served

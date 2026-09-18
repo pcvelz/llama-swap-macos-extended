@@ -368,6 +368,22 @@
                 }
             }
         },
+        "memoryBrake": {
+            "type": "object",
+            "additionalProperties": false,
+            "description": "Memory emergency brake (macOS). An in-process 1 s sampler (no fork) watches file-backed memory only; when it grows by growthGB above its minimum within any rolling windowMinutes window on confirmSamples consecutive samples, once every local child has been ready armAfterMinutes, it SIGKILLs the process group of every local child, logs why, appends a marker file, and holds local-model reloads for holdMinutes. Calibrated on the 2026-09-18 kernel-panic run-ups. ON when the block is absent.",
+            "properties": {
+                "enabled": {"type": "boolean", "default": true, "description": "Arm the brake."},
+                "sampleIntervalMs": {"type": "integer", "default": 1000, "description": "Sampling period in milliseconds."},
+                "windowMinutes": {"type": "integer", "default": 5, "description": "Rolling window over which growth is measured against the window's minimum."},
+                "growthGB": {"type": "number", "default": 3.5, "description": "File-backed growth (GB) above the window minimum that counts as a breach."},
+                "armAfterMinutes": {"type": "integer", "default": 10, "description": "The brake arms only once every local child has been ready this long; every load or reload restarts the delay."},
+                "windowSeconds": {"type": "integer", "deprecated": true, "description": "OBSOLETE (superseded 30 s rule). Accepted and ignored with a startup warning; use windowMinutes."},
+                "confirmSamples": {"type": "integer", "default": 2, "description": "Consecutive breaching samples required before the kill."},
+                "holdMinutes": {"type": "integer", "default": 5, "description": "After a brake event, local-model loads are parked this long. 0 disables the hold."},
+                "markerPath": {"type": "string", "default": "~/Library/Logs/llama-cm/LLAMA-SWAP-MEMORY-BRAKE", "description": "Crash-surviving marker file; one line appended per brake event."}
+            }
+        },
         "tiers": {
             "type": "object",
             "default": {},

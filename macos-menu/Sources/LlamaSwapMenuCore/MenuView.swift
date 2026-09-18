@@ -59,7 +59,7 @@ public struct MenuView: View {
         // parked, one summary line otherwise (never inferred per-row; see
         // SessionThroughput.swift's header on why PARKED isn't a per-request
         // word here).
-        Text(MenuState.queueSummary(state.queueRows))
+        Text(MenuState.queueSummary(state.sessionRows))
 
         Text("Load")
             .foregroundStyle(.secondary)

@@ -297,6 +297,8 @@ groups:
 		Upstream: UpstreamConfig{
 			IgnorePaths: DefaultUpstreamIgnorePaths(),
 		},
+		// Seeded when the memoryBrake block is absent: the brake defaults ON.
+		MemoryBrake: DefaultMemoryBrakeConfig(),
 		// Seeded by LoadConfigFromReader when the peerStall block is absent;
 		// see Config.PeerStall.
 		PeerStall: PeerStallConfig{

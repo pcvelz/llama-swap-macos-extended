@@ -114,23 +114,4 @@ final class MetricsTests: XCTestCase {
         XCTAssertEqual(stats.totalRequests, 137)
     }
 
-    /// Direct decode check for the merged /api/events "inflight" union
-    /// payload: our total/byTier fields plus upstream's operation/requests/
-    /// request/id in the same object (internal/swaputil/events.go
-    /// InFlightRequestsEvent). This was previously verified only by
-    /// inspection (Codable ignores unrecognized keys by default); pinning it
-    /// here means a future upstream merge that changes the union shape again
-    /// fails a test instead of silently zeroing the waiting count.
-    func testInFlightStatsDecodesUnionPayloadIgnoringUpstreamExtraFields() throws {
-        let json = """
-        {"total":3,"byTier":{"default":2,"priority":1},"operation":"snapshot",\
-        "requests":[{"id":"abc123","timestamp":"2026-08-14T00:00:00Z","model":"cq35",\
-        "req_path":"/v1/chat/completions","method":"POST","req_headers":{},\
-        "remote_ip":"127.0.0.1","resp_headers":{},"resp_bytes":0,"elapsed_ms":120}],\
-        "id":"abc123"}
-        """.data(using: .utf8)!
-        let stats = try JSONDecoder().decode(InFlightStats.self, from: json)
-        XCTAssertEqual(stats.total, 3)
-        XCTAssertEqual(stats.byTier, ["default": 2, "priority": 1])
-    }
 }
