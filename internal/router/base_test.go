@@ -2,6 +2,7 @@ package router
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -660,6 +661,13 @@ func TestBaseRouter_ConcurrencyLimitParksBeforeLoadingStream(t *testing.T) {
 		t.Fatalf("over-limit request completed while the cap was full: status=%d body=%q", w.Code, w.Body.String())
 	case <-time.After(50 * time.Millisecond):
 	}
+	// @user-gated (2026-09-18): this fork NEVER bounces an over-limit request -
+	// it parks and is served when a slot frees. Upstream asserts a 429 error
+	// envelope at this point; there is no error body to inspect here, the
+	// request is still waiting. When an upstream merge brings a test that
+	// assumes the bounce, the test is adapted to this behaviour, never the
+	// other way round. The envelope format itself is covered by swaputil's
+	// TestSendError_* tests.
 
 	close(bProc.serveBlock)
 	for name, ch := range map[string]chan struct{}{"b": bDone, "a1": aDone1, "a2": aDone2, "a3": aDone3} {
@@ -670,6 +678,43 @@ func TestBaseRouter_ConcurrencyLimitParksBeforeLoadingStream(t *testing.T) {
 	}
 	if !strings.Contains(w.Body.String(), "ok:a") {
 		t.Fatalf("parked request was never served by the model: body=%q", w.Body.String())
+	}
+}
+
+// TestBaseRouter_DispatchErrorFramedIntoLoadingStream covers the second half of
+// #1029. Once the loading stream has committed its 200, an error can only reach
+// the client in-band: swaputil.SendError's status is dropped and its JSON body
+// lands as a bare line that every SSE parser discards, leaving the caller with
+// a truncated stream, no [DONE], and no reason.
+func TestBaseRouter_DispatchErrorFramedIntoLoadingStream(t *testing.T) {
+	sendLoading := true
+	conf := config.Config{
+		HealthCheckTimeout: 5,
+		Models:             map[string]config.ModelConfig{"a": {SendLoadingState: &sendLoading}},
+	}
+	a := newFakeProcess("a")
+	a.ensureErr = fmt.Errorf("upstream command exited prematurely")
+
+	b := newTestBaseWithConfig(t, conf, map[string]process.Process{"a": a}, &stubPlanner{})
+
+	w := httptest.NewRecorder()
+	b.ServeHTTP(w, newStreamRequest("a"))
+
+	body := w.Body.String()
+	// The loading text is streamed a few characters per frame, so reassemble it.
+	if content := extractStreamedContent(body); !strings.Contains(content, "llama-swap loading model") {
+		t.Fatalf("loading stream did not start, so this is not the path under test: %q", content)
+	}
+	for _, line := range strings.Split(strings.TrimRight(body, "\n"), "\n") {
+		if line != "" && !strings.HasPrefix(line, "data: ") {
+			t.Errorf("line %q is not an SSE field; a client would silently ignore it", line)
+		}
+	}
+	if !strings.Contains(body, "upstream command exited prematurely") {
+		t.Errorf("dispatch error never reached the client: %q", body)
+	}
+	if !strings.HasSuffix(strings.TrimRight(body, "\n"), "data: [DONE]") {
+		t.Errorf("stream not terminated with [DONE]: %q", body)
 	}
 }
 

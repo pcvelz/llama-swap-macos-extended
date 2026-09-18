@@ -28,8 +28,12 @@ build_from_source() {
     git clone --filter=blob:none --no-checkout "${LLAMA_SWAP_REPO}" "${SRC}"
     git -C "${SRC}" checkout --detach "${ref}"
 
-    echo "=== Building UI (ui-svelte) ==="
-    ( cd "${SRC}/ui-svelte" && npm install && npm run build )
+    # The UI lives in ui/ since upstream v256 and in ui-svelte/ before it; the
+    # ref being built decides, so look rather than assume.
+    local ui_dir="${SRC}/ui"
+    [ -f "${ui_dir}/package.json" ] || ui_dir="${SRC}/ui-svelte"
+    echo "=== Building UI (${ui_dir##*/}) ==="
+    ( cd "${ui_dir}" && npm install && npm run build )
 
     local git_hash git_version build_date
     git_hash="$(git -C "${SRC}" rev-parse --short HEAD)"

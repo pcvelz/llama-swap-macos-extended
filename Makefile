@@ -45,12 +45,12 @@ ensure-simple-responder:
 	fi
 
 ui/node_modules:
-	cd ui-svelte && npm install
+	cd ui && npm install
 
-# build react UI into internal/server/ui_dist; the `embed_ui` build tag embeds
+# build the UI into internal/server/ui_dist; the `embed_ui` build tag embeds
 # this output into the binary (see internal/server/embed.go)
 ui: ui/node_modules
-	cd ui-svelte && npm run build
+	cd ui && npm run build
 
 # Build OSX binary
 mac: mac-menu ui
@@ -113,6 +113,10 @@ release:
 # Get the highest tag in v{number} format, increment it, and create a new tag
 	@highest_tag=$$(git tag --sort=-v:refname | grep -E '^v[0-9]+$$' | head -n 1 || echo "v0"); \
 	new_tag="v$$(( $${highest_tag#v} + 1 ))"; \
+	echo "Generating changelog entry for: $$new_tag"; \
+	scripts/add-changelog.sh "$$new_tag"; \
+	git add CHANGELOG.md; \
+	git commit -m "changelog: $$new_tag"; \
 	echo "tagging new version: $$new_tag"; \
 	git tag "$$new_tag";
 
@@ -123,7 +127,12 @@ wol-proxy: $(BUILD_DIR)
 	go build -o $(BUILD_DIR)/wol-proxy-$(GOOS)-$(GOARCH)-$(shell date +%Y-%m-%d) cmd/wol-proxy/wol-proxy.go
 
 test-ui:
-	cd ui-svelte && npm ci && npm run check && npm test
+	cd ui && npm ci && npm run check && npm test
+
+# Score the Playground's Docs Agent against a local model. Builds and starts
+# llama-swap itself; see evals/docs-agent/README.md for the tuning loop.
+eval-docs-agent:
+	./evals/docs-agent/run.sh $(EVAL_ARGS)
 
 # run the full local CI mirror + workflow hygiene lane (see scripts/preflight.sh)
 preflight:
@@ -140,5 +149,5 @@ test-mac-menu:
 	cd macos-menu && swift test
 
 # Phony targets
-.PHONY: all clean ui mac mac-menu tray windows simple-responder simple-responder-windows ensure-simple-responder test test-all test-dev test-ui test-mac-menu wol-proxy preflight ci-await
-.PHONE: linux linux-arm64 linux-amd64
+.PHONY: all clean ui mac mac-menu tray windows simple-responder simple-responder-windows ensure-simple-responder test test-all test-dev test-ui test-mac-menu wol-proxy preflight ci-await eval-docs-agent release
+.PHONY: linux linux-arm64 linux-amd64

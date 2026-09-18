@@ -119,6 +119,10 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 		config.UnloadTimeout = DEFAULT_UNLOAD_TIMEOUT
 	}
 
+	if config.GlobalConcurrencyLimit < 0 {
+		return Config{}, fmt.Errorf("globalConcurrencyLimit must be >= 0")
+	}
+
 	config.UI.Activity.SessionID = normalizeHeaderNames(config.UI.Activity.SessionID)
 
 	if config.Store != nil {
@@ -386,6 +390,10 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 		return Config{}, err
 	}
 
+	if err := validateTailcatConfig(&config); err != nil {
+		return Config{}, err
+	}
+
 	return config, nil
 }
 
@@ -410,6 +418,11 @@ func validateProfiles(config Config) error {
 				}
 				return fmt.Errorf("profiles.%s.pins.%s references unknown model %q", profileName, pin, target)
 			}
+		}
+	}
+	if profile := config.Hooks.OnStartup.Profile; profile != "" {
+		if _, found := config.Profiles[profile]; !found {
+			return fmt.Errorf("hooks.on_startup.profile references unknown profile %q", profile)
 		}
 	}
 	return nil

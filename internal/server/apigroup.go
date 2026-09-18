@@ -184,7 +184,7 @@ func (s *Server) handleAPIActivity(w http.ResponseWriter, r *http.Request) {
 		swaputil.SendResponse(w, r, http.StatusBadRequest, err.Error())
 		return
 	}
-	page, err := s.store.ListActivity(r.Context(), query)
+	page, err := s.store.Activity().List(r.Context(), query)
 	if err != nil {
 		swaputil.SendResponse(w, r, http.StatusInternalServerError, "failed to get activity")
 		return
@@ -196,7 +196,7 @@ func (s *Server) handleAPIActivity(w http.ResponseWriter, r *http.Request) {
 
 // handleAPIActivityStats serves aggregate activity statistics and histograms.
 func (s *Server) handleAPIActivityStats(w http.ResponseWriter, r *http.Request) {
-	stats, err := s.store.ActivityStats(r.Context(), store.ActivityStatsQuery{
+	stats, err := s.store.Activity().Stats(r.Context(), store.ActivityStatsQuery{
 		Model: strings.TrimSpace(r.URL.Query().Get("model")),
 	})
 	if err != nil {
@@ -452,13 +452,77 @@ func parseActivityLimit(raw string) (int, error) {
 	return 0, fmt.Errorf("limit must be between 1 and 999")
 }
 
+// parseActivityTime reads an optional RFC3339 timestamp param, matching the
+// ?after= convention used by handleAPIPerformance. A missing param is the zero
+// time, which the store treats as unbounded. The UI does not send these; they
+// exist for direct API consumers.
+func parseActivityTime(r *http.Request, param string) (time.Time, error) {
+	raw := strings.TrimSpace(r.URL.Query().Get(param))
+	if raw == "" {
+		return time.Time{}, nil
+	}
+	parsed, err := time.Parse(time.RFC3339, raw)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("invalid '%s' timestamp, use RFC3339 format", param)
+	}
+	return parsed, nil
+}
+
+// parseActivityID reads an optional row id bound. A missing param is 0, which
+// the store treats as unbounded.
+func parseActivityID(r *http.Request, param string) (int, error) {
+	raw := strings.TrimSpace(r.URL.Query().Get(param))
+	if raw == "" {
+		return 0, nil
+	}
+	id, err := strconv.Atoi(raw)
+	if err != nil || id < 1 {
+		return 0, fmt.Errorf("%s must be >= 1", param)
+	}
+	return id, nil
+}
+
 func parseActivityQuery(r *http.Request) (store.ActivityQuery, error) {
 	const defaultLimit = 25
 	query := store.ActivityQuery{
-		Model: strings.TrimSpace(r.URL.Query().Get("model")),
 		Limit: defaultLimit,
 		Page:  1,
 	}
+	query.SrcPrefix = r.URL.Query().Get("src_prefix")
+
+	// model repeats to filter on several models at once (?model=a&model=b).
+	// A single ?model=x stays a plain exact match.
+	for _, raw := range r.URL.Query()["model"] {
+		if model := strings.TrimSpace(raw); model != "" {
+			query.Models = append(query.Models, model)
+		}
+	}
+
+	start, err := parseActivityTime(r, "start")
+	if err != nil {
+		return store.ActivityQuery{}, err
+	}
+	end, err := parseActivityTime(r, "end")
+	if err != nil {
+		return store.ActivityQuery{}, err
+	}
+	if !start.IsZero() && !end.IsZero() && start.After(end) {
+		return store.ActivityQuery{}, fmt.Errorf("start must be before end")
+	}
+	query.Start, query.End = start, end
+
+	minID, err := parseActivityID(r, "min_id")
+	if err != nil {
+		return store.ActivityQuery{}, err
+	}
+	maxID, err := parseActivityID(r, "max_id")
+	if err != nil {
+		return store.ActivityQuery{}, err
+	}
+	if minID > 0 && maxID > 0 && minID > maxID {
+		return store.ActivityQuery{}, fmt.Errorf("min_id must be <= max_id")
+	}
+	query.MinID, query.MaxID = minID, maxID
 
 	if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
 		limit, err := parseActivityLimit(raw)
@@ -477,7 +541,7 @@ func parseActivityQuery(r *http.Request) (store.ActivityQuery, error) {
 	}
 
 	if raw := strings.TrimSpace(r.URL.Query().Get("sort")); raw != "" {
-		if _, ok := store.ActivitySortColumn(raw); !ok {
+		if !store.ValidActivitySortKey(raw) {
 			return store.ActivityQuery{}, fmt.Errorf("invalid sort column")
 		}
 		query.Sort = raw
@@ -546,6 +610,69 @@ func (s *Server) handleAPIVersion(w http.ResponseWriter, r *http.Request) {
 		"commit":     s.build.Commit,
 		"build_date": s.build.Date,
 	})
+}
+
+func (s *Server) handleAPITailcat(w http.ResponseWriter, r *http.Request) {
+	address := ""
+	models := []string{}
+	enabled := s.cfg.TailcatEnabled()
+	if enabled {
+		address = s.TailcatAddress()
+		if ids := s.tailcatExposedModelIDs(); ids != nil {
+			models = ids
+		}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{"enabled": enabled, "address": address, "models": models})
+}
+
+// tailcatExposedModelIDs returns the sorted model IDs a Tailcat caller can
+// currently request, using the same active-profile routing rules as the
+// listener itself (ServeTailcatHTTP's tailcatModelAllowed check): local
+// models and their aliases, selectors, the active profile's pins, and peer
+// models addressed either by their fully qualified name or, where
+// unambiguous, their bare name. A "*" entry expands to every candidate.
+func (s *Server) tailcatExposedModelIDs() []string {
+	tc := s.cfg.Tailcat
+	if tc == nil {
+		return nil
+	}
+
+	candidates := make(map[string]struct{})
+	for id, mc := range s.cfg.Models {
+		candidates[id] = struct{}{}
+		for _, alias := range mc.Aliases {
+			candidates[alias] = struct{}{}
+		}
+	}
+	for selectorID := range s.cfg.Selectors {
+		candidates[selectorID] = struct{}{}
+	}
+	for peerID, peer := range s.cfg.Peers {
+		for _, modelID := range peer.Models {
+			candidates[config.PeerModelFQN(peerID, modelID)] = struct{}{}
+			if resolvedPeer, resolvedModel, found := s.cfg.ResolvePeerModel(modelID); found &&
+				resolvedPeer == peerID && resolvedModel == modelID {
+				candidates[modelID] = struct{}{}
+			}
+		}
+	}
+	if profile, ok := s.cfg.Profiles[s.ActiveProfile()]; ok {
+		for pin, target := range profile.Pins {
+			if target != "" {
+				candidates[pin] = struct{}{}
+			}
+		}
+	}
+
+	ids := make([]string, 0, len(candidates))
+	for id := range candidates {
+		if tailcatModelAllowed(tc.Models, id) {
+			ids = append(ids, id)
+		}
+	}
+	sort.Strings(ids)
+	return ids
 }
 
 // handleAPIHardware serves the hardware snapshot captured at process startup.
@@ -664,6 +791,10 @@ const (
 	msgTypeSwapGrace   messageType = "swapGrace"
 )
 
+// sendDropReportInterval is how often handleAPIEvents reports messages that
+// were dropped because the send buffer was full.
+const sendDropReportInterval = 5 * time.Second
+
 type messageEnvelope struct {
 	Type messageType `json:"type"`
 	Data string      `json:"data"`
@@ -691,13 +822,39 @@ func (s *Server) handleAPIEvents(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 
+	// Dropped messages are counted and reported at most once per interval.
+	// Logging every drop floods the logs because each warning becomes a log
+	// event that is sent over this same buffer, which drops again.
+	dropped := newSuppressionCounter(sendDropReportInterval)
+	cancelled := newSuppressionCounter(sendDropReportInterval)
+	reportDropped := func(n int) {
+		s.proxylog.Warnf("handleAPIEvents sendBuffer full, %d messages suppressed", n)
+	}
+	reportCancelled := func(n int) {
+		s.proxylog.Warnf("handleAPIEvents send suppressed due to context done, %d messages suppressed", n)
+	}
+	// runs after the event handlers below are unsubscribed so any remaining
+	// counts are reported before the connection goes away
+	defer func() {
+		if n, ok := dropped.Flush(); ok {
+			reportDropped(n)
+		}
+		if n, ok := cancelled.Flush(); ok {
+			reportCancelled(n)
+		}
+	}()
+
 	send := func(msg messageEnvelope) {
 		select {
 		case sendBuffer <- msg:
 		case <-ctx.Done():
-			s.proxylog.Warn("handleAPIEvents send suppressed due to context done")
+			if n, ok := cancelled.Add(); ok {
+				reportCancelled(n)
+			}
 		default:
-			s.proxylog.Warn("handleAPIEvents sendBuffer full, dropped message")
+			if n, ok := dropped.Add(); ok {
+				reportDropped(n)
+			}
 		}
 	}
 	sendModels := func() {

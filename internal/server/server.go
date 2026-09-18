@@ -13,9 +13,11 @@ import (
 
 	"github.com/mostlygeek/llama-swap/internal/chain"
 	"github.com/mostlygeek/llama-swap/internal/config"
+	"github.com/mostlygeek/llama-swap/internal/docagent"
 	"github.com/mostlygeek/llama-swap/internal/event"
 	"github.com/mostlygeek/llama-swap/internal/hw"
 	"github.com/mostlygeek/llama-swap/internal/logmon"
+	"github.com/mostlygeek/llama-swap/internal/mcptools"
 	"github.com/mostlygeek/llama-swap/internal/perf"
 	"github.com/mostlygeek/llama-swap/internal/process"
 	"github.com/mostlygeek/llama-swap/internal/router"
@@ -36,7 +38,7 @@ type Server struct {
 	perf     *perf.Monitor
 	inflight *inflightTracker
 	metrics  *metricsMonitor
-	store    *store.Store
+	store    store.Store
 	// slotAffinity pins sessions to the child slot that last served them for
 	// models with slotAffinity: true (slot_affinity.go).
 	slotAffinity *slotAffinityStore
@@ -45,6 +47,19 @@ type Server struct {
 	trace    *stateTrace
 	build    BuildInfo
 	hardware *hw.HardwareSnapshot
+
+	// reference is llama-swap's own embedded documentation, served to the
+	// Playground's agentic chat and to external MCP clients through /api/mcp.
+	// It is immutable and independent of cfg, so the same library is shared
+	// across the Server instances a hot config reload creates. A nil value
+	// disables the endpoint; Docs methods are nil-receiver safe.
+	reference *docagent.Docs
+
+	// tools is the MCP tool surface served at /api/mcp. Providers are
+	// aggregated here rather than enumerated in the handler, so a future
+	// provider that proxies an upstream MCP endpoint plugs in without
+	// touching the transport.
+	tools *mcptools.Registry
 
 	profileMu     sync.RWMutex
 	activeProfile string
@@ -55,9 +70,29 @@ type Server struct {
 	mux     *http.ServeMux
 	handler http.Handler
 
-	shutdownCtx  context.Context
-	shutdownFn   context.CancelFunc
-	shuttingDown atomic.Bool
+	shutdownCtx    context.Context
+	shutdownFn     context.CancelFunc
+	shuttingDown   atomic.Bool
+	tailcatAddress atomic.Pointer[string]
+}
+
+func (s *Server) SetTailcatAddress(address string) {
+	value := address
+	s.tailcatAddress.Store(&value)
+}
+
+func (s *Server) TailcatAddress() string {
+	if value := s.tailcatAddress.Load(); value != nil {
+		return *value
+	}
+	return ""
+}
+
+type tailcatRequestContextKey struct{}
+
+func isTailcatRequest(ctx context.Context) bool {
+	marked, _ := ctx.Value(tailcatRequestContextKey{}).(bool)
+	return marked
 }
 
 // ActiveProfile returns the active runtime profile, or an empty string when no
@@ -166,7 +201,7 @@ type BuildInfo struct {
 	Date    string
 }
 
-func New(cfg config.Config, muxlog *logmon.Monitor, proxylog *logmon.Monitor, upstreamlog *logmon.Monitor, perfMon *perf.Monitor, st *store.Store, build BuildInfo, hardware *hw.HardwareSnapshot) (*Server, error) {
+func New(cfg config.Config, muxlog *logmon.Monitor, proxylog *logmon.Monitor, upstreamlog *logmon.Monitor, perfMon *perf.Monitor, st store.Store, build BuildInfo, hardware *hw.HardwareSnapshot, refs *docagent.Docs) (*Server, error) {
 	var local router.LocalRouter
 	var err error
 
@@ -194,21 +229,35 @@ func New(cfg config.Config, muxlog *logmon.Monitor, proxylog *logmon.Monitor, up
 
 	shutdownCtx, shutdownFn := context.WithCancel(context.Background())
 	s := &Server{
-		cfg:         cfg,
-		muxlog:      muxlog,
-		proxylog:    proxylog,
-		upstreamlog: upstreamlog,
-		perf:        perfMon,
-		inflight:    newInflightTracker(tierNames(cfg.Tiers)...),
-		metrics:     newMetricsMonitor(proxylog, cfg.MetricsMaxInMemory, cfg.CaptureBuffer, st),
-		store:       st,
-		build:       build,
-		hardware:    hardware,
-		local:       local,
-		peer:        peer,
-		shutdownCtx: shutdownCtx,
-		shutdownFn:  shutdownFn,
+		cfg:           cfg,
+		muxlog:        muxlog,
+		proxylog:      proxylog,
+		upstreamlog:   upstreamlog,
+		perf:          perfMon,
+		inflight:      newInflightTracker(tierNames(cfg.Tiers)...),
+		metrics:       newMetricsMonitor(proxylog, cfg.MetricsMaxInMemory, cfg.CaptureBuffer, st),
+		store:         st,
+		build:         build,
+		hardware:      hardware,
+		reference:     refs,
+		activeProfile: cfg.Hooks.OnStartup.Profile,
+		local:         local,
+		peer:          peer,
+		shutdownCtx:   shutdownCtx,
+		shutdownFn:    shutdownFn,
 	}
+	// SysProvider is constructed here because this is where perf and hardware
+	// are in scope; wiring those in later is a change to internal/mcptools.
+	tools, err := mcptools.New(
+		docagent.NewDocsProvider(refs),
+		mcptools.NewSysProvider(nil),
+		config.NewConfigProvider(cfg),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("building the MCP tool registry: %w", err)
+	}
+	s.tools = tools
+
 	s.slotAffinity = newSlotAffinityStore(cfg)
 	s.metrics.affinity = s.slotAffinity
 	s.wireStateTrace()
@@ -420,9 +469,7 @@ func stripVersionPrefix(r *http.Request) {
 // before forwarding upstream, so /audioapi/v1/tasks/run reaches the upstream
 // as /v1/tasks/run.
 func stripAudioAPIPrefix(r *http.Request) {
-	if strings.HasPrefix(r.URL.Path, "/audioapi") {
-		r.URL.Path = strings.TrimPrefix(r.URL.Path, "/audioapi")
-	}
+	r.URL.Path = strings.TrimPrefix(r.URL.Path, "/audioapi")
 }
 
 // routes builds the mux, registers every route, and wraps the mux with the
@@ -439,8 +486,14 @@ func (s *Server) routes() {
 	}
 
 	authMW := CreateAuthMiddleware(s.cfg)
-	modelChain := chain.New(
-		authMW,
+	modelMWs := []chain.Middleware{authMW}
+	// globalConcurrencyLimit guards the top of the inference chain; a limit of
+	// 0 (the default) means no limit, so the handler is left out of the chain
+	// entirely rather than wrapping every request in a no-op semaphore.
+	if s.cfg.GlobalConcurrencyLimit > 0 {
+		modelMWs = append(modelMWs, CreateConcurrencyLimitMiddleware(s.cfg.GlobalConcurrencyLimit))
+	}
+	modelMWs = append(modelMWs,
 		CreateProfileMiddleware(s),
 		CreateSelectorMiddleware(s),
 		CreateRequestContextMiddleware(s.cfg),
@@ -458,6 +511,7 @@ func (s *Server) routes() {
 		CreateSlotAffinityMiddleware(s.slotAffinity, s.cfg),
 		CreateMetricsMiddleware(s.metrics, s.cfg),
 	)
+	modelChain := chain.New(modelMWs...)
 	// Custom endpoints only need auth.
 	apiChain := chain.New(authMW)
 
@@ -525,6 +579,7 @@ func (s *Server) routes() {
 	mux.Handle("GET /api/performance", apiChain.ThenFunc(s.handleAPIPerformance))
 	mux.Handle("GET /api/version", apiChain.ThenFunc(s.handleAPIVersion))
 	mux.Handle("GET /api/hardware", apiChain.ThenFunc(s.handleAPIHardware))
+	mux.Handle("GET /api/tailcat", apiChain.ThenFunc(s.handleAPITailcat))
 	mux.Handle("GET /api/captures/{id}", apiChain.ThenFunc(s.handleAPICapture))
 	mux.Handle("POST /api/models/pin/{model}", apiChain.ThenFunc(s.handleAPIPin))
 	mux.Handle("POST /api/models/unpin/{model}", apiChain.ThenFunc(s.handleAPIUnpin))
@@ -533,12 +588,104 @@ func (s *Server) routes() {
 	mux.Handle("GET /api/slots", apiChain.ThenFunc(s.handleAPISlots))
 	mux.Handle("GET /api/state-trace", apiChain.ThenFunc(s.handleAPIStateTrace))
 
+	// Stateless MCP server exposing llama-swap's own documentation as tools,
+	// consumed by the Playground's agentic chat and by any external MCP client.
+	// Registered without a method so non-POST reaches the handler and gets a
+	// 405 with Allow, rather than the mux's bare 404.
+	mux.Handle("/api/mcp", apiChain.ThenFunc(s.handleAPIMCP))
+
 	s.mux = mux
 	s.handler = chain.New(CreateRequestLogMiddleware(s.proxylog), CreateCORSMiddleware()).Then(mux)
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.handler.ServeHTTP(w, r)
+}
+
+// ServeTailcatHTTP applies Tailcat's deliberately narrow HTTP capability
+// surface before delegating to the normal, API-key-protected handler.
+func (s *Server) ServeTailcatHTTP(w http.ResponseWriter, r *http.Request) {
+	tc := s.cfg.Tailcat
+	if !s.cfg.TailcatEnabled() || tc == nil {
+		http.NotFound(w, r)
+		return
+	}
+
+	inference := isTailcatInferenceRequest(r)
+	if !tc.Admin {
+		allowed := r.Method == http.MethodGet && (r.URL.Path == "/health" || r.URL.Path == "/v1/models" || r.URL.Path == "/models")
+		if r.Method == http.MethodOptions {
+			allowed = isTailcatInferencePath(r.URL.Path)
+		}
+		if inference {
+			allowed = true
+		}
+		if !allowed {
+			http.NotFound(w, r)
+			return
+		}
+	}
+
+	if inference && r.Method != http.MethodOptions {
+		model, err := swaputil.ExtractModel(r)
+		if err != nil || !tailcatModelAllowed(tc.Models, model) {
+			http.NotFound(w, r)
+			return
+		}
+	}
+	r = r.WithContext(context.WithValue(r.Context(), tailcatRequestContextKey{}, true))
+	s.handler.ServeHTTP(w, r)
+}
+
+func isTailcatInferenceRequest(r *http.Request) bool {
+	if r.Method == http.MethodPost {
+		for _, path := range modelPostJSONRoutes {
+			if r.URL.Path == path {
+				return true
+			}
+		}
+		for _, path := range modelPostFormRoutes {
+			if r.URL.Path == path {
+				return true
+			}
+		}
+	}
+	if r.Method == http.MethodGet {
+		for _, path := range modelGetRoutes {
+			if r.URL.Path == path {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func isTailcatInferencePath(path string) bool {
+	for _, candidate := range modelPostJSONRoutes {
+		if path == candidate {
+			return true
+		}
+	}
+	for _, candidate := range modelPostFormRoutes {
+		if path == candidate {
+			return true
+		}
+	}
+	for _, candidate := range modelGetRoutes {
+		if path == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func tailcatModelAllowed(models []string, id string) bool {
+	for _, exposed := range models {
+		if exposed == "*" || exposed == id {
+			return true
+		}
+	}
+	return false
 }
 
 // CloseStreams cancels long-lived response streams (Server-Sent Events) so a
@@ -565,6 +712,13 @@ func (s *Server) Shutdown(timeout time.Duration) error {
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	var errs []error
+
+	// Server.Shutdown is a closed list: anything holding resources that is not
+	// released here leaks. The tool registry is cheap today and expensive once
+	// a provider holds upstream connections or subprocesses.
+	if err := s.tools.Shutdown(timeout); err != nil {
+		errs = append(errs, err)
+	}
 
 	for _, rt := range []router.Router{s.local, s.peer} {
 		if rt == nil {

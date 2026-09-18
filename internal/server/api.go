@@ -27,6 +27,7 @@ type modelRecord struct {
 	SupportedParameters []string       `json:"supported_parameters,omitempty"`
 	ContextLength       int            `json:"context_length,omitempty"`
 	MaxContextLength    int            `json:"max_context_length,omitempty"`
+	ContextWindow       int            `json:"context_window,omitempty"`
 	Meta                map[string]any `json:"meta,omitempty"`
 	Status              map[string]any `json:"status"`
 }
@@ -40,6 +41,7 @@ var cappedMetadataKeys = map[string]struct{}{
 	"supported_parameters": {},
 	"context_length":       {},
 	"max_context_length":   {},
+	"context_window":       {},
 }
 
 // renderCapabilities converts a model's capabilities config into additional
@@ -148,7 +150,7 @@ func filterCappedMetadata(md map[string]any) map[string]any {
 // does NOT key on x-api-key: keyed OpenAI consumers may also send it, so OpenAI
 // clients keep getting the byte-identical OpenAI envelope.
 func (s *Server) handleListModels(w http.ResponseWriter, r *http.Request) {
-	records := s.collectModelRecords()
+	records := s.collectModelRecords(r)
 
 	// Echo the Origin so browser clients can read the listing.
 	if origin := r.Header.Get("Origin"); origin != "" {
@@ -169,7 +171,8 @@ func (s *Server) handleListModels(w http.ResponseWriter, r *http.Request) {
 
 // collectModelRecords builds the sorted OpenAI modelRecord list shared by both
 // listing envelopes (extraction keeps the OpenAI encoding path byte-identical).
-func (s *Server) collectModelRecords() []modelRecord {
+// It takes the request so the Tailcat exposure filter covers both envelopes.
+func (s *Server) collectModelRecords(r *http.Request) []modelRecord {
 	created := time.Now().Unix()
 	data := make([]modelRecord, 0, len(s.cfg.Models)+len(s.cfg.Selectors))
 	running := s.local.RunningModels()
@@ -200,6 +203,9 @@ func (s *Server) collectModelRecords() []modelRecord {
 		}
 		rec.Architecture, rec.Capabilities, rec.SupportedParameters, rec.ContextLength = renderCapabilities(caps)
 		rec.MaxContextLength = rec.ContextLength
+		// context_window mirrors context_length for OpenAI-compatible gateways
+		// (e.g. Bifrost) that read the context size from this field name.
+		rec.ContextWindow = rec.ContextLength
 		if !caps.Empty() {
 			metadata = filterCappedMetadata(metadata)
 		}
@@ -333,6 +339,18 @@ func (s *Server) collectModelRecords() []modelRecord {
 	}
 
 	sort.Slice(data, func(i, j int) bool { return data[i].ID < data[j].ID })
+	if isTailcatRequest(r.Context()) {
+		exposed := s.cfg.Tailcat
+		filtered := data[:0]
+		if exposed != nil {
+			for _, record := range data {
+				if tailcatModelAllowed(exposed.Models, record.ID) {
+					filtered = append(filtered, record)
+				}
+			}
+		}
+		data = filtered
+	}
 	return data
 }
 

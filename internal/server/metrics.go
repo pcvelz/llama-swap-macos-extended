@@ -19,6 +19,7 @@ import (
 	"github.com/mostlygeek/llama-swap/internal/logmon"
 	"github.com/mostlygeek/llama-swap/internal/store"
 	"github.com/mostlygeek/llama-swap/internal/swaputil"
+	"github.com/mostlygeek/llama-swap/internal/tailcat"
 	"github.com/tidwall/gjson"
 )
 
@@ -46,7 +47,7 @@ func (e ActivityLogEvent) Type() uint32 {
 // activity in a store, and (when captures are enabled) stores
 // zstd+CBOR-compressed request/response captures in a sized in-memory cache.
 type metricsMonitor struct {
-	store          *store.Store
+	store          store.Store
 	maxMetrics     int
 	logger         *logmon.Monitor
 	enableCaptures bool
@@ -57,7 +58,7 @@ type metricsMonitor struct {
 	affinity *slotAffinityStore
 }
 
-func newMetricsMonitor(logger *logmon.Monitor, maxMetrics int, captureBufferMB int, st *store.Store) *metricsMonitor {
+func newMetricsMonitor(logger *logmon.Monitor, maxMetrics int, captureBufferMB int, st store.Store) *metricsMonitor {
 	if maxMetrics <= 0 {
 		maxMetrics = 1000
 	}
@@ -81,13 +82,13 @@ func (mp *metricsMonitor) queueMetrics(metric ActivityLogEntry) (ActivityLogEntr
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	stored, err := mp.store.InsertActivity(ctx, metric)
+	stored, err := mp.store.Activity().Insert(ctx, metric)
 	if err != nil {
 		mp.warnf("failed to persist activity metric: %v", err)
 		return ActivityLogEntry{}, false
 	}
 	if mp.store.IsInMemory() {
-		if err := mp.store.PruneActivity(ctx, mp.maxMetrics); err != nil {
+		if err := mp.store.Activity().Prune(ctx, mp.maxMetrics); err != nil {
 			mp.warnf("failed to prune activity metrics: %v", err)
 		}
 	}
@@ -117,8 +118,27 @@ func (mp *metricsMonitor) warnf(format string, args ...any) {
 	}
 }
 
+func (mp *metricsMonitor) debugf(format string, args ...any) {
+	if mp.logger != nil {
+		mp.logger.Debugf(format, args...)
+	}
+}
+
 func (mp *metricsMonitor) Close() error {
 	return nil
+}
+
+// activitySource returns trusted connection metadata for activity records.
+// Forwarding headers are intentionally ignored because callers can spoof them.
+func activitySource(r *http.Request) string {
+	if source, ok := tailcat.SourceFromContext(r.Context()); ok {
+		return source
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
+	return "ip:" + host
 }
 
 // record parses a completed response body and stores/emits an activity entry.
@@ -138,6 +158,7 @@ func (mp *metricsMonitor) record(modelID string, r *http.Request, recorder *resp
 		RespStatusCode:  recorder.Status(),
 		DurationMs:      int(time.Since(recorder.StartTime()).Milliseconds()),
 	}
+	tm.Src = activitySource(r)
 
 	if ctxData, ok := swaputil.ReadContext(r.Context()); ok && len(ctxData.Metadata) > 0 {
 		tm.Metadata = make(map[string]string, len(ctxData.Metadata))
@@ -170,6 +191,18 @@ func (mp *metricsMonitor) record(modelID string, r *http.Request, recorder *resp
 		}
 		tm = stored
 		mp.emitMetric(tm)
+	}
+
+	// A client that hangs up is normal traffic, not a server fault: record the
+	// entry so the abort is visible, but at debug level and without the
+	// synthesized upstream error message the failure path below would attach.
+	// No capture is stored — there is no response to inspect, and a client
+	// retrying in a loop would otherwise flood the capture store. See #1029.
+	if recorder.Status() == swaputil.StatusClientClosedRequest {
+		mp.debugf("metrics: client disconnected before response, path=%s", r.URL.Path)
+		tm.ErrorMsg = "client disconnected before response"
+		queueAndEmit()
+		return
 	}
 
 	if recorder.Status() != http.StatusOK {
@@ -404,6 +437,7 @@ func processStreamingResponse(modelID string, start time.Time, body []byte) (Act
 		inputTokens, outputTokens int64
 		cachedTokens              int64 = -1
 		hasAny                    bool
+		usage                     gjson.Result
 		timings                   gjson.Result
 		responseMetrics           gjson.Result
 		slotID                    gjson.Result
@@ -453,6 +487,9 @@ func processStreamingResponse(modelID string, start time.Time, body []byte) (Act
 			if c >= 0 {
 				cachedTokens = c
 			}
+			// Remember the last usage block so buildMetrics can read the
+			// TabbyAPI rates it embeds there.
+			usage = u
 		}
 		if t := parsed.Get("timings"); t.Exists() {
 			timings = t
@@ -478,24 +515,43 @@ func processStreamingResponse(modelID string, start time.Time, body []byte) (Act
 		return ActivityLogEntry{}, fmt.Errorf("no valid JSON data found in stream")
 	}
 
-	return buildMetrics(modelID, start, inputTokens, outputTokens, cachedTokens, timings, responseMetrics, slotID), nil
+	return buildMetrics(modelID, start, inputTokens, outputTokens, cachedTokens, usage, timings, responseMetrics, slotID), nil
 }
 
 func parseMetrics(modelID string, start time.Time, usage, timings, responseMetrics, slotID gjson.Result) (ActivityLogEntry, error) {
 	input, output, cached, _ := extractUsageTokens(usage)
-	return buildMetrics(modelID, start, input, output, cached, timings, responseMetrics, slotID), nil
+	return buildMetrics(modelID, start, input, output, cached, usage, timings, responseMetrics, slotID), nil
 }
 
 // buildMetrics composes an ActivityLogEntry from accumulated token counts and
 // optional llama-server timings (which override input/output and provide rates)
-// or vLLM response metrics.
-func buildMetrics(modelID string, start time.Time, inputTokens, outputTokens, cachedTokens int64, timings, responseMetrics, slotID gjson.Result) ActivityLogEntry {
+// or vLLM response metrics (rates and speculative decoding counters). TabbyAPI
+// embeds its rates and total time in the usage block, which supplies base rates
+// when timings and metrics are absent.
+func buildMetrics(modelID string, start time.Time, inputTokens, outputTokens, cachedTokens int64, usage, timings, responseMetrics, slotID gjson.Result) ActivityLogEntry {
 	wallDurationMs := int(time.Since(start).Milliseconds())
 	durationMs := wallDurationMs
 	tokensPerSecond := -1.0
 	promptPerSecond := -1.0
 	draftTokens := -1
 	draftAccTokens := -1
+
+	// TabbyAPI reports prompt/completion rates and total time inside its usage
+	// block. These are base values that llama-server timings and vLLM metrics
+	// override when present.
+	if usage.Exists() {
+		if v := usage.Get("prompt_tokens_per_sec"); v.Exists() {
+			promptPerSecond = v.Float()
+		}
+		if v := usage.Get("completion_tokens_per_sec"); v.Exists() {
+			tokensPerSecond = v.Float()
+		}
+		if v := usage.Get("total_time"); v.Exists() {
+			if totalTimeMs := int(v.Float() * 1000); totalTimeMs > durationMs {
+				durationMs = totalTimeMs
+			}
+		}
+	}
 
 	if timings.Exists() {
 		inputTokens = timings.Get("prompt_n").Int()
@@ -512,6 +568,18 @@ func buildMetrics(modelID string, start time.Time, inputTokens, outputTokens, ca
 		if timings.Get("draft_n").Exists() && timings.Get("draft_n_accepted").Exists() {
 			draftTokens = int(timings.Get("draft_n").Int())
 			draftAccTokens = int(timings.Get("draft_n_accepted").Int())
+		}
+	}
+	// vLLM reports speculative decoding counts under metrics.speculative_decoding
+	// when started with --per-request-spec-decode-metrics (#1032). Both counters
+	// are required so the acceptance rate is never derived from a half-filled
+	// object.
+	if spec := responseMetrics.Get("speculative_decoding"); spec.Exists() {
+		drafted := spec.Get("num_draft_tokens")
+		accepted := spec.Get("num_accepted_draft_tokens")
+		if drafted.Exists() && accepted.Exists() {
+			draftTokens = int(drafted.Int())
+			draftAccTokens = int(accepted.Int())
 		}
 	}
 	if timeToFirstToken := responseMetrics.Get("time_to_first_token_ms"); timeToFirstToken.Exists() && timeToFirstToken.Float() > 0 {
@@ -826,11 +894,31 @@ func (w *responseBodyCopier) WriteHeader(statusCode int) {
 	w.ResponseWriter.WriteHeader(statusCode)
 }
 
+// MarkStatus records code for metrics without writing to the client, and
+// forwards to the wrapped writer so the access-log recorder agrees.
+func (w *responseBodyCopier) MarkStatus(code int) {
+	w.status = code
+	if marker, ok := w.ResponseWriter.(swaputil.StatusMarker); ok {
+		marker.MarkStatus(code)
+	}
+}
+
+// WroteHeader reports whether a response status reached the client.
+func (w *responseBodyCopier) WroteHeader() bool { return w.wroteHeader }
+
 // Flush forwards to the underlying writer so streaming responses still flush.
 func (w *responseBodyCopier) Flush() {
-	if f, ok := w.ResponseWriter.(http.Flusher); ok {
-		f.Flush()
+	f, ok := w.ResponseWriter.(http.Flusher)
+	if !ok {
+		return
 	}
+	// Flushing commits the implicit 200, so the response has started even if
+	// nothing wrote a header. Recorded here for the same reason as in
+	// statusRecorder: the client-closed sentinel must not overwrite it.
+	if !w.wroteHeader {
+		w.WriteHeader(http.StatusOK)
+	}
+	f.Flush()
 }
 
 // Hijack forwards to the underlying writer so httputil.ReverseProxy can take

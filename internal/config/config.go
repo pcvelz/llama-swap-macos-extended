@@ -55,6 +55,25 @@ func (ml *MacroList) UnmarshalYAML(value *yaml.Node) error {
 	return nil
 }
 
+// MarshalYAML renders the list back as an ordered mapping, the shape it is
+// written in, rather than the default slice-of-structs. Only diagnostics such
+// as the config__get_config tool marshal a Config, but when they do the macro
+// block should read like the source file.
+func (ml MacroList) MarshalYAML() (interface{}, error) {
+	node := &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
+	for _, entry := range ml {
+		var key, value yaml.Node
+		if err := key.Encode(entry.Name); err != nil {
+			return nil, fmt.Errorf("encoding macro name %q: %w", entry.Name, err)
+		}
+		if err := value.Encode(entry.Value); err != nil {
+			return nil, fmt.Errorf("encoding macro value for %q: %w", entry.Name, err)
+		}
+		node.Content = append(node.Content, &key, &value)
+	}
+	return node, nil
+}
+
 // Get retrieves a macro value by name
 func (ml MacroList) Get(name string) (any, bool) {
 	for _, entry := range ml {
@@ -96,6 +115,7 @@ type HooksConfig struct {
 
 type HookOnStartup struct {
 	Preload []string `yaml:"preload"`
+	Profile string   `yaml:"profile"`
 }
 
 type Store struct {
@@ -134,6 +154,7 @@ func (c *ProfileConfig) UnmarshalYAML(value *yaml.Node) error {
 }
 
 type Config struct {
+	Tailcat            *TailcatConfig    `yaml:"tailcat"`
 	HealthCheckTimeout int               `yaml:"healthCheckTimeout"`
 	LogRequests        bool              `yaml:"logRequests"`
 	LogLevel           string            `yaml:"logLevel"`
@@ -173,6 +194,10 @@ type Config struct {
 	Models    map[string]ModelConfig    `yaml:"models"` /* key is model ID */
 	Profiles  map[string]ProfileConfig  `yaml:"profiles"`
 	Selectors map[string]SelectorConfig `yaml:"selectors"`
+
+	// GlobalConcurrencyLimit caps the number of inference requests served at
+	// once across all models. 0 (default) means no limit. See issue #1086.
+	GlobalConcurrencyLimit int `yaml:"globalConcurrencyLimit"`
 
 	// routing is the canonical source for swap/scheduling configuration.
 	// New code must read Routing, never the backwards-compat fields below.
@@ -251,6 +276,22 @@ type Config struct {
 	// or empty Tiers map is byte-identical, single-listener behavior. See
 	// docs/intent/llama-swap-tiers.md (llama-cm) for the full design.
 	Tiers map[string]TierConfig `yaml:"tiers"`
+
+	// tailcatEnabled records whether this process started a Tailcat listener.
+	// It is runtime state, not user configuration, so it must never appear in
+	// rendered configuration output.
+	tailcatEnabled bool
+}
+
+// SetTailcatEnabled records whether this process has a Tailcat listener.
+// main owns this startup-only setting from -listen-tailcat.
+func (c *Config) SetTailcatEnabled(enabled bool) {
+	c.tailcatEnabled = enabled
+}
+
+// TailcatEnabled reports whether this process has a Tailcat listener.
+func (c Config) TailcatEnabled() bool {
+	return c.tailcatEnabled
 }
 
 // TierConfig is one extra entry point declared under the top-level `tiers:`

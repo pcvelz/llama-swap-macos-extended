@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"io"
 	"math"
 	"net/http"
@@ -10,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mostlygeek/llama-swap/internal/chain"
 	"github.com/mostlygeek/llama-swap/internal/config"
 	"github.com/mostlygeek/llama-swap/internal/logmon"
 	"github.com/mostlygeek/llama-swap/internal/swaputil"
@@ -28,6 +30,28 @@ func TestServer_ParseMetrics_ChatCompletions(t *testing.T) {
 	}
 }
 
+func TestServer_ActivitySourceStripsClientPort(t *testing.T) {
+	tests := []struct {
+		name       string
+		remoteAddr string
+		want       string
+	}{
+		{name: "IPv4", remoteAddr: "192.168.1.10:54321", want: "ip:192.168.1.10"},
+		{name: "IPv6", remoteAddr: "[2001:db8::10]:54321", want: "ip:2001:db8::10"},
+		{name: "missing port", remoteAddr: "localhost", want: "ip:localhost"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			r := httptest.NewRequest(http.MethodGet, "/", nil)
+			r.RemoteAddr = test.remoteAddr
+			r.Header.Set("X-Forwarded-For", "203.0.113.10:9999")
+			if got := activitySource(r); got != test.want {
+				t.Fatalf("activitySource() = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
 func TestServer_ParseMetrics_Timings(t *testing.T) {
 	body := `{"timings":{"prompt_n":20,"predicted_n":50,"prompt_per_second":100.0,"predicted_per_second":40.0,"prompt_ms":200,"predicted_ms":1250,"cache_n":8}}`
 	parsed := gjson.Parse(body)
@@ -43,6 +67,60 @@ func TestServer_ParseMetrics_Timings(t *testing.T) {
 	}
 	if entry.DurationMs != 1450 {
 		t.Fatalf("DurationMs = %d, want 1450", entry.DurationMs)
+	}
+}
+
+func TestServer_ParseMetrics_TabbyAPI(t *testing.T) {
+	body := `{"id":"chatcmpl-131b9995cd0c40c99e2ce958083ee406","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":83,"prompt_time":2.36,"prompt_tokens_per_sec":35.17,"completion_tokens":192,"completion_time":11.22,"completion_tokens_per_sec":17.11,"total_tokens":275,"total_time":13.63},"model":"SC_6.00bpw_H6_V6"}`
+	parsed := gjson.Parse(body)
+	entry, err := parseMetrics("m", time.Now(), parsed.Get("usage"), parsed.Get("timings"), parsed.Get("metrics"), parsed.Get("id_slot"))
+	if err != nil {
+		t.Fatalf("parseMetrics: %v", err)
+	}
+	if entry.Tokens.InputTokens != 83 || entry.Tokens.OutputTokens != 192 {
+		t.Fatalf("tokens = %+v", entry.Tokens)
+	}
+	if got, want := entry.Tokens.PromptPerSecond, 35.17; math.Abs(got-want) > 1e-9 {
+		t.Errorf("PromptPerSecond = %v, want %v", got, want)
+	}
+	if got, want := entry.Tokens.TokensPerSecond, 17.11; math.Abs(got-want) > 1e-9 {
+		t.Errorf("TokensPerSecond = %v, want %v", got, want)
+	}
+	if entry.DurationMs != 13630 {
+		t.Errorf("DurationMs = %d, want 13630", entry.DurationMs)
+	}
+}
+
+// llama-server timings and TabbyAPI usage rates never appear together, but a
+// response carrying both must keep the timings-sourced rates.
+func TestServer_ParseMetrics_TabbyAPINotOverwrittenByTimings(t *testing.T) {
+	body := `{"usage":{"prompt_tokens":83,"completion_tokens":192,"prompt_tokens_per_sec":35.17,"completion_tokens_per_sec":17.11},"timings":{"prompt_n":20,"predicted_n":50,"prompt_per_second":100.0,"predicted_per_second":40.0,"prompt_ms":200,"predicted_ms":1250}}`
+	parsed := gjson.Parse(body)
+	entry, err := parseMetrics("m", time.Now(), parsed.Get("usage"), parsed.Get("timings"), parsed.Get("metrics"), parsed.Get("id_slot"))
+	if err != nil {
+		t.Fatalf("parseMetrics: %v", err)
+	}
+	if entry.Tokens.PromptPerSecond != 100.0 || entry.Tokens.TokensPerSecond != 40.0 {
+		t.Fatalf("rates = %+v, want timings rates", entry.Tokens)
+	}
+}
+
+func TestServer_ProcessStreamingResponse_TabbyAPI(t *testing.T) {
+	body := []byte("data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n" +
+		"data: {\"id\":\"chatcmpl-131b9995cd0c40c99e2ce958083ee406\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":83,\"prompt_time\":2.36,\"prompt_tokens_per_sec\":35.17,\"completion_tokens\":192,\"completion_time\":11.22,\"completion_tokens_per_sec\":17.11,\"total_tokens\":275,\"total_time\":13.63},\"model\":\"SC_6.00bpw_H6_V6\"}\n\n" +
+		"data: [DONE]\n\n")
+	entry, err := processStreamingResponse("m", time.Now(), body)
+	if err != nil {
+		t.Fatalf("processStreamingResponse: %v", err)
+	}
+	if entry.Tokens.InputTokens != 83 || entry.Tokens.OutputTokens != 192 {
+		t.Fatalf("tokens = %+v", entry.Tokens)
+	}
+	if got, want := entry.Tokens.PromptPerSecond, 35.17; math.Abs(got-want) > 1e-9 {
+		t.Errorf("PromptPerSecond = %v, want %v", got, want)
+	}
+	if got, want := entry.Tokens.TokensPerSecond, 17.11; math.Abs(got-want) > 1e-9 {
+		t.Errorf("TokensPerSecond = %v, want %v", got, want)
 	}
 }
 
@@ -97,6 +175,63 @@ func TestServer_ParseMetrics_VLLMMetrics(t *testing.T) {
 	}
 	if got, want := entry.Tokens.TokensPerSecond, 1000/9.1; math.Abs(got-want) > 1e-9 {
 		t.Errorf("TokensPerSecond = %v, want %v", got, want)
+	}
+}
+
+func TestServer_ParseMetrics_VLLMSpeculativeDecoding(t *testing.T) {
+	body := `{"id":"chatcmpl-abc123","object":"chat.completion","usage":{"prompt_tokens":42,"completion_tokens":128},"metrics":{"mean_itl_ms":9.1,"speculative_decoding":{"mean_acceptance_length":1.7,"draft_acceptance_rate":0.7,"acceptance_histogram":[6,14],"num_spec_steps":20,"num_accepted_draft_tokens":14,"num_draft_tokens":20,"num_spec_tokens":1}}}`
+	parsed := gjson.Parse(body)
+	entry, err := parseMetrics("m", time.Now(), parsed.Get("usage"), parsed.Get("timings"), parsed.Get("metrics"), parsed.Get("id_slot"))
+	if err != nil {
+		t.Fatalf("parseMetrics: %v", err)
+	}
+	if entry.Tokens.DraftTokens != 20 || entry.Tokens.DraftAccTokens != 14 {
+		t.Fatalf("draft tokens = %+v, want 14/20", entry.Tokens)
+	}
+}
+
+// A speculative_decoding object missing either counter must leave both unset so
+// the acceptance rate is not computed from half the data.
+func TestServer_ParseMetrics_VLLMSpeculativeDecodingPartial(t *testing.T) {
+	body := `{"usage":{"prompt_tokens":42,"completion_tokens":128},"metrics":{"speculative_decoding":{"num_draft_tokens":20}}}`
+	parsed := gjson.Parse(body)
+	entry, err := parseMetrics("m", time.Now(), parsed.Get("usage"), parsed.Get("timings"), parsed.Get("metrics"), parsed.Get("id_slot"))
+	if err != nil {
+		t.Fatalf("parseMetrics: %v", err)
+	}
+	if entry.Tokens.DraftTokens != -1 || entry.Tokens.DraftAccTokens != -1 {
+		t.Fatalf("draft tokens = %+v, want -1/-1", entry.Tokens)
+	}
+}
+
+// vLLM only emits the metrics object on the final streamed chunk.
+func TestServer_ProcessStreamingResponse_VLLMSpeculativeDecoding(t *testing.T) {
+	body := []byte(`data: {"choices":[{"delta":{"content":"hi"}}]}
+
+data: {"object":"chat.completion.chunk","choices":[],"usage":{"prompt_tokens":11742,"completion_tokens":35},"metrics":{"mean_itl_ms":17.209908293272534,"speculative_decoding":{"mean_acceptance_length":1.7,"draft_acceptance_rate":0.7,"num_spec_steps":20,"num_accepted_draft_tokens":14,"num_draft_tokens":20,"num_spec_tokens":1}}}
+
+data: [DONE]
+`)
+	entry, err := processStreamingResponse("m", time.Now(), body)
+	if err != nil {
+		t.Fatalf("processStreamingResponse: %v", err)
+	}
+	if entry.Tokens.DraftTokens != 20 || entry.Tokens.DraftAccTokens != 14 {
+		t.Fatalf("draft tokens = %+v, want 14/20", entry.Tokens)
+	}
+}
+
+// llama-server timings and vLLM metrics never appear together, but a response
+// carrying both must not have its timings-sourced draft counts clobbered.
+func TestServer_ParseMetrics_TimingsDraftTokensNotOverwritten(t *testing.T) {
+	body := `{"timings":{"prompt_n":20,"predicted_n":50,"draft_n":30,"draft_n_accepted":12},"metrics":{"speculative_decoding":{}}}`
+	parsed := gjson.Parse(body)
+	entry, err := parseMetrics("m", time.Now(), parsed.Get("usage"), parsed.Get("timings"), parsed.Get("metrics"), parsed.Get("id_slot"))
+	if err != nil {
+		t.Fatalf("parseMetrics: %v", err)
+	}
+	if entry.Tokens.DraftTokens != 30 || entry.Tokens.DraftAccTokens != 12 {
+		t.Fatalf("draft tokens = %+v, want 12/30", entry.Tokens)
 	}
 }
 
@@ -206,6 +341,120 @@ func TestMetricsMonitor_RecordSlotID(t *testing.T) {
 	}
 	if entries[0].Metadata["client"] != "web" {
 		t.Errorf("client = %q, want web (slot_id merge must not clobber context metadata)", entries[0].Metadata["client"])
+	}
+}
+
+// TestMetricsMonitor_RecordClientClosed covers #1029: a client that hangs up
+// before a response is written must not be filed as a successful (empty-body)
+// metric. It is recorded with the 499 sentinel and a client-cancelled
+// ErrorMsg, and skips the capture the upstream-failure path would store.
+func TestMetricsMonitor_RecordClientClosed(t *testing.T) {
+	mm := newTestMetricsMonitor(t, logmon.NewWriter(io.Discard), 10, 5)
+	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+
+	w := httptest.NewRecorder()
+	copier := newBodyCopier(w)
+	// Nothing is ever written: this is the cold-load cancellation shape.
+	copier.MarkStatus(swaputil.StatusClientClosedRequest)
+
+	mm.record("m", r, copier, captureAll, testReqCapture(t, []byte("req"), nil))
+
+	entries := metricsEntries(t, mm)
+	if len(entries) != 1 {
+		t.Fatalf("want 1 entry, got %d", len(entries))
+	}
+	entry := entries[0]
+	if entry.RespStatusCode != swaputil.StatusClientClosedRequest {
+		t.Errorf("status = %d, want %d", entry.RespStatusCode, swaputil.StatusClientClosedRequest)
+	}
+	if entry.ErrorMsg != "client disconnected before response" {
+		t.Errorf("error_msg = %q, want client-cancelled message", entry.ErrorMsg)
+	}
+	if entry.HasCapture {
+		t.Error("a cancelled request has no response to capture")
+	}
+}
+
+// TestServer_MetricsMiddleware_ClientClosed checks the middleware derives the
+// sentinel for a handler that returns without writing, and that the marker
+// propagates outward to the access-log recorder so both agree.
+func TestServer_MetricsMiddleware_ClientClosed(t *testing.T) {
+	mm := newTestMetricsMonitor(t, logmon.NewWriter(io.Discard), 10, 0)
+	cfg := config.Config{Models: map[string]config.ModelConfig{"m": {}}}
+
+	proxylog := logmon.NewWriter(io.Discard)
+	handler := chain.New(
+		CreateRequestLogMiddleware(proxylog),
+		CreateMetricsMiddleware(mm, cfg),
+	).ThenFunc(func(w http.ResponseWriter, r *http.Request) {})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	body := `{"model":"m","messages":[{"role":"user","content":"hi"}]}`
+	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body)).WithContext(ctx)
+	r.Header.Set("Content-Type", "application/json")
+	r.RemoteAddr = "192.168.1.1:5000"
+	cancel()
+
+	handler.ServeHTTP(httptest.NewRecorder(), r)
+
+	entries := metricsEntries(t, mm)
+	if len(entries) != 1 {
+		t.Fatalf("want 1 entry, got %d", len(entries))
+	}
+	if entries[0].RespStatusCode != swaputil.StatusClientClosedRequest {
+		t.Errorf("activity status = %d, want %d", entries[0].RespStatusCode, swaputil.StatusClientClosedRequest)
+	}
+	if line := string(proxylog.GetHistory()); !strings.Contains(line, "499 0") {
+		t.Errorf("access log %q should report 499", line)
+	}
+}
+
+// TestServer_MetricsMiddleware_ServerSideCancelIsNotClientClosed guards the
+// distinction #1029's fix depends on. The inflight middleware derives a
+// cancellable context that POST /api/inflight/{id}/cancel fires, so testing
+// "is this request's context done?" would report an operator cancelling a
+// request from the UI as a client that hung up.
+func TestServer_MetricsMiddleware_ServerSideCancelIsNotClientClosed(t *testing.T) {
+	mm := newTestMetricsMonitor(t, logmon.NewWriter(io.Discard), 10, 0)
+	cfg := config.Config{Models: map[string]config.ModelConfig{"m": {}}}
+
+	proxylog := logmon.NewWriter(io.Discard)
+	// The handler stands in for a dispatch that is cancelled mid-flight and
+	// answers the still-connected client, as the proxy ErrorHandler does.
+	handler := chain.New(
+		CreateRequestLogMiddleware(proxylog),
+		CreateMetricsMiddleware(mm, cfg),
+	).ThenFunc(func(w http.ResponseWriter, r *http.Request) {
+		derived, cancel := context.WithCancel(r.Context())
+		defer cancel()
+		cancel() // the operator cancels it
+		r = r.WithContext(derived)
+		if swaputil.MarkClientClosed(w, r) {
+			return
+		}
+		w.WriteHeader(http.StatusBadGateway)
+	})
+
+	body := `{"model":"m","messages":[{"role":"user","content":"hi"}]}`
+	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	r.Header.Set("Content-Type", "application/json")
+	r.RemoteAddr = "192.168.1.1:5000"
+
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, r)
+
+	if w.Code != http.StatusBadGateway {
+		t.Errorf("client got %d, want %d: a connected client must be answered", w.Code, http.StatusBadGateway)
+	}
+	entries := metricsEntries(t, mm)
+	if len(entries) != 1 {
+		t.Fatalf("want 1 entry, got %d", len(entries))
+	}
+	if entries[0].RespStatusCode == swaputil.StatusClientClosedRequest {
+		t.Error("a server-side cancel must not be recorded as a client disconnect")
+	}
+	if line := string(proxylog.GetHistory()); strings.Contains(line, "499") {
+		t.Errorf("access log %q should not report 499 for a connected client", line)
 	}
 }
 

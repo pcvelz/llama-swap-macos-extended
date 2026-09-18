@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -12,11 +13,14 @@ import (
 	"time"
 
 	"github.com/mostlygeek/llama-swap/internal/config"
+	"github.com/mostlygeek/llama-swap/internal/docagent"
 	"github.com/mostlygeek/llama-swap/internal/event"
 	"github.com/mostlygeek/llama-swap/internal/logmon"
+	"github.com/mostlygeek/llama-swap/internal/mcptools"
 	"github.com/mostlygeek/llama-swap/internal/process"
 	"github.com/mostlygeek/llama-swap/internal/router"
 	"github.com/mostlygeek/llama-swap/internal/store"
+	"github.com/mostlygeek/llama-swap/internal/store/sqlite"
 	"github.com/mostlygeek/llama-swap/internal/swaputil"
 )
 
@@ -130,14 +134,20 @@ func (s *stubRouter) FinishCooldown() { s.finishCalls++ }
 
 // newTestServer wires a Server with stub routers and a built mux.
 func newTestServer(local router.LocalRouter, peer router.Router) *Server {
+	return newTestServerWithConfig(config.Config{}, local, peer)
+}
+
+// newTestServerWithConfig is newTestServer with a caller-supplied config, for
+// tests that exercise config-driven middleware wiring in routes().
+func newTestServerWithConfig(cfg config.Config, local router.LocalRouter, peer router.Router) *Server {
 	ctx, cancel := context.WithCancel(context.Background())
 	proxylog := logmon.NewWriter(io.Discard)
-	st, err := store.New("")
+	st, err := sqlite.New("")
 	if err != nil {
 		panic(err)
 	}
 	s := &Server{
-		cfg:         config.Config{},
+		cfg:         cfg,
 		muxlog:      logmon.NewWriter(io.Discard),
 		proxylog:    proxylog,
 		upstreamlog: logmon.NewWriter(io.Discard),
@@ -155,11 +165,33 @@ func newTestServer(local router.LocalRouter, peer router.Router) *Server {
 	return s
 }
 
+// newTestServerWithReference is newTestServer plus an indexed documentation
+// library, for the /api/mcp tests. Handlers read s.reference at request time,
+// so no re-registration is needed.
+func newTestServerWithReference(local router.LocalRouter, peer router.Router, fsys fs.FS) *Server {
+	s := newTestServer(local, peer)
+	s.reference = docagent.New(fsys)
+
+	registry, err := mcptools.New(
+		docagent.NewDocsProvider(s.reference),
+		mcptools.NewSysProvider(func() time.Time { return testClock }),
+		config.NewConfigProvider(s.cfg),
+	)
+	if err != nil {
+		panic(err)
+	}
+	s.tools = registry
+	return s
+}
+
+// testClock is the fixed instant SysProvider reports in tests.
+var testClock = time.Date(2026, 3, 14, 15, 9, 26, 0, time.UTC)
+
 func newTestMetricsMonitor(t *testing.T, logger *logmon.Monitor, maxMetrics int, captureBufferMB int) *metricsMonitor {
 	t.Helper()
-	st, err := store.New("")
+	st, err := sqlite.New("")
 	if err != nil {
-		t.Fatalf("store.New: %v", err)
+		t.Fatalf("sqlite.New: %v", err)
 	}
 	t.Cleanup(func() {
 		if err := st.Close(); err != nil {
@@ -171,7 +203,7 @@ func newTestMetricsMonitor(t *testing.T, logger *logmon.Monitor, maxMetrics int,
 
 func metricsEntries(t *testing.T, mm *metricsMonitor) []ActivityLogEntry {
 	t.Helper()
-	page, err := mm.store.ListActivity(context.Background(), store.ActivityQuery{Limit: 1000, Page: 1})
+	page, err := mm.store.Activity().List(context.Background(), store.ActivityQuery{Limit: 1000, Page: 1})
 	if err != nil {
 		t.Fatalf("ListActivity: %v", err)
 	}
@@ -199,12 +231,12 @@ func TestServer_New_GroupConfig(t *testing.T) {
 	discard := logmon.NewWriter(io.Discard)
 	cfg := config.Config{HealthCheckTimeout: 15}
 	cfg.Routing.Router.Use = "group"
-	st, err := store.New("")
+	st, err := sqlite.New("")
 	if err != nil {
-		t.Fatalf("store.New: %v", err)
+		t.Fatalf("sqlite.New: %v", err)
 	}
 	defer st.Close()
-	s, err := New(cfg, discard, discard, discard, nil, st, BuildInfo{}, nil)
+	s, err := New(cfg, discard, discard, discard, nil, st, BuildInfo{}, nil, nil)
 	if err != nil {
 		t.Fatalf("New (group): %v", err)
 	}
@@ -229,12 +261,12 @@ func TestServer_New_MatrixConfig(t *testing.T) {
 	cfg.Routing.Router.Settings.Matrix = &config.MatrixConfig{
 		Sets: config.OrderedSets{{Name: "single", DSL: "model"}},
 	}
-	st, err := store.New("")
+	st, err := sqlite.New("")
 	if err != nil {
-		t.Fatalf("store.New: %v", err)
+		t.Fatalf("sqlite.New: %v", err)
 	}
 	defer st.Close()
-	s, err := New(cfg, discard, discard, discard, nil, st, BuildInfo{}, nil)
+	s, err := New(cfg, discard, discard, discard, nil, st, BuildInfo{}, nil, nil)
 	if err != nil {
 		t.Fatalf("New (matrix): %v", err)
 	}
@@ -295,6 +327,59 @@ func TestServer_RouteToLocalModel_PrefersLocalCollision(t *testing.T) {
 	if w.Body.String() != "local response" {
 		t.Errorf("body=%q want local response", w.Body.String())
 	}
+}
+
+func TestServer_GlobalConcurrencyLimit(t *testing.T) {
+	t.Run("zero disables the limiter, unbounded requests pass", func(t *testing.T) {
+		s := newTestServerWithConfig(
+			config.Config{GlobalConcurrencyLimit: 0},
+			newStubRouter([]string{"local-model"}, "ok"),
+			newStubRouter(nil, ""),
+		)
+
+		for i := 0; i < 5; i++ {
+			w := httptest.NewRecorder()
+			s.ServeHTTP(w, chatRequest("local-model"))
+			if w.Code != http.StatusOK {
+				t.Fatalf("request %d: status=%d body=%q", i, w.Code, w.Body.String())
+			}
+		}
+	})
+
+	t.Run("rejects requests beyond the configured limit with 429", func(t *testing.T) {
+		release := make(chan struct{})
+		started := make(chan struct{})
+		blocking := newStubRouter([]string{"local-model"}, "")
+		blocking.serveHTTP = func(w http.ResponseWriter, r *http.Request) {
+			close(started)
+			<-release
+			w.WriteHeader(http.StatusOK)
+		}
+
+		s := newTestServerWithConfig(
+			config.Config{GlobalConcurrencyLimit: 1},
+			blocking,
+			newStubRouter(nil, ""),
+		)
+
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			w := httptest.NewRecorder()
+			s.ServeHTTP(w, chatRequest("local-model"))
+		}()
+
+		<-started
+
+		w := httptest.NewRecorder()
+		s.ServeHTTP(w, chatRequest("local-model"))
+		if w.Code != http.StatusTooManyRequests {
+			t.Fatalf("status=%d body=%q want 429", w.Code, w.Body.String())
+		}
+
+		close(release)
+		<-done
+	})
 }
 
 func TestServer_UnknownModelReturns404(t *testing.T) {
@@ -468,6 +553,31 @@ func TestServer_Preload(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("preload event not received")
+	}
+}
+
+// TestServer_New_OnStartupProfile verifies New activates the configured startup profile.
+func TestServer_New_OnStartupProfile(t *testing.T) {
+	discard := logmon.NewWriter(io.Discard)
+	cfg := config.Config{HealthCheckTimeout: 15}
+	cfg.Profiles = map[string]config.ProfileConfig{
+		"coding": {Pins: map[string]string{"llm-code": "model"}},
+	}
+	cfg.Hooks.OnStartup.Profile = "coding"
+	st, err := sqlite.New("")
+	if err != nil {
+		t.Fatalf("sqlite.New: %v", err)
+	}
+	defer st.Close()
+	s, err := New(cfg, discard, discard, discard, nil, st, BuildInfo{}, nil, nil)
+	if err != nil {
+		t.Fatalf("New (startup profile): %v", err)
+	}
+	if got := s.ActiveProfile(); got != "coding" {
+		t.Fatalf("ActiveProfile()=%q want %q", got, "coding")
+	}
+	if err := s.Shutdown(time.Second); err != nil {
+		t.Fatalf("Shutdown: %v", err)
 	}
 }
 

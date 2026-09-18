@@ -274,7 +274,7 @@ fi
 # ---------------------------------------------------------------------------
 # Lane: UI  (ui-tests.yml)
 # ---------------------------------------------------------------------------
-if touched '^ui-svelte/'; then
+if touched '^ui/'; then
     hdr "UI tests (ui-tests.yml)"
     if ! command -v npm >/dev/null 2>&1; then
         skip "make test-ui — npm not installed"

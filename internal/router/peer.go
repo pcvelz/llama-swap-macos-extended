@@ -2,6 +2,7 @@ package router
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -16,11 +17,14 @@ import (
 	"github.com/mostlygeek/llama-swap/internal/config"
 	"github.com/mostlygeek/llama-swap/internal/logmon"
 	"github.com/mostlygeek/llama-swap/internal/swaputil"
+	"github.com/mostlygeek/llama-swap/internal/tailcat"
 )
 
 type peerMember struct {
 	peerID       string
 	reverseProxy *httputil.ReverseProxy
+	transport    *http.Transport
+	tailcat      *tailcat.Client
 	apiKey       string
 }
 
@@ -30,9 +34,10 @@ type peerRoute struct {
 }
 
 type Peer struct {
-	cfg    config.Config
-	logger *logmon.Monitor
-	peers  map[string]*peerRoute
+	cfg     config.Config
+	logger  *logmon.Monitor
+	peers   map[string]*peerRoute
+	members []*peerMember
 
 	shutdownCtx  context.Context
 	shutdownFn   context.CancelFunc
@@ -50,6 +55,8 @@ func NewPeer(cfg config.Config, logger *logmon.Monitor) (*Peer, error) {
 	bareRoutes := make(map[string][]*peerRoute)
 
 	peerIDs := make([]string, 0, len(peers))
+	tailcatClients := make(map[string]*tailcat.Client)
+	members := make([]*peerMember, 0, len(peers))
 	for peerID := range peers {
 		peerIDs = append(peerIDs, peerID)
 	}
@@ -57,13 +64,36 @@ func NewPeer(cfg config.Config, logger *logmon.Monitor) (*Peer, error) {
 
 	for _, peerID := range peerIDs {
 		peer := peers[peerID]
+		var tailcatClient *tailcat.Client
+		proxyFromEnvironment := http.ProxyFromEnvironment
+		dialContext := (&net.Dialer{
+			Timeout:   time.Duration(peer.Timeouts.Connect) * time.Second,
+			KeepAlive: time.Duration(peer.Timeouts.KeepAlive) * time.Second,
+		}).DialContext
+		if _, blob, privateKey, found := peer.Tailcat(); found {
+			clientKey := "ephemeral:" + peerID
+			if privateKey != nil {
+				clientKey = privateKey.Identity() + ":" + blob
+			}
+			tailcatClient = tailcatClients[clientKey]
+			if tailcatClient == nil {
+				tailcatClient = tailcat.NewClient(peerID, blob, privateKey, logger)
+				tailcatClients[clientKey] = tailcatClient
+			}
+			proxyFromEnvironment = nil
+			dialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+				if peer.Timeouts.Connect > 0 {
+					var cancel context.CancelFunc
+					ctx, cancel = context.WithTimeout(ctx, time.Duration(peer.Timeouts.Connect)*time.Second)
+					defer cancel()
+				}
+				return tailcatClient.DialContext(ctx, network, address)
+			}
+		}
 
 		peerTransport := &http.Transport{
-			Proxy: http.ProxyFromEnvironment,
-			DialContext: (&net.Dialer{
-				Timeout:   time.Duration(peer.Timeouts.Connect) * time.Second,
-				KeepAlive: time.Duration(peer.Timeouts.KeepAlive) * time.Second,
-			}).DialContext,
+			Proxy:                 proxyFromEnvironment,
+			DialContext:           dialContext,
 			TLSHandshakeTimeout:   time.Duration(peer.Timeouts.TLSHandshake) * time.Second,
 			ResponseHeaderTimeout: time.Duration(peer.Timeouts.ResponseHeader) * time.Second,
 			ExpectContinueTimeout: time.Duration(peer.Timeouts.ExpectContinue) * time.Second,
@@ -89,19 +119,36 @@ func NewPeer(cfg config.Config, logger *logmon.Monitor) (*Peer, error) {
 		}
 
 		reverseProxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
-			logger.Warnf("peer %s: proxy error: %v", peerID, err)
+			// A cancelled request is not a peer failure, so keep it out of the
+			// warning stream whether or not the sentinel applies below.
+			if errors.Is(err, context.Canceled) || r.Context().Err() != nil {
+				logger.Debugf("peer %s: request cancelled: %v", peerID, err)
+			} else {
+				logger.Warnf("peer %s: proxy error: %v", peerID, err)
+			}
+
+			// Only a client that actually hung up gets the recorded-only
+			// sentinel (#1029). A request cancelled server-side still has a
+			// client waiting for an answer.
+			if swaputil.MarkClientClosed(w, r) || swaputil.ResponseStarted(w) {
+				return
+			}
+
 			errMsg := fmt.Sprintf("peer proxy error: %v", err)
 			if runtime.GOOS == "darwin" && strings.Contains(err.Error(), "connect: no route to host") {
 				errMsg += " (hint: on macOS, check System Settings > Privacy & Security > Local Network permissions)"
 			}
-			http.Error(w, errMsg, http.StatusBadGateway)
+			swaputil.SendResponse(w, r, http.StatusBadGateway, errMsg)
 		}
 
 		pp := &peerMember{
 			peerID:       peerID,
 			reverseProxy: reverseProxy,
+			transport:    peerTransport,
+			tailcat:      tailcatClient,
 			apiKey:       peer.ApiKey,
 		}
+		members = append(members, pp)
 
 		seen := make(map[string]struct{})
 		for _, modelID := range peer.Models {
@@ -128,13 +175,15 @@ func NewPeer(cfg config.Config, logger *logmon.Monitor) (*Peer, error) {
 
 	shutdownCtx, shutdownFn := context.WithCancel(context.Background())
 
-	return &Peer{
+	r := &Peer{
 		cfg:         cfg,
 		logger:      logger,
 		peers:       modelMap,
+		members:     members,
 		shutdownCtx: shutdownCtx,
 		shutdownFn:  shutdownFn,
-	}, nil
+	}
+	return r, nil
 }
 
 func (r *Peer) Handles(model string) bool {
@@ -150,8 +199,12 @@ func (r *Peer) Shutdown(timeout time.Duration) error {
 	if timeout == 0 {
 		r.shutdownFn()
 		r.inflight.Wait()
-		return nil
+		return r.closeTransports(time.Second)
 	}
+
+	deadline := time.Now().Add(timeout)
+	deadlineCtx, cancelDeadline := context.WithDeadline(context.Background(), deadline)
+	defer cancelDeadline()
 
 	done := make(chan struct{})
 	go func() {
@@ -161,12 +214,60 @@ func (r *Peer) Shutdown(timeout time.Duration) error {
 
 	select {
 	case <-done:
-		return nil
-	case <-time.After(timeout):
 		r.shutdownFn()
-		r.inflight.Wait()
-		return fmt.Errorf("peer shutdown timed out after %v", timeout)
+		return r.closeTransports(max(time.Until(deadline), 0))
+	case <-deadlineCtx.Done():
+		r.shutdownFn()
+		select {
+		case <-done:
+		case <-deadlineCtx.Done():
+		}
+		return errors.Join(fmt.Errorf("peer shutdown timed out after %v", timeout), r.closeTransports(max(time.Until(deadline), 0)))
 	}
+}
+
+func (r *Peer) closeTransports(timeout time.Duration) error {
+	type closeResult struct {
+		index int
+		err   error
+	}
+
+	deadline := time.Now().Add(timeout)
+	closedTailcat := make(map[*tailcat.Client]struct{})
+	errs := make([]error, len(r.members))
+	done := make(chan closeResult, len(r.members))
+	for i, member := range r.members {
+		closeTailcat := false
+		if member.tailcat != nil {
+			if _, closed := closedTailcat[member.tailcat]; !closed {
+				closedTailcat[member.tailcat] = struct{}{}
+				closeTailcat = true
+			}
+		}
+
+		go func() {
+			var err error
+			member.transport.CloseIdleConnections()
+			if closeTailcat {
+				if closeErr := member.tailcat.CloseWithTimeout(max(time.Until(deadline), 0)); closeErr != nil {
+					err = fmt.Errorf("peer %s: %w", member.peerID, closeErr)
+				}
+			}
+			done <- closeResult{index: i, err: err}
+		}()
+	}
+
+	timer := time.NewTimer(max(time.Until(deadline), 0))
+	defer timer.Stop()
+	for range r.members {
+		select {
+		case result := <-done:
+			errs[result.index] = result.err
+		case <-timer.C:
+			return errors.Join(errs...)
+		}
+	}
+	return errors.Join(errs...)
 }
 
 func (r *Peer) ServeHTTP(w http.ResponseWriter, req *http.Request) {
@@ -207,15 +308,16 @@ func (r *Peer) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	}
 
 	// Cancel the proxy request when the client disconnects or shutdown times out.
-	// AfterFunc links both parent contexts to our child without a goroutine leak.
-	ctx, cancel := context.WithCancel(context.Background())
-	stopReq := context.AfterFunc(req.Context(), cancel)
+	// Deriving from the request covers the client half directly and keeps the
+	// request's context values — notably the client context that tells a real
+	// disconnect apart from a server-side cancel. AfterFunc links the unrelated
+	// shutdown context in without a goroutine leak.
+	ctx, cancel := context.WithCancel(req.Context())
 	stopShutdown := context.AfterFunc(r.shutdownCtx, cancel)
 	req = req.WithContext(ctx)
 
 	pp.reverseProxy.ServeHTTP(w, req)
 
 	stopShutdown()
-	stopReq()
 	cancel()
 }
