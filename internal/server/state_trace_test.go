@@ -113,6 +113,38 @@ func TestStateTrace_LinesFollowTheLedger(t *testing.T) {
 	}
 }
 
+// TestStateTrace_NoWaiterCooldownStillReadsDash pins the trace's own
+// vocabulary against the 2026-09-18 no-waiter cooldown addition
+// (cooldownSnapshotIdle): the trace line is about queue TRANSITIONS
+// ("cooldown=cq35h->cq27" means a swap is waited on), not the resident's own
+// idle-grace state, which the menu now shows on its own but the trace never
+// did before this and must not start now. A cooldown with an empty
+// NextModel (nothing queued) renders "cooldown=-", same as no cooldown at
+// all - even though the hot slots it protects are real and still listed.
+func TestStateTrace_NoWaiterCooldownStillReadsDash(t *testing.T) {
+	clk := time.Date(2026, 9, 18, 9, 0, 0, 0, time.UTC)
+	tr := newStateTrace(func() time.Time { return clk }, 100)
+	alias := func(id string) string { return map[string]string{"cq35": "cq35"}[id] }
+
+	tr.Observe(traceSnapshot{
+		Alias:    alias,
+		Resident: "cq35", ResidentState: process.StateReady,
+		// No live requests: the resident is idle inside its own grace, which
+		// is exactly what a no-waiter cooldown means. The hot slot below is
+		// what is kept warm for a session that paused, not a running request.
+		Requests: nil,
+		Cooldown: &swaputil.Cooldown{EvicteeModel: "cq35", NextModel: "", Waiting: 0, RemainingSeconds: 240,
+			Slots: []swaputil.HotSlot{{Slot: 0, SessionID: "725558cb-17fa", IdleSeconds: 5}}},
+	})
+
+	want := []string{
+		"09:00:00 resident=cq35 slots=[0:HOT(725558cb)] queue=[] cooldown=-",
+	}
+	if got := tr.Lines(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("trace lines:\n got=%q\nwant=%q", got, want)
+	}
+}
+
 func TestStateTrace_RingBufferKeepsTheLastN(t *testing.T) {
 	clk := time.Date(2026, 9, 10, 9, 0, 0, 0, time.UTC)
 	tr := newStateTrace(func() time.Time { return clk }, 2)

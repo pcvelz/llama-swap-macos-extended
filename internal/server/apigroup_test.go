@@ -871,6 +871,40 @@ func TestServer_HandleAPISwapGrace_ReportsCooldownWithHotSlots(t *testing.T) {
 	}
 }
 
+// A no-waiter cooldown (2026-09-18: the resident is idle inside its own
+// grace with nothing cross-model queued behind it) passes through the same
+// way, with empty NextModel/zero Waiting, and still gets its hot slots
+// joined - the menu needs those to render the row even without a waiter.
+func TestServer_HandleAPISwapGrace_ReportsNoWaiterCooldownWithHotSlots(t *testing.T) {
+	local := newStubRouter([]string{"cq35"}, "")
+	local.cooldown = &swaputil.Cooldown{EvicteeModel: "cq35", NextModel: "", Waiting: 0, RemainingSeconds: 240}
+	s := newTestServer(local, newStubRouter(nil, ""))
+	s.cfg = config.Config{Models: map[string]config.ModelConfig{
+		"cq35": {ConcurrencyLimit: 1, SlotAffinity: true},
+	}}
+	s.slotAffinity = newSlotAffinityStore(s.cfg)
+	s.slotAffinity.learn("cq35", "725558cb-session", 0)
+
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api/swap-grace", nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%q", w.Code, w.Body.String())
+	}
+	var body struct {
+		Cooldown *swaputil.Cooldown `json:"cooldown"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	cd := body.Cooldown
+	if cd == nil || cd.EvicteeModel != "cq35" || cd.NextModel != "" || cd.Waiting != 0 {
+		t.Fatalf("cooldown=%+v want evictee=cq35 next=\"\" waiting=0", cd)
+	}
+	if len(cd.Slots) != 1 || cd.Slots[0].SessionID != "725558cb-session" {
+		t.Fatalf("slots=%+v want one hot slot owned by 725558cb-session", cd.Slots)
+	}
+}
+
 // POST /api/swap-grace/finish ends the singleton cooldown: no model in the
 // path, nothing to resolve, always 200 (a no-op finish is harmless).
 func TestServer_SwapGraceFinish_CallsFinishCooldown(t *testing.T) {

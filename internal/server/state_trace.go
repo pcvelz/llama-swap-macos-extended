@@ -143,7 +143,15 @@ func traceLine(snap traceSnapshot) string {
 	}
 	cooldown := "-"
 	if cd := snap.Cooldown; cd != nil {
-		cooldown = alias(cd.EvicteeModel) + "->" + alias(cd.NextModel)
+		// The trace's "cooldown=X->Y" vocabulary is about a queued swap
+		// waiting on X, never the resident's own idle-grace state alone
+		// (2026-09-18 cooldownSnapshotIdle publishes a no-waiter cooldown
+		// with NextModel empty for the menu's cosmetic row - that must not
+		// invent a new trace symbol nobody asked for). Hot slots still list:
+		// they are real regardless of whether anything is queued.
+		if cd.NextModel != "" {
+			cooldown = alias(cd.EvicteeModel) + "->" + alias(cd.NextModel)
+		}
 		for _, hs := range cd.Slots {
 			if hs.SessionID != "" {
 				slots = append(slots, slotLine{hs.Slot, fmt.Sprintf("%d:HOT(%s)", hs.Slot, short(hs.SessionID))})

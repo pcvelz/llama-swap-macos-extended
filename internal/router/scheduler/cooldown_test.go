@@ -76,8 +76,12 @@ func TestFIFO_Cooldown_ExemptStatusReadNeverQueuesSwap(t *testing.T) {
 	if len(s.queued) != 0 {
 		t.Fatalf("exempt status read must never be queued, queue len=%d", len(s.queued))
 	}
-	if cd := s.Cooldown(); cd != nil {
-		t.Fatalf("a status read must not start a cooldown, got %+v", cd)
+	// The resident is still idle inside its own grace (2026-09-18: the
+	// no-waiter cooldown is now always published), but a status read must
+	// never turn that into a "waiting for" cooldown - no NextModel, no
+	// Waiting.
+	if cd := s.Cooldown(); cd == nil || cd.NextModel != "" || cd.Waiting != 0 {
+		t.Fatalf("a status read must not start a waiting cooldown, got %+v", cd)
 	}
 	if got := eff.startsFor("b"); got != 0 {
 		t.Fatalf("a status read must never start a swap, StartSwap(b)=%d", got)
@@ -137,17 +141,70 @@ func TestFIFO_Cooldown_ResidentUseRestarts_FinishEnds(t *testing.T) {
 	}
 }
 
-// No cooldown is reported when nothing cross-model is queued, even though the
-// resident is inside its grace: a cooldown with nobody waiting is not a state
-// the operator needs to see (and there is nothing to finish).
-func TestFIFO_Cooldown_NilWithoutCrossModelWaiter(t *testing.T) {
+// A no-waiter cooldown is reported when the resident is idle inside its own
+// grace even though nothing cross-model is queued (2026-09-18): the model's
+// slots and KV cache are hot and cooling exactly as they are with a waiter,
+// so the row must show too - just without NextModel/Waiting, since there is
+// no swap pending and nothing to finish.
+func TestFIFO_Cooldown_NoWaiterWhileIdleInGrace(t *testing.T) {
 	s, _, clk := cooldownFixture(t)
 	*clk = clk.Add(10 * time.Second)
-	if cd := s.Cooldown(); cd != nil {
-		t.Fatalf("Cooldown()=%+v want nil with nothing queued", cd)
+	s.OnTick() // the run-loop grace ticker's periodic re-publish, simulated
+	cd := s.Cooldown()
+	if cd == nil {
+		t.Fatalf("Cooldown()=nil want a no-waiter cooldown while a is idle inside its grace")
 	}
-	s.OnRequest(req("a")) // same-model request: no cooldown either
+	if cd.EvicteeModel != "a" {
+		t.Fatalf("cooldown.EvicteeModel=%q want a", cd.EvicteeModel)
+	}
+	if cd.NextModel != "" {
+		t.Fatalf("cooldown.NextModel=%q want empty (nothing queued)", cd.NextModel)
+	}
+	if cd.Waiting != 0 {
+		t.Fatalf("cooldown.Waiting=%d want 0 (nothing queued)", cd.Waiting)
+	}
+	if cd.RemainingSeconds <= 0 || cd.RemainingSeconds > 50 {
+		t.Fatalf("cooldown.RemainingSeconds=%d want in (0,50]", cd.RemainingSeconds)
+	}
+
+	s.OnRequest(req("a")) // same-model request: still no waiter, cooldown restarts
+	s.OnServeDone(ServeDoneEvent{ModelID: "a"})
+	s.OnTick()
+	if cd := s.Cooldown(); cd == nil || cd.NextModel != "" {
+		t.Fatalf("Cooldown()=%+v want a no-waiter cooldown for a same-model request", cd)
+	}
+}
+
+// Once the resident's grace has fully elapsed with nothing queued, there is
+// nothing left to cool down: no slots/KV are being protected past that point
+// (the process's own idle-TTL unload takes it from there).
+func TestFIFO_Cooldown_NilOnceGraceFullyElapsed(t *testing.T) {
+	s, _, clk := cooldownFixture(t)
+	*clk = clk.Add(61 * time.Second) // grace is 60s
+	s.OnTick()
 	if cd := s.Cooldown(); cd != nil {
-		t.Fatalf("Cooldown()=%+v want nil for a same-model request", cd)
+		t.Fatalf("Cooldown()=%+v want nil once grace has fully elapsed", cd)
+	}
+}
+
+// FinishCooldown on a no-waiter cooldown is harmless: there is no queued swap
+// to end, so the one-shot flag is simply dropped at the next tick and the
+// no-waiter row keeps counting down on its own.
+func TestFIFO_Cooldown_FinishOnNoWaiterIsHarmless(t *testing.T) {
+	s, eff, clk := cooldownFixture(t)
+	*clk = clk.Add(10 * time.Second)
+	s.OnTick()
+	if s.Cooldown() == nil {
+		t.Fatalf("expected a no-waiter cooldown before FinishCooldown")
+	}
+
+	s.FinishCooldown()
+	s.OnTick()
+
+	if cd := s.Cooldown(); cd == nil || cd.EvicteeModel != "a" {
+		t.Fatalf("Cooldown()=%+v want the no-waiter cooldown to survive a no-op finish", cd)
+	}
+	if got := eff.startsFor("b"); got != 0 {
+		t.Fatalf("no swap must start, StartSwap(b)=%d", got)
 	}
 }

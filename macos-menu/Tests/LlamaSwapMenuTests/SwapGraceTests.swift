@@ -54,6 +54,18 @@ final class SwapGraceTests: XCTestCase {
                        "cooldown 0:09, then cq27 · 1 waiting")
     }
 
+    // 2026-09-18: the resident is idle inside its own grace with nothing
+    // queued behind it (grace.go cooldownSnapshotIdle) - the row shows with
+    // no "then <next> · N waiting" suffix, since there is no swap pending.
+    func testCooldownLabelOmitsSuffixWithNoWaiter() {
+        let cd = CooldownRow(evicteeModel: "cq27", nextModel: "", waiting: 0, remainingSeconds: 240,
+                             slots: [HotSlotRow(slot: 0, sessionId: "17426df4-aaaa", idleSeconds: 5)])
+        XCTAssertEqual(MenuState.cooldownLabel(cd, next: ""),
+                       "cooldown 4:00 for [17426df4]")
+        XCTAssertEqual(MenuState.cooldownLabel(cd, next: "", restartedAgo: 12),
+                       "cooldown 4:00 (restarted 0:12 ago) for [17426df4]")
+    }
+
     func testOnlyOwnedSlotsAreListedUnderTheCooldown() {
         // A free slot is protected by nothing; listing it read as two slots
         // in cooldown (2026-09-10 screenshot: "slot 0 hot", "slot 1 free").

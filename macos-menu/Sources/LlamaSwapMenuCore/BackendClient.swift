@@ -282,6 +282,7 @@ public final class BackendClient: ObservableObject {
 
     private func publishHeldRows() {
         menuState.sessionRows = rowWordStabilizer.apply(rawRows, now: Date())
+        applyWaitingParity()
         // A pending word must be able to land with NO further data: an idle
         // lane sends no events and stops slot polling, so re-apply once the
         // hold has run. .common so an open menu's tracking loop still fires it.
@@ -293,6 +294,34 @@ public final class BackendClient: ObservableObject {
         }
         RunLoop.main.add(timer, forMode: .common)
         rowHoldTimer = timer
+    }
+
+    /// Recomputes menuState.waiting/waitingByTier from menuState.sessionRows -
+    /// the exact rows just published, counting PARKED ones only (running
+    /// requests are shown as slots, never as waiting). Called from
+    /// publishHeldRows, the single place sessionRows changes, so the two can
+    /// never read from different snapshots and disagree (2026-09-18 hard
+    /// rule - see MenuState.waitingByTier's doc comment).
+    ///
+    /// The per-tier breakdown's key set comes from every tier CURRENTLY
+    /// represented among sessionRows (running or parked), not a static
+    /// config list the menu doesn't have - a tier with nothing happening
+    /// right now simply isn't shown, same as before tiers existed. Untiered
+    /// rows (tier "-") fold into "default", matching the server's own
+    /// swaputil.DefaultTier.Name.
+    private func applyWaitingParity() {
+        let rows = menuState.sessionRows
+        func tierName(_ row: SessionRow) -> String { row.tier == "-" ? "default" : row.tier }
+        let parked = rows.filter { $0.word == ThroughputWord.parked.rawValue }
+        menuState.waiting = parked.count
+        let tiers = Set(rows.map(tierName))
+        guard tiers.count > 1 else {
+            menuState.waitingByTier = [:]
+            return
+        }
+        var byTier = Dictionary(uniqueKeysWithValues: tiers.map { ($0, 0) })
+        for row in parked { byTier[tierName(row), default: 0] += 1 }
+        menuState.waitingByTier = byTier
     }
 
     /// Lanes with no in-flight request that are still being rendered, with
@@ -364,7 +393,6 @@ public final class BackendClient: ObservableObject {
             if let inner = envelope.data.data(using: .utf8),
                let stats = try? JSONDecoder().decode(InFlightStats.self, from: inner) {
                 applyInflightEntries(stats)
-                menuState.applyInflight(total: stats.total, byTier: stats.byTier ?? [:])
             }
         case "swapGrace":
             if let inner = envelope.data.data(using: .utf8),

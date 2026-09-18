@@ -5,16 +5,19 @@ public struct MenuState: Encodable {
     public var completed = 0
     public var waiting = 0
     /// Per-tier waiting breakdown (docs/intent/llama-swap-tiers.md, llama-cm).
-    /// Populated only when the backend's inflight event carried more than one
-    /// tier; empty otherwise, so a single-listener backend renders exactly as
-    /// before tiers existed.
+    /// Populated only when more than one tier is currently in play among the
+    /// rows shown; empty otherwise, so a single-tier deployment renders
+    /// exactly as before tiers existed.
+    ///
+    /// HARD RULE (user, 2026-09-18): waiting must always be in parity with
+    /// the slots shown - both are derived from the same sessionRows snapshot
+    /// (BackendClient.applyWaitingParity), counting PARKED rows only. There
+    /// is deliberately no independent smoothing/anti-flap hold here anymore
+    /// (the old 600s peak-hold let "N waiting" show a stale peak with
+    /// "Queue: idle" and no PARKED rows in sight) - if a hold is ever wanted
+    /// again it must apply to waiting and waitingByTier from the exact same
+    /// state so the two can never disagree.
     public var waitingByTier: [String: Int] = [:]
-    /// When each waiting count ("" = total) last peaked, for the anti-flap hold.
-    private var heldSince: [String: Date] = [:]
-
-    /// Mirrors the config's swapGraceSeconds (600) — anti-flap display hold;
-    /// slot stability: llama-cm docs/intent/llama-swap-backend.md § Slot stability.
-    static let waitingHold: TimeInterval = 600
     public var models: [ModelRow] = []
     /// The model the user last picked. Kept after the switch completes: it is
     /// what makes `activeModelID` keep tracking their choice once several models
@@ -66,12 +69,20 @@ public struct MenuState: Encodable {
     /// separate section: "cooldown 9:41 for [17426df4], then cq35 · 5 waiting",
     /// with "(restarted 0:31 ago)" after the countdown once a turn of the
     /// resident has restarted it. Never "X waiting for <loaded model>".
+    ///
+    /// A no-waiter cooldown (2026-09-18: the resident is idle inside its own
+    /// grace with nothing cross-model queued behind it - CooldownRow.nextModel
+    /// empty) omits the ", then <next> · N waiting" suffix entirely: there is
+    /// no swap pending, so naming one and counting zero waiters would read as
+    /// a real wait that isn't happening.
     public static func cooldownLabel(_ cd: CooldownRow, next: String, restartedAgo: Int? = nil) -> String {
         var s = "cooldown \(CompactFormatter.countdown(cd.remainingSeconds))"
         if let restartedAgo { s += " (restarted \(CompactFormatter.countdown(restartedAgo)) ago)" }
         let owners = hotSlots(cd).map { "[\(String($0.sessionId.prefix(8)))]" }
         if !owners.isEmpty { s += " for " + owners.joined(separator: " ") }
-        s += ", then \(next) · \(cd.waiting) waiting"
+        if !cd.nextModel.isEmpty {
+            s += ", then \(next) · \(cd.waiting) waiting"
+        }
         return s
     }
 
@@ -133,29 +144,6 @@ public struct MenuState: Encodable {
             return parts.joined(separator: ", ") + " waiting"
         }
         return "\(waiting) waiting"
-    }
-
-    /// Applies an inflight event through the anti-flap hold: rises show
-    /// immediately (and refresh the peak timestamp); drops only apply once the
-    /// count has not re-peaked for waitingHold. No flapping — slot stability.
-    public mutating func applyInflight(total: Int, byTier: [String: Int], now: Date = Date()) {
-        waiting = holdWaiting(key: "", held: waiting, raw: total, now: now)
-        var merged = byTier
-        for key in waitingByTier.keys where merged[key] == nil { merged[key] = 0 }
-        guard !merged.isEmpty else { return }
-        var held: [String: Int] = [:]
-        for (key, raw) in merged {
-            held[key] = holdWaiting(key: key, held: waitingByTier[key] ?? 0, raw: raw, now: now)
-        }
-        waitingByTier = held
-    }
-
-    private mutating func holdWaiting(key: String, held: Int, raw: Int, now: Date) -> Int {
-        if raw >= held || now.timeIntervalSince(heldSince[key] ?? .distantPast) > MenuState.waitingHold {
-            heldSince[key] = now
-            return raw
-        }
-        return held
     }
 
     /// Several models can be ready at once, so "first ready row" is just config

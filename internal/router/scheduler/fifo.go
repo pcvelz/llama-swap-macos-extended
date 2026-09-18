@@ -390,6 +390,13 @@ func (s *FIFO) OnRequest(req HandlerReq) {
 	s.logger.Debugf("%s: starting swap for model %s, evicting %v", s.name, req.Model, evict)
 	markParked(&req, ParkLoading)
 	s.startSwap(req, evict, running)
+	// Every other branch above publishes via enqueue or grantHandler; this is
+	// the one path that goes straight to startSwap with nothing queued.
+	// Publish now so a no-waiter cooldown snapshot (cooldownSnapshotIdle)
+	// excludes the model this swap just started evicting immediately,
+	// instead of waiting out the next OnTick.
+	s.publishCapacity()
+	s.publishGrace()
 }
 
 // OnCancel removes a request whose client has disconnected from the queue and
@@ -531,7 +538,14 @@ func (s *FIFO) OnServeDone(ev ServeDoneEvent) {
 // grace-deferred swap proceed once its evictee has gone idle and STAYS idle:
 // no serve or swap event fires during pure idle, so without this nudge the
 // deferred request would wait forever. The router arms it only when a swap-grace
-// is configured; it is a no-op when the queue is empty.
+// is configured; drainQueue is a no-op when the queue is empty.
+//
+// publishGrace runs unconditionally on every tick, queue empty or not: a
+// no-waiter cooldown (cooldownSnapshotIdle) has nothing in the queue to
+// trigger a re-publish otherwise, so without this its countdown would freeze
+// at whatever value it read when the resident went idle. Cheap and
+// side-effect free — it is the same snapshot every other publishGrace call
+// site already takes on every state change.
 func (s *FIFO) OnTick() {
 	if len(s.queued) == 0 {
 		// A finish clicked while nothing was held has nothing to end. Drop
@@ -540,6 +554,7 @@ func (s *FIFO) OnTick() {
 		s.consumeForced()
 	}
 	s.drainQueue()
+	s.publishGrace()
 }
 
 // withinGrace reports whether any model in evict is still inside its swap-grace

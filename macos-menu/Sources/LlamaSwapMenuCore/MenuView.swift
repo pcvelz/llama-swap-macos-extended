@@ -88,7 +88,15 @@ public struct MenuView: View {
         // thing happening (2026-09-10).
         ForEach(state.models) { model in
             if let cd = state.cooldown, cd.evicteeModel == model.id {
+                // A no-waiter cooldown (empty nextModel) has no swap pending
+                // to finish - the click is a harmless no-op rather than a
+                // POST that would do nothing (server-side FinishCooldown is
+                // already a no-op here too, see grace.go OnTick/consumeForced,
+                // but skipping the request avoids a pointless round trip and
+                // an optimistic clear of a row that would just come right
+                // back on the next SSE tick).
                 Button {
+                    guard !cd.nextModel.isEmpty else { return }
                     client.finishCooldown()
                 } label: {
                     Label {
