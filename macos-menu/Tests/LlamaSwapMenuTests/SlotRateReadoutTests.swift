@@ -94,7 +94,10 @@ final class SlotRateReadoutTests: XCTestCase {
         }, "expected the total to reflect the second poll's 15400 tokens, got \(client.menuState.sessionRows.first?.detail ?? "<none>")")
 
         let detail = client.menuState.sessionRows.first?.detail ?? "<none>"
-        XCTAssertFalse(detail.contains("0.0 t/s"),
+        // Anchored on the "· " separator: a bare "0.0 t/s" also matches a
+        // legitimate "200.0 t/s", which is exactly the rate when the two polls
+        // land 2s apart (400 tokens / 2s).
+        XCTAssertFalse(detail.contains("· 0.0 t/s"),
                         "the total rose by 400 tokens between polls - the rate must not read 0.0 t/s; got '\(detail)'")
     }
 
