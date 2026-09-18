@@ -52,7 +52,7 @@ func newStallTestServer(t *testing.T, budget time.Duration, chunk []byte) *stall
 		served:    make(chan struct{}),
 	}
 
-	st.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	st.srv = httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer close(st.served)
 
 		ctx, cancel := context.WithCancel(r.Context())
@@ -89,6 +89,23 @@ func newStallTestServer(t *testing.T, budget time.Duration, chunk []byte) *stall
 			pw.Flush()
 		}
 	}))
+	// Pin the SERVER's send buffer small as well. The client's small receive
+	// window alone is enough on macOS and Linux, but Windows auto-tunes the
+	// send buffer so large that the stalled write never blocks within the
+	// budget, and the test then proves nothing there (Windows CI red on this
+	// test since it was added). Both buffers small means the write blocks
+	// after a few KB on every platform, which is the property under test.
+	st.srv.Config.ConnState = func(c net.Conn, state http.ConnState) {
+		if state != http.StateNew {
+			return
+		}
+		if tcp, ok := c.(*net.TCPConn); ok {
+			if err := tcp.SetWriteBuffer(4096); err != nil {
+				t.Errorf("SetWriteBuffer: %v", err)
+			}
+		}
+	}
+	st.srv.Start()
 	t.Cleanup(st.srv.Close)
 	return st
 }
