@@ -111,7 +111,16 @@ func TestTailcatTransport_LocalDERPHTTP(t *testing.T) {
 				http.Error(w, "missing authenticated source", http.StatusInternalServerError)
 				return
 			}
-			gotSource <- source
+			// Non-blocking: an attempt the retry loop below already abandoned
+			// can still reach this handler later. A blocking send let that
+			// late request fill the buffer, after which every retry blocked
+			// here before writing its response and timed out, so the test
+			// could never recover. Every request comes from the same client,
+			// so whichever source is buffered is the one to check.
+			select {
+			case gotSource <- source:
+			default:
+			}
 			io.WriteString(w, "tailcat over HTTP")
 		}),
 	})
