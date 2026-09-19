@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -38,6 +39,20 @@ type stallTestServer struct {
 	writeErr atomic.Pointer[error]
 	// served closes when the handler returns.
 	served chan struct{}
+	// written and maxWrite describe what the stream did, so a failure says
+	// whether the writes never blocked or blocked without being reclaimed.
+	written  atomic.Int64
+	maxWrite atomic.Int64
+}
+
+// describe summarises the stream for a failure message.
+func (st *stallTestServer) describe() string {
+	werr := "none"
+	if p := st.writeErr.Load(); p != nil {
+		werr = (*p).Error()
+	}
+	return fmt.Sprintf("wrote %d bytes, longest write+flush %v, write error: %s",
+		st.written.Load(), time.Duration(st.maxWrite.Load()), werr)
 }
 
 // newStallTestServer starts a server whose handler streams `chunk` repeatedly
@@ -82,11 +97,17 @@ func newStallTestServer(t *testing.T, budget time.Duration, chunk []byte) *stall
 		// loop going forever, which is exactly the "slow but alive" case: it
 		// must NOT be reaped.
 		for ctx.Err() == nil {
-			if _, err := pw.Write(chunk); err != nil {
+			started := time.Now()
+			n, err := pw.Write(chunk)
+			st.written.Add(int64(n))
+			if err != nil {
 				st.writeErr.Store(&err)
 				return
 			}
 			pw.Flush()
+			if d := int64(time.Since(started)); d > st.maxWrite.Load() {
+				st.maxWrite.Store(d)
+			}
 		}
 	}))
 	t.Cleanup(st.srv.Close)
@@ -100,21 +121,25 @@ func newStallTestServer(t *testing.T, budget time.Duration, chunk []byte) *stall
 func dialAndReadOnce(t *testing.T, srv *httptest.Server, rcvBuf int) net.Conn {
 	t.Helper()
 
+	// A small receive buffer closes the window after a few KB instead of after
+	// the default hundreds of KB, so the stall shows up in test time rather
+	// than in minutes of streaming. It is set BEFORE connect: the window scale
+	// is negotiated in the handshake, and Windows keeps receive-window
+	// auto-tuning on for a socket whose buffer was only shrunk afterwards, so
+	// the frozen peer's window never closed there.
+	dialer := net.Dialer{Control: func(_, _ string, c syscall.RawConn) error {
+		var serr error
+		if err := c.Control(func(fd uintptr) { serr = setRcvBufFD(fd, rcvBuf) }); err != nil {
+			return err
+		}
+		return serr
+	}}
 	addr := strings.TrimPrefix(srv.URL, "http://")
-	conn, err := net.Dial("tcp", addr)
+	conn, err := dialer.Dial("tcp", addr)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
 	t.Cleanup(func() { conn.Close() })
-
-	// A small receive buffer closes the window after a few KB instead of after
-	// the default hundreds of KB, so the stall shows up in test time rather
-	// than in minutes of streaming.
-	if tcp, ok := conn.(*net.TCPConn); ok {
-		if err := tcp.SetReadBuffer(rcvBuf); err != nil {
-			t.Fatalf("SetReadBuffer: %v", err)
-		}
-	}
 
 	if _, err := fmt.Fprintf(conn, "GET / HTTP/1.1\r\nHost: x\r\n\r\n"); err != nil {
 		t.Fatalf("write request: %v", err)
@@ -146,7 +171,7 @@ func TestPeerStall_FrozenPeerReclaimsSlot(t *testing.T) {
 	select {
 	case <-st.cancelled:
 	case <-time.After(budget + 15*time.Second):
-		t.Fatal("frozen peer was not reclaimed: request context never cancelled")
+		t.Fatalf("frozen peer was not reclaimed: request context never cancelled (%s)", st.describe())
 	}
 
 	select {
