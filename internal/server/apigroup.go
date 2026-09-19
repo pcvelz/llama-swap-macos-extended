@@ -791,7 +791,8 @@ const (
 	msgTypeProfile     messageType = "profileChanged"
 	msgTypeSwapGrace   messageType = "swapGrace"
 	// msgTypeMemoryBrake carries membrake.Status (enabled, holding, the
-	// hold countdown and the last brake event), pushed on the same 1s tick.
+	// drain gate's current and release file-backed level, and the last brake
+	// event), pushed on the same 1s tick.
 	msgTypeMemoryBrake messageType = "memoryBrake"
 	// msgTypeSessions carries the session-state snapshot, the same body as
 	// GET /api/sessions (sessions.go), pushed on change at most 1 Hz.

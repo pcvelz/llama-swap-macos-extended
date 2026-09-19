@@ -597,7 +597,7 @@ func (p *ProcessCommand) doStart(startCtx context.Context, healthCheckTimeout ti
 		cmdCancel()
 		return startResult{err: fmt.Errorf("failed to start command '%s': %w", strings.Join(args, " "), err)}
 	}
-	registerLive(p, cmd.Process.Pid)
+	registerLive(p, cmd.Process.Pid, args)
 
 	go func() {
 		waitErr := cmd.Wait()

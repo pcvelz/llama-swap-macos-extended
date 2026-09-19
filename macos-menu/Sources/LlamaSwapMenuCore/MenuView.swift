@@ -58,6 +58,12 @@ public struct MenuView: View {
             }
         }
 
+        // The memory brake's admission gate: after a brake kill, loads wait
+        // for the killed model's file cache to drain. Absent while open.
+        if let brake = MenuState.memoryBrakeLabel(state.memoryBrake) {
+            Text(brake)
+        }
+
         Text("Load")
             .foregroundStyle(.secondary)
             .disabled(true)

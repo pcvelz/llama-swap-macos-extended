@@ -223,6 +223,7 @@ public final class BackendClient: ObservableObject {
         state.sessionRows = snapshot.sessions.map(SessionRow.init(contract:))
         state.waiting = snapshot.queue.waiting
         state.waitingByTier = snapshot.queue.byTier
+        state.memoryBrake = snapshot.memoryBrake
         menuState = state
     }
 

@@ -48,10 +48,16 @@ public struct QueueCounts: Decodable, Equatable {
     public let byTier: [String: Int]
 }
 
-public struct MemoryBrakeInfo: Decodable {
+/// The memory brake's admission gate. After a brake kill, local-model loads
+/// are held until file-backed memory drains below `drainBelowGB`
+/// (`fileBackedGB` is the live value). Both drain fields are sent only while
+/// holding, and are absent from servers that predate the gate.
+public struct MemoryBrakeInfo: Codable, Equatable {
     public let enabled: Bool
     public let holding: Bool
     public let remainingSeconds: Int
+    public let fileBackedGB: Double?
+    public let drainBelowGB: Double?
 }
 
 /// One `sessions[]` entry. `phase` and `parkReason` are plain `String`, not a

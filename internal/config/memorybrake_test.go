@@ -21,14 +21,27 @@ func TestMemoryBrakeDefaultsOnWhenBlockAbsent(t *testing.T) {
 }
 
 func TestMemoryBrakePartialBlockKeepsOtherDefaults(t *testing.T) {
-	cfg, err := LoadConfigFromReader(strings.NewReader("memoryBrake:\n  holdMinutes: 9\n"))
+	cfg, err := LoadConfigFromReader(strings.NewReader("memoryBrake:\n  drainBelowGB: 8\n"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	want := DefaultMemoryBrakeConfig()
-	want.HoldMinutes = 9
+	want.DrainBelowGB = 8
 	if cfg.MemoryBrake != want {
 		t.Fatalf("got %+v, want %+v", cfg.MemoryBrake, want)
+	}
+}
+
+// A yaml written for the fixed hold (holdMinutes) still loads; the value is
+// recorded as ignored (the brake warns about it at startup) and the drain gate
+// keeps its default.
+func TestMemoryBrakeLegacyHoldMinutesAcceptedAndIgnored(t *testing.T) {
+	cfg, err := LoadConfigFromReader(strings.NewReader("memoryBrake:\n  holdMinutes: 5\n"))
+	if err != nil {
+		t.Fatalf("legacy holdMinutes must not fail the load: %v", err)
+	}
+	if cfg.MemoryBrake.LegacyHoldMinutes != 5 || cfg.MemoryBrake.DrainBelowGB != 10 {
+		t.Fatalf("legacy holdMinutes not recorded, or it changed the drain gate: %+v", cfg.MemoryBrake)
 	}
 }
 
@@ -43,11 +56,12 @@ func TestMemoryBrakeCanBeDisabled(t *testing.T) {
 }
 
 // The 2026-09-18 20:35 ruling: file-backed growth >= 3.5 GB within a rolling
-// 5-minute window, armed 10 min after a model is ready.
+// 5-minute window. Armed at ready since 2026-09-19 (Event 8: the 14:54
+// collapse came five minutes after ready, inside the old 10-minute warm-up).
 func TestMemoryBrakeFileBackedDefaults(t *testing.T) {
 	d := DefaultMemoryBrakeConfig()
-	if d.GrowthGB != 3.5 || d.WindowMinutes != 5 || d.ArmAfterMinutes != 10 ||
-		d.ConfirmSamples != 2 || d.HoldMinutes != 5 || d.SampleIntervalMs != 1000 || !d.Enabled {
+	if d.GrowthGB != 3.5 || d.WindowMinutes != 5 || d.ArmAfterMinutes != 0 ||
+		d.ConfirmSamples != 2 || d.DrainBelowGB != 10 || d.SampleIntervalMs != 1000 || !d.Enabled {
 		t.Fatalf("defaults drifted from the ruling: %+v", d)
 	}
 }
@@ -73,6 +87,7 @@ func TestMemoryBrakeRejectsNonsense(t *testing.T) {
 		"memoryBrake:\n  windowMinutes: 0\n",
 		"memoryBrake:\n  armAfterMinutes: -1\n",
 		"memoryBrake:\n  confirmSamples: 0\n",
+		"memoryBrake:\n  drainBelowGB: -1\n",
 		"memoryBrake:\n  sampleIntervalMs: 0\n",
 	} {
 		if _, err := LoadConfigFromReader(strings.NewReader(y)); err == nil {

@@ -552,10 +552,11 @@ func (b *baseRouter) doSwap(modelID string, toStop []string) {
 	// the same decision inside the process, where the state is owned.
 	target := b.processes[modelID]
 	// Memory brake hold: after the brake SIGKILLed the local children, a load
-	// is parked until the hold expires, so swap-grace, the kv-admission parker
-	// or a waiting client cannot reload into the very condition that tripped
-	// it (internal/membrake). Parking, not refusing: the client keeps its
-	// place and gets its turn when the hold ends.
+	// is parked until file-backed memory has drained below drainBelowGB, so
+	// swap-grace, the kv-admission parker or a waiting client cannot reload
+	// into the killed model's leftover file cache (internal/membrake).
+	// Parking, not refusing: the client keeps its place and gets its turn
+	// when the gate opens.
 	var err error
 	if target.State() != process.StateReady {
 		err = membrake.DefaultHold.Wait(b.shutdownCtx, modelID, b.logger)

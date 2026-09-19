@@ -12,15 +12,16 @@ import (
 )
 
 // After a memory brake event, a load of a local model is PARKED until the
-// hold expires (so swap-grace, the kv-admission parker or a waiting client
-// cannot reload straight into the condition that tripped the brake), and then
-// proceeds normally.
+// brake opens the gate (file-backed drained, so swap-grace, the kv-admission
+// parker or a waiting client cannot reload straight into the killed model's
+// leftover file cache), and then proceeds normally - it is never failed.
 func TestMemoryBrakeHoldParksLoadUntilExpiry(t *testing.T) {
 	old := membrake.DefaultHold
 	defer func() { membrake.DefaultHold = old }()
 	membrake.DefaultHold = &membrake.Hold{}
 	hold := 400 * time.Millisecond
-	membrake.DefaultHold.Set(time.Now().Add(hold), &membrake.Event{})
+	membrake.DefaultHold.Set(&membrake.Event{}, 10<<30)
+	time.AfterFunc(hold, membrake.DefaultHold.Release)
 
 	b := newFakeProcess("b")
 	b.autoReady = true

@@ -118,8 +118,8 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 	}
 
 	if mb := config.MemoryBrake; mb.SampleIntervalMs <= 0 || mb.WindowMinutes <= 0 ||
-		mb.GrowthGB <= 0 || mb.ArmAfterMinutes < 0 || mb.ConfirmSamples < 1 || mb.HoldMinutes < 0 {
-		return Config{}, fmt.Errorf("memoryBrake: sampleIntervalMs, windowMinutes, growthGB must be > 0, armAfterMinutes >= 0, confirmSamples >= 1, holdMinutes >= 0 (windowSeconds is obsolete and ignored)")
+		mb.GrowthGB <= 0 || mb.ArmAfterMinutes < 0 || mb.ConfirmSamples < 1 || mb.DrainBelowGB < 0 {
+		return Config{}, fmt.Errorf("memoryBrake: sampleIntervalMs, windowMinutes, growthGB must be > 0, armAfterMinutes >= 0, confirmSamples >= 1, drainBelowGB >= 0 (windowSeconds and holdMinutes are obsolete and ignored)")
 	}
 
 	if dh := config.DebugHistory; dh.Enabled && (dh.IntervalMs <= 0 || dh.RetainMinutes <= 0) {

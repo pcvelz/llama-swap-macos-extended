@@ -40,8 +40,13 @@ type tick struct {
 	pid     int
 }
 
-func loadTicks(t *testing.T) []tick {
-	f, err := os.Open("testdata/observer-filebacked-2026-09-18.log")
+const (
+	day18 = "2026-09-18"
+	day19 = "2026-09-19"
+)
+
+func loadTicks(t *testing.T, day string) []tick {
+	f, err := os.Open("testdata/observer-filebacked-" + day + ".log")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -54,7 +59,7 @@ func loadTicks(t *testing.T) []tick {
 			continue
 		}
 		fs := strings.Fields(line)
-		ts, err := time.ParseInLocation("2006-01-02 15:04:05", "2026-09-18 "+fs[0], time.Local)
+		ts, err := time.ParseInLocation("2006-01-02 15:04:05", day+" "+fs[0], time.Local)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -72,7 +77,11 @@ type replayResult struct {
 }
 
 func replay(t *testing.T, cfg config.MemoryBrakeConfig) replayResult {
-	ticks := loadTicks(t)
+	return replayDay(t, day18, cfg)
+}
+
+func replayDay(t *testing.T, day string, cfg config.MemoryBrakeConfig) replayResult {
+	ticks := loadTicks(t, day)
 	res := replayResult{fires: map[string]int{}, peak: map[string]float64{}}
 	kids := &fakeKids{}
 	var b *Brake
@@ -130,12 +139,23 @@ func TestReplayFiresOnlyOnTheFatalRunUps(t *testing.T) {
 	cfg.MarkerPath = ""
 	res := replay(t, cfg)
 
+	// The first fire in each run-up is the brake; later fires in the same
+	// run-up are replay artefacts (the observer data keeps the "killed" child
+	// alive, and with the brake armed at ready it re-fires on the same climb).
 	got := sortedKeys(res.fires)
-	if len(got) != 2 || got[0] != "14:39:22" || got[1] != "15:56:05" {
-		t.Fatalf("brake fired in segments ending %v, want exactly [14:39:22 15:56:05]", got)
-	}
+	first := map[string]string{}
 	for _, k := range got {
 		t.Logf("fired in the segment ending %s, %ds into the tick (linear-growth worst case)", k, res.fires[k])
+		if !inRunUp(k) {
+			t.Errorf("false fire in the segment ending %s", k)
+			continue
+		}
+		if run := k[:2]; first[run] == "" {
+			first[run] = k
+		}
+	}
+	if first["14"] != "14:39:22" || first["15"] != "15:56:05" {
+		t.Fatalf("first fires %v, want 14:39:22 (14:47 run-up) and 15:56:05 (16:02 run-up); all fires %v", first, got)
 	}
 
 	// Margins, against the pure observer data (no threshold in the way).
@@ -174,6 +194,122 @@ func TestReplayFiresOnlyOnTheFatalRunUps(t *testing.T) {
 		cfg.GrowthGB, cfg.WindowMinutes, cfg.ArmAfterMinutes, fatal1, fatal1-cfg.GrowthGB, fatal2, fatal2-cfg.GrowthGB, maxNormal, maxNormalAt, cfg.GrowthGB-maxNormal)
 	if maxNormal >= cfg.GrowthGB {
 		t.Fatalf("armed non-fatal growth %.2f GB at %s reaches the threshold", maxNormal, maxNormalAt)
+	}
+}
+
+// Event 8 (2026-09-19): the reload at 14:48:52 went into 36 GB of leftover
+// file cache and collapsed at 14:54:33, five minutes after ready - inside the
+// old 10-minute warm-up, so the brake never saw it. Armed at ready, it fires
+// inside that last tick, and nowhere after a load (file-backed falls there).
+func TestReplay_Event8FiresOnTheReloadCollapse(t *testing.T) {
+	cfg := config.DefaultMemoryBrakeConfig()
+	cfg.MarkerPath = ""
+	res := replayDay(t, day19, cfg)
+	got := sortedKeys(res.fires)
+	for _, k := range got {
+		t.Logf("fired in the segment ending %s, %ds into the tick", k, res.fires[k])
+	}
+	if _, ok := res.fires["14:54:33"]; !ok {
+		t.Fatalf("brake fired in segments ending %v, want one ending 14:54:33 (the 14:54 collapse)", got)
+	}
+	for _, k := range got {
+		// The observer ticks miss the three live kills (each run-up fell
+		// between two ticks), so the collapse is the only fire the replay
+		// can see.
+		if k != "14:54:33" {
+			t.Errorf("unexpected fire in the segment ending %s", k)
+		}
+	}
+}
+
+// Arming at ready costs no false-fire margin: on both days the largest armed
+// growth outside the fatal events is the same with the old 10-minute warm-up
+// and with none, because file-backed only falls after a load.
+func TestReplay_ArmAtReadyAddsNoFalseFireExposure(t *testing.T) {
+	largestOther := func(day string, arm int) (float64, string) {
+		cfg := config.DefaultMemoryBrakeConfig()
+		cfg.MarkerPath = ""
+		cfg.ArmAfterMinutes = arm
+		cfg.GrowthGB = 1e6 // observe the growth, never trip
+		mx, at := 0.0, ""
+		for k, g := range replayDay(t, day, cfg).peak {
+			if (day == day18 && inRunUp(k)) || (day == day19 && k == "14:54:33") {
+				continue
+			}
+			if g > mx {
+				mx, at = g, k
+			}
+		}
+		return mx, at
+	}
+	for _, day := range []string{day18, day19} {
+		old, oldAt := largestOther(day, 10)
+		now, nowAt := largestOther(day, 0)
+		t.Logf("%s: largest armed non-event growth %.2f GB at %s (arm 10 min) vs %.2f GB at %s (arm at ready); threshold 3.50", day, old, oldAt, now, nowAt)
+		if now > old+0.01 || now >= 3.5 {
+			t.Errorf("%s: arming at ready raised the largest non-event growth from %.2f to %.2f GB", day, old, now)
+		}
+	}
+}
+
+// Fix B backtest (Event 8): the drain gate started at each real brake kill of
+// 2026-09-19 (marker times), fed the observer ticks that followed. The log
+// cannot show what an eviction would have freed, so the replay is PASSIVE
+// (eviction frees nothing): the gate opens only if the cache drains on its
+// own. Expected: shut at every reload the fixed 5-minute hold admitted
+// (14:11:05, 14:32:15 and the fatal 14:48:52).
+func TestReplay_Event8DrainGateBlocksEveryReload(t *testing.T) {
+	ticks := loadTicks(t, day19)
+	at := func(hms string) time.Time {
+		ts, err := time.ParseInLocation("2006-01-02 15:04:05", day19+" "+hms, time.Local)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return ts
+	}
+	for _, k := range []struct{ kill, reload string }{
+		{"14:06:00", "14:11:05"}, {"14:27:05", "14:32:15"}, {"14:43:30", "14:48:52"},
+	} {
+		cfg := config.DefaultMemoryBrakeConfig()
+		cfg.MarkerPath = ""
+		hold := &Hold{}
+		b := New(cfg, nil, (&fakeKids{}).snap, func(int) error { return nil }, nil, hold)
+		b.alive = func(int) bool { return false }
+		b.evict = func(string) error { return nil }
+		kill, reload := at(k.kill), at(k.reload)
+		b.trip(kill, Reading{}, 0, 0, 0)
+
+		// minFB/fbAtReload: the observer's own ticks strictly between the
+		// kill and the reload tick (the interpolated seconds right after the
+		// kill still lean on the pre-kill tick).
+		openedAt, minFB, fbAtReload := time.Time{}, 1e9, 0.0
+		for i := 1; i < len(ticks); i++ {
+			a, z := ticks[i-1], ticks[i]
+			if !z.t.After(kill) || !a.t.Before(reload) {
+				continue
+			}
+			if z.t.Before(reload) {
+				minFB = min(minFB, z.file)
+				fbAtReload = z.file
+			}
+			secs := int(z.t.Sub(a.t) / time.Second)
+			for s := 1; s <= secs; s++ {
+				now := a.t.Add(time.Duration(s) * time.Second)
+				if !now.After(kill) || !now.Before(reload) {
+					continue
+				}
+				fb := a.file + (z.file-a.file)*float64(s)/float64(secs)
+				b.observe(now, Reading{FileBacked: uint64(fb * gib)})
+				if openedAt.IsZero() && !hold.Holding() {
+					openedAt = now
+				}
+			}
+		}
+		t.Logf("kill %s -> reload %s (fixed 5 min hold admitted it): observer file-backed min %.2f GB, last tick before the reload %.2f GB; drain gate (< %.0f GB) at the reload: holding=%v",
+			k.kill, k.reload, minFB, fbAtReload, cfg.DrainBelowGB, hold.Holding())
+		if !openedAt.IsZero() || !hold.Holding() {
+			t.Errorf("drain gate opened at %s, before the %s reload, with file-backed never below %.2f GB", openedAt.Format("15:04:05"), k.reload, minFB)
+		}
 	}
 }
 

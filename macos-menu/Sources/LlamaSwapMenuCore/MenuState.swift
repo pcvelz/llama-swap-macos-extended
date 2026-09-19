@@ -57,6 +57,24 @@ public struct MenuState: Encodable {
     /// event's remaining goes UP; nil until that has happened once.
     public var cooldownRestartedAt: Date? = nil
 
+    /// The memory brake's state from the session-state contract's
+    /// `memoryBrake`, copied by BackendClient.applySessionsSnapshot.
+    public var memoryBrake: MemoryBrakeInfo? = nil
+
+    /// The brake's admission-gate line, nil while the gate is open. After a
+    /// brake kill the killed model's weights linger as file cache (Event 8,
+    /// 2026-09-19: 36 GB with nothing loaded), so loads are held until it
+    /// drains; a request parked behind it shows as loading, and this line
+    /// says why it does not move.
+    public static func memoryBrakeLabel(_ mb: MemoryBrakeInfo?) -> String? {
+        guard let mb, mb.holding else { return nil }
+        guard let below = mb.drainBelowGB, let now = mb.fileBackedGB else {
+            return "Memory brake: loads held"
+        }
+        let level = below == below.rounded() ? "\(Int(below))" : String(format: "%.1f", below)
+        return "Memory brake: loads held until file-backed < \(level) GB (now \(String(format: "%.1f", now)) GB)"
+    }
+
     /// A restart is a countdown that went up: the resident finished a turn
     /// inside its own grace. A one-second wobble from tick alignment is not.
     public static func cooldownRestarted(previous: Int?, current: Int) -> Bool {

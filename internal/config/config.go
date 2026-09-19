@@ -337,15 +337,22 @@ type TierConfig struct {
 // MemoryBrakeConfig is the memory emergency brake (internal/membrake): a 1 s
 // in-process sampler that SIGKILLs every local child when FILE-BACKED memory
 // grows by GrowthGB within any rolling WindowMinutes window (measured against
-// the window's minimum), once a model has been ready ArmAfterMinutes; then it
-// holds reloads for HoldMinutes. Calibration and why the defaults are what
-// they are: internal/membrake/brake.go and llama-cm docs/intent/llama-swap-
+// the window's minimum), once a model has been ready ArmAfterMinutes (default
+// 0: armed at ready). After a kill it evicts the killed models' files from the
+// file cache and holds reloads until file-backed memory is below DrainBelowGB.
+// Calibration and why the defaults are what they are:
+// internal/membrake/brake.go and llama-cm docs/intent/llama-swap-
 // fork-customizations.md. Enabled by default: the block being absent means ON.
 //
 // Rename (2026-09-18): the superseded rule's windowSeconds is replaced by
 // windowMinutes; growthGB keeps its key but now measures file-backed growth
 // only. A yaml that still sets windowSeconds loads, the value is ignored and
 // the brake warns about it at startup (LegacyWindowSeconds).
+//
+// Rename (2026-09-19): the fixed holdMinutes hold is replaced by the
+// drainBelowGB gate (Event 8: the 5-minute hold expired with 36 GB of the
+// killed model still in the file cache). holdMinutes is accepted, ignored and
+// warned about at startup (LegacyHoldMinutes).
 type MemoryBrakeConfig struct {
 	Enabled             bool    `yaml:"enabled"`
 	SampleIntervalMs    int     `yaml:"sampleIntervalMs"`
@@ -353,9 +360,10 @@ type MemoryBrakeConfig struct {
 	GrowthGB            float64 `yaml:"growthGB"`
 	ArmAfterMinutes     int     `yaml:"armAfterMinutes"`
 	ConfirmSamples      int     `yaml:"confirmSamples"`
-	HoldMinutes         int     `yaml:"holdMinutes"`
+	DrainBelowGB        float64 `yaml:"drainBelowGB"`
 	MarkerPath          string  `yaml:"markerPath"`
 	LegacyWindowSeconds int     `yaml:"windowSeconds"` // ignored; warned about at startup
+	LegacyHoldMinutes   int     `yaml:"holdMinutes"`   // ignored; warned about at startup
 }
 
 // DebugHistoryConfig: a bounded ring of box-state samples (memory, resident
@@ -383,9 +391,9 @@ func DefaultMemoryBrakeConfig() MemoryBrakeConfig {
 		SampleIntervalMs: 1000,
 		WindowMinutes:    5,
 		GrowthGB:         3.5,
-		ArmAfterMinutes:  10,
+		ArmAfterMinutes:  0,
 		ConfirmSamples:   2,
-		HoldMinutes:      5,
+		DrainBelowGB:     10,
 		MarkerPath:       "~/Library/Logs/llama-cm/LLAMA-SWAP-MEMORY-BRAKE",
 	}
 }

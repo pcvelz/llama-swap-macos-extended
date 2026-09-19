@@ -13,3 +13,13 @@ func killGroup(pgid int) error {
 	}
 	return syscall.Kill(-pgid, syscall.SIGKILL)
 }
+
+// groupAlive reports whether any process of the group still exists (a zombie
+// not yet reaped by llama-swap counts as alive: its mappings may still be
+// torn down).
+func groupAlive(pgid int) bool {
+	if pgid <= 1 {
+		return false
+	}
+	return syscall.Kill(-pgid, 0) != syscall.ESRCH
+}
