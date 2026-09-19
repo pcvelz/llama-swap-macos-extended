@@ -28,6 +28,44 @@ import (
 // client connects, reads the first bytes, then stops calling Read while keeping
 // the connection open. With a small receive buffer the window closes within a
 // few kilobytes and the server's writes start blocking.
+//
+// Both socket buffers are pinned on every OS, before the server writes a
+// byte: the client's receive buffer before connect (the window scale is
+// negotiated in the handshake), the server's send buffer as each connection
+// is accepted. Left to auto-tuning, Windows grows the receive window of a
+// socket shrunk only after connect, and macOS wakes a writer blocked on a
+// ~0.5 MB send buffer in batches that can take seconds even against a live
+// reader - either way the kernel, not the guard, decides the outcome.
+const stallSndBuf = 8192
+
+// sndBufListener pins the send buffer of every accepted connection.
+type sndBufListener struct{ net.Listener }
+
+func (l sndBufListener) Accept() (net.Conn, error) {
+	c, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	if tcp, ok := c.(*net.TCPConn); ok {
+		if err := tcp.SetWriteBuffer(stallSndBuf); err != nil {
+			c.Close()
+			return nil, err
+		}
+	}
+	return c, nil
+}
+
+// sockBufControl is a net.Dialer Control hook that sets one socket buffer
+// option before the socket connects.
+func sockBufControl(opt, size int) func(string, string, syscall.RawConn) error {
+	return func(_, _ string, c syscall.RawConn) error {
+		var serr error
+		if err := c.Control(func(fd uintptr) { serr = setSockBufFD(fd, opt, size) }); err != nil {
+			return err
+		}
+		return serr
+	}
+}
 
 // stallTestServer wires a pingWriter + peerStallGuard over a real
 // httptest.Server and reports whether the request context was cancelled.
@@ -67,7 +105,7 @@ func newStallTestServer(t *testing.T, budget time.Duration, chunk []byte) *stall
 		served:    make(chan struct{}),
 	}
 
-	st.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	st.srv = httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer close(st.served)
 
 		ctx, cancel := context.WithCancel(r.Context())
@@ -110,6 +148,8 @@ func newStallTestServer(t *testing.T, budget time.Duration, chunk []byte) *stall
 			}
 		}
 	}))
+	st.srv.Listener = sndBufListener{st.srv.Listener}
+	st.srv.Start()
 	t.Cleanup(st.srv.Close)
 	return st
 }
@@ -123,17 +163,8 @@ func dialAndReadOnce(t *testing.T, srv *httptest.Server, rcvBuf int) net.Conn {
 
 	// A small receive buffer closes the window after a few KB instead of after
 	// the default hundreds of KB, so the stall shows up in test time rather
-	// than in minutes of streaming. It is set BEFORE connect: the window scale
-	// is negotiated in the handshake, and Windows keeps receive-window
-	// auto-tuning on for a socket whose buffer was only shrunk afterwards, so
-	// the frozen peer's window never closed there.
-	dialer := net.Dialer{Control: func(_, _ string, c syscall.RawConn) error {
-		var serr error
-		if err := c.Control(func(fd uintptr) { serr = setRcvBufFD(fd, rcvBuf) }); err != nil {
-			return err
-		}
-		return serr
-	}}
+	// than in minutes of streaming. Set before connect; see stallSndBuf.
+	dialer := net.Dialer{Control: sockBufControl(syscall.SO_RCVBUF, rcvBuf)}
 	addr := strings.TrimPrefix(srv.URL, "http://")
 	conn, err := dialer.Dial("tcp", addr)
 	if err != nil {
@@ -195,13 +226,20 @@ func TestPeerStall_SlowButAliveReaderNotReaped(t *testing.T) {
 	// Drain a little, slowly, for many multiples of the budget. Each read
 	// reopens the window, so no single server write ever blocks for a whole
 	// budget even though the client is far slower than the server.
+	//
+	// "Slow" is relative to the budget: a paced writer waits roughly
+	// (kernel backlog) / (reader rate), and the window reopens in MSS-sized
+	// steps (16-64 KB on loopback). At this test's 500 ms budget a reader of a
+	// few KB/s is indistinguishable from a frozen one on macOS; ~800 KB/s keeps
+	// every flush under ~30 ms there while staying orders of magnitude slower
+	// than the unpaced server. Production budgets are minutes.
 	stopDraining := make(chan struct{})
 	var drainErr atomic.Pointer[error]
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		buf := make([]byte, 128)
+		buf := make([]byte, 4096)
 		for {
 			select {
 			case <-stopDraining:
@@ -213,13 +251,13 @@ func TestPeerStall_SlowButAliveReaderNotReaped(t *testing.T) {
 				drainErr.Store(&err)
 				return
 			}
-			time.Sleep(20 * time.Millisecond)
+			time.Sleep(5 * time.Millisecond)
 		}
 	}()
 
 	select {
 	case <-st.cancelled:
-		t.Fatal("a slow but alive reader was reaped; the guard has become a request timeout")
+		t.Fatalf("a slow but alive reader was reaped; the guard has become a request timeout (%s)", st.describe())
 	case <-time.After(10 * budget):
 	}
 
@@ -288,6 +326,63 @@ func TestPeerStallGuard_FailsOpenWithoutDeadlineSupport(t *testing.T) {
 	}
 	if guard.stalled() || cancelled {
 		t.Fatal("guard reclaimed on a chain with no deadline support; it must fail open")
+	}
+}
+
+// frozenFlushWriter is a fake ResponseWriter whose Flush blocks the way a
+// flush to a frozen peer does: until the write deadline passes, or, with no
+// deadline armed, until release closes.
+type frozenFlushWriter struct {
+	hdr      http.Header
+	release  chan struct{}
+	mu       sync.Mutex
+	deadline time.Time
+}
+
+func (f *frozenFlushWriter) Header() http.Header         { return f.hdr }
+func (f *frozenFlushWriter) WriteHeader(int)             {}
+func (f *frozenFlushWriter) Write(p []byte) (int, error) { return len(p), nil }
+func (f *frozenFlushWriter) SetWriteDeadline(t time.Time) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.deadline = t
+	return nil
+}
+func (f *frozenFlushWriter) Flush() {
+	f.mu.Lock()
+	d := f.deadline
+	f.mu.Unlock()
+	if d.IsZero() {
+		<-f.release
+		return
+	}
+	select {
+	case <-time.After(time.Until(d)):
+	case <-f.release:
+	}
+}
+
+// TestPeerStall_FlushIsGuarded pins that the flush, not only the write, runs
+// under the stall budget. A frozen peer can block in the flush alone (the
+// write just fills the server's buffer), and an unguarded flush never
+// reclaims: Windows CI hung in exactly that call.
+func TestPeerStall_FlushIsGuarded(t *testing.T) {
+	logger := logmon.NewWriter(io.Discard)
+	guard := newPeerStallGuard(logger, "m", 100*time.Millisecond, 0)
+	var cancels atomic.Int32
+	guard.setCancel(func() { cancels.Add(1) })
+
+	w := &frozenFlushWriter{hdr: make(http.Header), release: make(chan struct{})}
+	pw := newPingWriter(logger, "m", w, false, guard)
+	defer func() { pw.stop(); pw.waitLoop() }()
+	timer := time.AfterFunc(5*time.Second, func() { close(w.release) })
+	defer timer.Stop()
+
+	pw.Flush()
+
+	if !guard.stalled() || cancels.Load() != 1 {
+		t.Fatalf("flush to a frozen peer was not reclaimed (stalled=%v, cancels=%d)",
+			guard.stalled(), cancels.Load())
 	}
 }
 

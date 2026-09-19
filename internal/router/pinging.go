@@ -470,10 +470,19 @@ func (pw *pingWriter) WriteHeader(code int) {
 
 func (pw *pingWriter) Header() http.Header { return pw.writer.Header() }
 
+// Flush drains buffered body bytes to the client under the stall guard. A
+// frozen peer can block here rather than in Write: the write only fills the
+// server's buffer and the flush is what meets the closed window (Windows CI
+// showed exactly this), and an unguarded flush would hold the slot forever.
 func (pw *pingWriter) Flush() {
-	if f, ok := pw.writer.(http.Flusher); ok {
-		f.Flush()
+	f, ok := pw.writer.(http.Flusher)
+	if !ok {
+		return
 	}
+	_, _ = pw.stall.write(pw.writer, func() (int, error) {
+		f.Flush()
+		return 0, nil
+	})
 }
 
 // stop fences the ping goroutine off from the ResponseWriter. Must run before
