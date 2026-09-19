@@ -14,7 +14,10 @@ import XCTest
 ///   - the waiting counter comes from body.queue, and is naturally in parity
 ///     with the PARKED rows because both come from the same decode
 ///     (testWaitingCounterParityFromTheSameSnapshot).
-///   - priority renders compactly, 0 omitted (testPriorityRendering).
+///   - the tier renders by NAME (priority / background), default omitted
+///     (testTierRendering); PARKED rows keep the server's queue order and
+///     no separate queue-order line exists (testParkedRowsKeepServerOrder,
+///     testMenuHasNoQueueSummaryLine).
 ///   - the empty box decodes to zero rows and zero waiting
 ///     (testEmptyBoxDecodesToNoRowsAndNoWaiting).
 ///   - unknown fields, an unknown phase and an unknown parkReason never
@@ -66,7 +69,7 @@ final class SessionStateContractTests: XCTestCase {
 
         let parked = try XCTUnwrap(rows.first { $0.phase == "PARKED" })
         XCTAssertEqual(parked.parkReason, "kv")
-        XCTAssertEqual(parked.displayLine, "[a1b2c3d4] cq27 · PARKED (kv pool) · 0/262.1k · P10")
+        XCTAssertEqual(parked.displayLine, "[a1b2c3d4] cq27 · PARKED (kv pool) · 0/262.1k · priority")
 
         let decode = try XCTUnwrap(rows.first { $0.phase == "DECODE" })
         XCTAssertEqual(decode.displayLine, "[69699f8b] cq27 · DECODE · 102.6k/262.1k · decode 7.1 t/s")
@@ -92,39 +95,141 @@ final class SessionStateContractTests: XCTestCase {
         XCTAssertEqual(snapshot.queue.waiting, parkedCount)
     }
 
-    // MARK: - priority rendering
+    // MARK: - tier rendering
 
-    func testPriorityRendering() throws {
-        let snapshot = try decode("decode-parked-hot")
-        let rows = snapshot.sessions.map(SessionRow.init(contract:))
-
-        let priorityTen = try XCTUnwrap(rows.first { $0.phase == "PARKED" })
-        XCTAssertEqual(priorityTen.priority, 10)
-        XCTAssertTrue(priorityTen.displayLine.hasSuffix("P10"), "P10 must render, got '\(priorityTen.displayLine)'")
-
-        // Default-tier priority 0 is the common case; printing "P0" on every
-        // row would be constant noise for zero information, so it is
-        // omitted rather than shown.
-        let defaultTier = try XCTUnwrap(rows.first { $0.phase == "DECODE" })
-        XCTAssertEqual(defaultTier.priority, 0)
-        XCTAssertFalse(defaultTier.displayLine.contains("P0"),
-                       "priority 0 (the default tier) must not print a P0 segment")
-
-        // A background-tier session (negative priority) renders "P-10", not
-        // dropped and not "P10" - constructed inline (not a fixture edit)
-        // since neither canonical fixture carries a negative priority.
-        let backgroundJSON = """
-        {"sessionId":"ee000000-0000-0000-0000-000000000000","sessionShort":"ee000000",
-         "requestId":null,"model":"cq27","alias":"cq27","tier":"background","priority":-10,
-         "phase":"IDLE","parkReason":null,"slot":null,
+    private func row(tier: String, priority: Int, alias: String = "cq27", short: String = "ee000000",
+                     phase: String = "PARKED") throws -> SessionRow {
+        let json = """
+        {"sessionId":"\(short)-0000-0000-0000-000000000000","sessionShort":"\(short)",
+         "requestId":null,"model":"\(alias)","alias":"\(alias)","tier":"\(tier)","priority":\(priority),
+         "phase":"\(phase)","parkReason":null,"slot":null,
          "context":{"used":100,"cached":100,"processed":0,"decoded":0,"promptTotal":100,"window":262144},
          "progress":null,"rate":{"kind":null,"tokensPerSecond":null,"windowSeconds":30.0},
          "elapsedMs":0,"phaseSinceMs":0,"respTokens":0}
         """.data(using: .utf8)!
-        let background = try JSONDecoder().decode(ContractSession.self, from: backgroundJSON)
-        let backgroundRow = SessionRow(contract: background)
-        XCTAssertTrue(backgroundRow.displayLine.hasSuffix("P-10"),
-                      "a background (negative) priority must render as P-10, got '\(backgroundRow.displayLine)'")
+        return SessionRow(contract: try JSONDecoder().decode(ContractSession.self, from: json))
+    }
+
+    func testTierRendering() throws {
+        let snapshot = try decode("decode-parked-hot")
+        let rows = snapshot.sessions.map(SessionRow.init(contract:))
+
+        // There are exactly three tiers; a raw rank like "P10" reads as if
+        // there were more layers, so the tier NAME renders instead.
+        let priorityTier = try XCTUnwrap(rows.first { $0.phase == "PARKED" })
+        XCTAssertEqual(priorityTier.tier, "priority")
+        XCTAssertTrue(priorityTier.displayLine.hasSuffix(" · priority"),
+                      "tier name must render, got '\(priorityTier.displayLine)'")
+        XCTAssertNil(priorityTier.displayLine.range(of: #"\bP-?\d+\b"#, options: .regularExpression),
+                     "no P<rank> token may render, got '\(priorityTier.displayLine)'")
+
+        // The default tier is the common case: nothing rendered for it.
+        let defaultTier = try XCTUnwrap(rows.first { $0.phase == "DECODE" })
+        XCTAssertFalse(defaultTier.displayLine.contains("default"))
+        XCTAssertFalse(defaultTier.displayLine.contains("P0"))
+
+        let background = try row(tier: "background", priority: -10, phase: "IDLE")
+        XCTAssertTrue(background.displayLine.hasSuffix(" · background"),
+                      "got '\(background.displayLine)'")
+        XCTAssertNil(background.displayLine.range(of: #"\bP-?\d+\b"#, options: .regularExpression),
+                     "no P-10 token may render, got '\(background.displayLine)'")
+    }
+
+    /// The tier field decides, not the number: a default-tier row with an
+    /// unexpected nonzero rank prints no rank, and an unknown tier name
+    /// renders verbatim (invariant 5).
+    func testTierNameIsDerivedFromTierNotPriority() throws {
+        let oddRank = try row(tier: "default", priority: 10)
+        XCTAssertFalse(oddRank.displayLine.contains("P10"))
+        XCTAssertFalse(oddRank.displayLine.contains("priority"),
+                       "default tier must not render as priority just because rank is 10")
+        let unknown = try row(tier: "batch", priority: -5)
+        XCTAssertTrue(unknown.displayLine.hasSuffix(" · batch"), "got '\(unknown.displayLine)'")
+    }
+
+    // MARK: - queue order is the row order
+
+    /// The separate "1. a, 2. b" queue line is gone: the PARKED rows are the
+    /// queue, shown in the server's order (first in line on top) - the menu
+    /// must not re-sort them.
+    func testParkedRowsKeepServerOrder() throws {
+        let first = try row(tier: "priority", priority: 10, alias: "cq35", short: "aaaaaaaa")
+        let second = try row(tier: "background", priority: -10, alias: "cq27", short: "bbbbbbbb")
+        let third = try row(tier: "background", priority: -10, alias: "cq35", short: "cccccccc")
+
+        var state = MenuState()
+        state.sessionRows = [first, second, third]
+        XCTAssertEqual(state.sessionRows.map(\.sessionShort), ["aaaaaaaa", "bbbbbbbb", "cccccccc"])
+
+        // Through the real decode path the order is the wire order too.
+        let snapshot = try decode("decode-parked-hot")
+        let wire = snapshot.sessions.map(\.sessionShort)
+        XCTAssertEqual(snapshot.sessions.map(SessionRow.init(contract:)).map(\.sessionShort), wire)
+    }
+
+    /// The parked list as shown IS the pick order: the server's sessions[]
+    /// order (tier rank descending, then the order the scheduler will grant),
+    /// so the top row is the next request a slot takes. Background rows here
+    /// arrived FIRST (largest elapsedMs) and are listed LAST by the server; a
+    /// menu that re-sorted by age, alias, id or tier name would reorder them.
+    func testParkedRowsRenderInServerPickOrder() throws {
+        func session(_ short: String, _ alias: String, _ tier: String, _ priority: Int, _ elapsedMs: Int) -> String {
+            """
+            {"sessionId":"\(short)-0000-0000-0000-000000000000","sessionShort":"\(short)",
+             "requestId":null,"model":"\(alias)","alias":"\(alias)","tier":"\(tier)","priority":\(priority),
+             "phase":"PARKED","parkReason":"cap","slot":null,
+             "context":{"used":0,"cached":0,"processed":0,"decoded":0,"promptTotal":0,"window":262144},
+             "progress":null,"rate":{"kind":null,"tokensPerSecond":null,"windowSeconds":30.0},
+             "elapsedMs":\(elapsedMs),"phaseSinceMs":0,"respTokens":0}
+            """
+        }
+        // Server order: priority, default, default, background, background.
+        // Names sort the opposite way alphabetically (z.. first) and the
+        // background rows are the oldest, so any client-side sort shows.
+        let body = """
+        {"schema":"llama-swap.sessions/v1","generatedAt":"2026-09-19T00:00:00Z",
+         "resident":null,"queue":{"waiting":5,"byTier":{"priority":1,"default":2,"background":2}},
+         "cooldown":null,
+         "sessions":[
+           \(session("zzzzzzzz", "cq35", "priority", 10, 1_000)),
+           \(session("yyyyyyyy", "cq27", "default", 0, 9_000)),
+           \(session("xxxxxxxx", "cq35", "default", 0, 4_000)),
+           \(session("bbbbbbbb", "cq27", "background", -10, 90_000)),
+           \(session("aaaaaaaa", "cq35", "background", -10, 80_000))
+         ]}
+        """.data(using: .utf8)!
+        let snapshot = try JSONDecoder().decode(SessionsSnapshot.self, from: body)
+        let serverOrder = snapshot.sessions.map(\.sessionShort)
+
+        var state = MenuState()
+        state.sessionRows = snapshot.sessions.map(SessionRow.init(contract:))
+        // What MenuView's ForEach walks, top to bottom.
+        let shown = state.sessionRows.filter { $0.phase == "PARKED" }
+
+        XCTAssertEqual(shown.map(\.sessionShort), serverOrder, "menu must render sessions[] order as-is")
+        XCTAssertEqual(shown.map(\.tier),
+                       ["priority", "default", "default", "background", "background"],
+                       "higher tiers on top, background last")
+        XCTAssertEqual(shown.first?.sessionShort, "zzzzzzzz", "top row is the next request a slot takes")
+        XCTAssertEqual(shown.map(\.displayLine), [
+            "[zzzzzzzz] cq35 · PARKED (slots full) · 0/262.1k · priority",
+            "[yyyyyyyy] cq27 · PARKED (slots full) · 0/262.1k",
+            "[xxxxxxxx] cq35 · PARKED (slots full) · 0/262.1k",
+            "[bbbbbbbb] cq27 · PARKED (slots full) · 0/262.1k · background",
+            "[aaaaaaaa] cq35 · PARKED (slots full) · 0/262.1k · background",
+        ])
+    }
+
+    /// MenuView is SwiftUI and cannot be rendered in a unit test, so this is
+    /// a source guard: the view must not build a queue-order summary line.
+    func testMenuHasNoQueueSummaryLine() throws {
+        let dir = URL(fileURLWithPath: String(#filePath))
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        let view = try String(contentsOf: dir.appendingPathComponent("Sources/LlamaSwapMenuCore/MenuView.swift"))
+        let state = try String(contentsOf: dir.appendingPathComponent("Sources/LlamaSwapMenuCore/MenuState.swift"))
+        XCTAssertFalse(view.contains("queueSummary"), "MenuView must not render a queue-order line")
+        XCTAssertFalse(state.contains("queueSummary"), "queueSummary must be removed")
+        XCTAssertFalse(view.contains("Queue: idle"), "no dangling idle line")
     }
 
     // MARK: - empty box
@@ -137,7 +242,6 @@ final class SessionStateContractTests: XCTestCase {
 
         let rows = snapshot.sessions.map(SessionRow.init(contract:))
         XCTAssertTrue(rows.isEmpty)
-        XCTAssertEqual(MenuState.queueSummary(rows), "Queue: idle")
     }
 
     // MARK: - invariant 5: unknown fields, unknown phase/parkReason

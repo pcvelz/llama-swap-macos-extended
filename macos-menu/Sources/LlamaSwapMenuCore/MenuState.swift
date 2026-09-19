@@ -14,7 +14,7 @@ public struct MenuState: Encodable {
     /// (BackendClient.applyWaitingParity), counting PARKED rows only. There
     /// is deliberately no independent smoothing/anti-flap hold here anymore
     /// (the old 600s peak-hold let "N waiting" show a stale peak with
-    /// "Queue: idle" and no PARKED rows in sight) - if a hold is ever wanted
+    /// no PARKED rows in sight) - if a hold is ever wanted
     /// again it must apply to waiting and waitingByTier from the exact same
     /// state so the two can never disagree.
     public var waitingByTier: [String: Int] = [:]
@@ -35,7 +35,11 @@ public struct MenuState: Encodable {
     /// (llama-cm docs/intent/session-state-contract.md), pushed by the
     /// "sessions" SSE event and decoded straight into `SessionRow` - see
     /// SessionStateContract.swift. Sorted by the server (priority descending,
-    /// then elapsedMs descending); this menu renders that order as given.
+    /// then elapsedMs descending); this menu renders that order as given,
+    /// never re-sorting it. The PARKED rows ARE the wait list: top to bottom is
+    /// the pick order (tier rank descending - priority, default, background -
+    /// then the order the scheduler will grant), so the top row is the next
+    /// request a slot takes. There is deliberately no separate queue-order line.
     public var sessionRows: [SessionRow] = []
 
     /// The current swap-grace cooldown (llama-cm llama-swap.yaml
@@ -96,21 +100,6 @@ public struct MenuState: Encodable {
     /// characters, the same short form the session rows use.
     public static func hotSlotLabel(_ s: HotSlotRow) -> String {
         "  slot \(s.slot) · [\(String(s.sessionId.prefix(8)))] · hot, idle \(CompactFormatter.countdown(s.idleSeconds))"
-    }
-
-    /// The "Queue: idle" line the design calls for when nothing is parked,
-    /// else one summary per queued entry - built straight from the contract's
-    /// own `sessions[]` (PARKED rows), the single source `sessionRows`
-    /// already comes from. There is no second "scheduler queue" list to keep
-    /// in sync with it: llama-swap's PARKED entries ARE the wait list, in the
-    /// order it already sorted them (priority descending, then elapsedMs
-    /// descending - session-state-contract.md § "sessions").
-    public static func queueSummary(_ rows: [SessionRow]) -> String {
-        let parked = rows.filter { $0.phase == "PARKED" }
-        guard !parked.isEmpty else { return "Queue: idle" }
-        return parked.enumerated()
-            .map { i, row in "\(i + 1). \(row.tier)/\(row.alias.isEmpty ? row.model : row.alias)" }
-            .joined(separator: ", ")
     }
 
     /// Derived, never stored: storing it meant recomputing at three call sites
@@ -285,23 +274,26 @@ public struct SessionRow: Identifiable, Encodable, Equatable {
         return "\(kind) \(String(format: "%.1f", tokensPerSecond)) t/s"
     }
 
-    /// "P10" / "P-10". The default tier's priority is 0 for almost every
-    /// row today, so printing "P0" on every line would be constant noise for
-    /// zero information; a nonzero priority (a priority-tier jump, a
-    /// background demotion) is exactly the exception a user needs to see, so
-    /// it is the only case this renders.
-    private var priorityText: String? {
-        priority == 0 ? nil : "P\(priority)"
+    /// The tier NAME ("priority" / "background"), nothing for the default
+    /// tier. There are exactly three tiers (llama-cm docs/intent/llama-swap-
+    /// tiers.md), and a raw rank like "P10" read as if there were more
+    /// layers, so the name is shown instead. Derived from `tier`, not from
+    /// `priority`: the rank is reserved for a future per-session override and
+    /// says nothing about which tier a row is in. The default tier is the
+    /// common case, so it is the one that renders nothing; an unknown tier
+    /// name renders verbatim (invariant 5).
+    private var tierText: String? {
+        tier.isEmpty || tier == "default" ? nil : tier
     }
 
     /// The row as the menu shows it, purely from contract fields, in the
     /// order the contract documents them:
     ///
     ///   `[<sessionShort>] <alias> · <PHASE[ (reason)]> · <used>/<window> ·
-    ///   [<progress>%] · [<rate kind> <N.n> t/s] · [P<priority>]`
+    ///   [<progress>%] · [<rate kind> <N.n> t/s] · [<tier>]`
     ///
     /// A segment the body did not supply (no progress, no rate yet, default
-    /// priority) is dropped rather than shown empty.
+    /// tier) is dropped rather than shown empty.
     public var displayLine: String {
         var segments: [String] = []
         let bracket = sessionShort.isEmpty ? "-" : sessionShort
@@ -314,7 +306,7 @@ public struct SessionRow: Identifiable, Encodable, Equatable {
         segments.append("\(CompactFormatter.tokens(context.used))/\(CompactFormatter.tokens(context.window))")
         if let progressText { segments.append(progressText) }
         if let rateText { segments.append(rateText) }
-        if let priorityText { segments.append(priorityText) }
+        if let tierText { segments.append(tierText) }
         return segments.joined(separator: " · ")
     }
 }

@@ -42,7 +42,10 @@ public struct MenuView: View {
 
         Text(state.waitingSummary)
 
-        // One row per in-flight request, in the grammar llama-cm's
+        // One row per in-flight request, in the server's order as given: the
+        // PARKED rows ARE the queue, top row = next request a slot takes, so
+        // there is no separate queue-order line (and no re-sorting here).
+        // Rows are in the grammar llama-cm's
         // session-identity contract fixes for both renderers - the row text
         // itself lives on SessionRow.displayLine, so cm-menu and this menu
         // can never disagree about how a request is described.
@@ -54,12 +57,6 @@ public struct MenuView: View {
                 client.cancelInflight(id: row.id)
             }
         }
-
-        // The scheduler's own wait list - "Queue: idle" when nothing is
-        // parked, one summary line otherwise (never inferred per-row; see
-        // SessionThroughput.swift's header on why PARKED isn't a per-request
-        // word here).
-        Text(MenuState.queueSummary(state.sessionRows))
 
         Text("Load")
             .foregroundStyle(.secondary)
