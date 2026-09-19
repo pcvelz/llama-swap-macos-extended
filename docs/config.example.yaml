@@ -63,6 +63,20 @@ metricsMaxInMemory: 1000
 # - set to 0 to disable
 captureBuffer: 15
 
+# debugHistory: rolling in-memory record served by GET /api/debug/history
+# - optional, default: off
+# - samples memory, the resident model, the queue, the memory brake and every
+#   session's phase and counters; records request completions (non-GET or
+#   failed), session phase transitions and memory-brake trips
+# - intervalMs: sample interval, default 1000; values below 1000 are raised
+#   to 1000 because samples ride the 1 Hz session-state loop
+# - retainMinutes: how long samples and events are kept, default 15
+# - query with ?minutes=N and ?session=<id or prefix>; 404 when disabled
+debugHistory:
+  enabled: false
+  intervalMs: 1000
+  retainMinutes: 15
+
 # ui.activity.session_id: ordered request headers used to identify sessions in
 # the Activity page's in-flight request table.
 # - optional, default: ["X-Session-ID", "X-Litellm-Session-Id"]

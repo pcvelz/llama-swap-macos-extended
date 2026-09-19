@@ -311,6 +311,9 @@ func CreateRequestLogMiddleware(proxylog *logmon.Monitor) chain.Middleware {
 
 			proxylog.Infof("Request %s \"%s %s %s\" %d %d \"%s\" %v tier=%s%s%s",
 				ip, method, path, proto, rec.status, rec.size, ua, time.Since(start), tier, cut, purpose)
+			if h := activeDebugHistory.Load(); h != nil {
+				h.requestDone(time.Now(), method, path, rec.status, int64(rec.size), time.Since(start), tier, rec.termination)
+			}
 		})
 	}
 }

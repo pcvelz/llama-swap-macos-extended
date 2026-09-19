@@ -368,6 +368,16 @@
                 }
             }
         },
+        "debugHistory": {
+            "type": "object",
+            "additionalProperties": false,
+            "description": "Rolling in-memory record of box state and events served by GET /api/debug/history. Off by default.",
+            "properties": {
+                "enabled": {"type": "boolean", "default": false},
+                "intervalMs": {"type": "integer", "minimum": 1, "default": 1000, "description": "Sample interval; values below 1000 are raised to 1000 (samples ride the 1 Hz session loop)."},
+                "retainMinutes": {"type": "integer", "minimum": 1, "default": 15}
+            }
+        },
         "memoryBrake": {
             "type": "object",
             "additionalProperties": false,

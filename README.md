@@ -47,6 +47,23 @@ Swap, free, pressure and wired are not part of the condition. The marker line re
 
 The defaults are calibrated on real pre-panic telemetry (`internal/membrake/replay_test.go`). The block is read at startup only: after changing it, restart llama-swap.
 
+## Session state (`GET /api/sessions`)
+
+One computed view of every session on the box: resident model, parked count per tier, the cooldown, the memory brake, and per session its phase (`PARKED`, `LOADING`, `PREFILL`, `DECODE`, `HOT`, `IDLE`), slot, context (`cached + processed + decoded`), prefill progress against the whole prompt, a server-side token rate and a numeric priority (the tier's `rank`). llama-swap polls each ready child's `/slots` once per second on behalf of every client; the same body is pushed on `/api/events` as a `sessions` event. Clients render it and do no math of their own. Schema `llama-swap.sessions/v1`.
+
+## Debug history (`GET /api/debug/history`)
+
+A rolling in-memory record for answering "what happened in the last few minutes" in one request: one sample per `intervalMs` (memory, resident model, parked count, brake hold, every session's phase and counters) and events (request completions with status, duration and `cut=`, session phase transitions, brake trips). Off by default:
+
+```yaml
+debugHistory:
+  enabled: true
+  intervalMs: 1000      # floor 1000: samples ride the 1 Hz session loop
+  retainMinutes: 30
+```
+
+Query with `?minutes=N` (default: everything retained) and `?session=<id or prefix>`. Returns 404 with a hint when disabled.
+
 ## Tiered entry points
 
 By default every request lands on the same `-listen` port and is served

@@ -708,7 +708,15 @@ func (h *sessionsHub) pollSlots(running map[string]process.ProcessState) map[str
 			defer wg.Done()
 			slots, err := fetchChildSlots(url)
 			if err != nil {
-				return
+				// A busy child answers /slots only between batches, so a
+				// long prefill ubatch outlasts the timeout. Keep the last
+				// good reading: an empty one would show the session as
+				// cached=0 used=0 and spike the rate on the next hit.
+				prev, ok := h.lastPoll[id]
+				if !ok {
+					return
+				}
+				slots = prev
 			}
 			mu.Lock()
 			out[id] = slots
@@ -776,6 +784,9 @@ func (h *sessionsHub) tick(now time.Time, poll bool) {
 		MemoryBrake: membrake.CurrentStatus(),
 	})
 	h.cur.Store(&body)
+	if s.debugHistory != nil {
+		s.debugHistory.record(now, body)
+	}
 	h.throttle.offer(now, body, func(b sessionsBody) { event.Emit(SessionsEvent{Body: b}) })
 }
 

@@ -167,7 +167,8 @@ func TestDocs_RealConfigExample_SectionKeys(t *testing.T) {
 	// list deliberately when the reference file gains or loses a section.
 	want := []string{
 		"healthCheckTimeout", "logLevel", "logTimeFormat", "logToStdout",
-		"metricsMaxInMemory", "captureBuffer", "ui", "performance", "menu_bar",
+		"metricsMaxInMemory", "captureBuffer", "debugHistory", "ui",
+		"performance", "menu_bar",
 		"startPort", "sendLoadingState", "includeAliasesInList", "globalTTL",
 		"unloadTimeout", "swapGraceSeconds", "swapStarvationSeconds", "peerStall",
 		"slotStall", "globalConcurrencyLimit", "macros", "apiKeys", "tailcat", "upstream",

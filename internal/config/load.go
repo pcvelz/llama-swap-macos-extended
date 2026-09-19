@@ -73,7 +73,8 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 		// The memory brake is on by default (absent block = ON); fields the
 		// yaml omits keep these defaults because Decode only overwrites keys
 		// that are present.
-		MemoryBrake: DefaultMemoryBrakeConfig(),
+		MemoryBrake:  DefaultMemoryBrakeConfig(),
+		DebugHistory: DefaultDebugHistoryConfig(),
 	}
 	if err = node.Decode(&config); err != nil {
 		return Config{}, err
@@ -119,6 +120,13 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 	if mb := config.MemoryBrake; mb.SampleIntervalMs <= 0 || mb.WindowMinutes <= 0 ||
 		mb.GrowthGB <= 0 || mb.ArmAfterMinutes < 0 || mb.ConfirmSamples < 1 || mb.HoldMinutes < 0 {
 		return Config{}, fmt.Errorf("memoryBrake: sampleIntervalMs, windowMinutes, growthGB must be > 0, armAfterMinutes >= 0, confirmSamples >= 1, holdMinutes >= 0 (windowSeconds is obsolete and ignored)")
+	}
+
+	if dh := config.DebugHistory; dh.Enabled && (dh.IntervalMs <= 0 || dh.RetainMinutes <= 0) {
+		return Config{}, fmt.Errorf("debugHistory: intervalMs and retainMinutes must be > 0 when enabled")
+	}
+	if config.DebugHistory.IntervalMs < 1000 {
+		config.DebugHistory.IntervalMs = 1000
 	}
 
 	if config.UnloadTimeout < 0 {

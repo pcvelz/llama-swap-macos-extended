@@ -18,6 +18,7 @@ import (
 	"github.com/mostlygeek/llama-swap/internal/hw"
 	"github.com/mostlygeek/llama-swap/internal/logmon"
 	"github.com/mostlygeek/llama-swap/internal/mcptools"
+	"github.com/mostlygeek/llama-swap/internal/membrake"
 	"github.com/mostlygeek/llama-swap/internal/perf"
 	"github.com/mostlygeek/llama-swap/internal/process"
 	"github.com/mostlygeek/llama-swap/internal/router"
@@ -46,6 +47,9 @@ type Server struct {
 	// pushed as the "sessions" SSE event (sessions.go); nil in tests that do
 	// not wire it.
 	sessions *sessionsHub
+	// debugHistory is the rolling record behind /api/debug/history
+	// (debughistory.go); nil when debugHistory.enabled is false.
+	debugHistory *debugHistory
 	// trace is the box's state machine as a log (state_trace.go); nil in
 	// tests that do not wire it.
 	trace    *stateTrace
@@ -266,6 +270,14 @@ func New(cfg config.Config, muxlog *logmon.Monitor, proxylog *logmon.Monitor, up
 	s.metrics.affinity = s.slotAffinity
 	s.wireStateTrace()
 	s.sessions = newSessionsHub(s)
+	if cfg.DebugHistory.Enabled {
+		// No sampler (non-darwin, no cgo) only drops the mem block.
+		sampler, _ := membrake.NewNativeSampler()
+		s.debugHistory = newDebugHistory(cfg.DebugHistory, sampler)
+	}
+	// Stored unconditionally: a Server rebuilt with the history off must not
+	// leave the access-log middleware feeding the previous one.
+	activeDebugHistory.Store(s.debugHistory)
 	s.routes()
 	go s.sessions.run(s.shutdownCtx)
 	s.startPreload()
@@ -593,6 +605,7 @@ func (s *Server) routes() {
 	mux.Handle("POST /api/swap-grace/finish", apiChain.ThenFunc(s.handleAPISwapGraceFinish))
 	mux.Handle("GET /api/slots", apiChain.ThenFunc(s.handleAPISlots))
 	mux.Handle("GET /api/sessions", apiChain.ThenFunc(s.handleAPISessions))
+	mux.Handle("GET /api/debug/history", apiChain.ThenFunc(s.handleAPIDebugHistory))
 	mux.Handle("GET /api/state-trace", apiChain.ThenFunc(s.handleAPIStateTrace))
 
 	// Stateless MCP server exposing llama-swap's own documentation as tools,

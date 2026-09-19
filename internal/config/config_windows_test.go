@@ -288,6 +288,8 @@ groups:
 		},
 		// Seeded when the memoryBrake block is absent: the brake defaults ON.
 		MemoryBrake: DefaultMemoryBrakeConfig(),
+		// Seeded when the debugHistory block is absent: off.
+		DebugHistory: DefaultDebugHistoryConfig(),
 		// Seeded by LoadConfigFromReader when the peerStall block is absent;
 		// see Config.PeerStall.
 		PeerStall: PeerStallConfig{

@@ -194,6 +194,10 @@ type Config struct {
 	// MemoryBrake is the memory emergency brake; see MemoryBrakeConfig.
 	MemoryBrake MemoryBrakeConfig `yaml:"memoryBrake"`
 
+	// DebugHistory keeps a rolling in-memory record of box state for
+	// GET /api/debug/history; see DebugHistoryConfig. Off by default.
+	DebugHistory DebugHistoryConfig `yaml:"debugHistory"`
+
 	Models    map[string]ModelConfig    `yaml:"models"` /* key is model ID */
 	Profiles  map[string]ProfileConfig  `yaml:"profiles"`
 	Selectors map[string]SelectorConfig `yaml:"selectors"`
@@ -352,6 +356,23 @@ type MemoryBrakeConfig struct {
 	HoldMinutes         int     `yaml:"holdMinutes"`
 	MarkerPath          string  `yaml:"markerPath"`
 	LegacyWindowSeconds int     `yaml:"windowSeconds"` // ignored; warned about at startup
+}
+
+// DebugHistoryConfig: a bounded ring of box-state samples (memory, resident
+// model, queue, brake, every session's phase and counters) plus events
+// (request completions with status/duration/cut, phase transitions, brake
+// trips), served by GET /api/debug/history. It answers "what happened in the
+// last N minutes" without reading three logs. Samples ride the 1 Hz
+// session-state loop, so intervalMs below 1000 is raised to 1000.
+type DebugHistoryConfig struct {
+	Enabled       bool `yaml:"enabled"`
+	IntervalMs    int  `yaml:"intervalMs"`
+	RetainMinutes int  `yaml:"retainMinutes"`
+}
+
+// DefaultDebugHistoryConfig is off; a deployment turns it on.
+func DefaultDebugHistoryConfig() DebugHistoryConfig {
+	return DebugHistoryConfig{Enabled: false, IntervalMs: 1000, RetainMinutes: 15}
 }
 
 // DefaultMemoryBrakeConfig returns the defaults applied when the yaml omits
