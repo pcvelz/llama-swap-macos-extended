@@ -113,6 +113,21 @@ final class WaitingParityTests: XCTestCase {
                         "a grant must clear waiting at once, not hold an old peak")
     }
 
+    /// A PENALIZED row is a session held off the box, not a request waiting
+    /// for a slot: `queue.waiting` must not count it, and the parity
+    /// invariant (waiting == count(phase == PARKED)) must hold with a
+    /// PENALIZED row present, same as any other non-PARKED phase.
+    func testPenalizedRowNeverCountsAsWaiting() {
+        let client = makeClient()
+        stub.pushEvent(type: "sessions", inner: sessionsBody(
+            waiting: 0, byTier: ["default": 0],
+            sessions: session(id: "eeeeeeee", phase: "PENALIZED")))
+        XCTAssertTrue(waitUntil { client.menuState.sessionRows.count == 1 })
+        assertParity(client)
+        XCTAssertEqual(client.menuState.waiting, 0,
+                        "a PENALIZED session must not be counted as waiting")
+    }
+
     func testTwoTiersBreakdownMatchesParkedRowsPerTier() {
         let client = makeClient()
         stub.pushEvent(type: "sessions", inner: sessionsBody(

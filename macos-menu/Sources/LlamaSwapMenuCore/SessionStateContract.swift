@@ -81,6 +81,31 @@ public struct ContractSession: Decodable {
     public let elapsedMs: Int
     public let phaseSinceMs: Int
     public let respTokens: Int
+    /// True while the session is in a degenerate tool-call loop (strike 1).
+    /// Absent on older servers, defaults to false - a strike-1 session
+    /// renders exactly as before (no looping segment), so a missing key
+    /// changes nothing.
+    public let looping: Bool?
+    /// How many requests in a row have looked uniform to the loop detector.
+    /// Absent on older servers, defaults to 0.
+    public let uniformRun: Int?
+    /// Present only once a loop has escalated to a hold (phase ==
+    /// "PENALIZED"). nil on every other phase and on servers that predate
+    /// the penalty box.
+    public let penalty: PenaltyInfo?
+}
+
+/// The PENALIZED hold's detail - session-state-contract.md's `penalty`
+/// object. `remainingSeconds` is nil for a HELD final strike (no timer,
+/// only a manual un-penalize releases it); `uniformRun`/`typicalTokens` are
+/// the loop-detector's evidence, shown only in the menu item's tooltip.
+public struct PenaltyInfo: Codable, Equatable {
+    public let reason: String
+    public let strike: Int
+    public let strikes: Int
+    public let remainingSeconds: Int?
+    public let uniformRun: Int
+    public let typicalTokens: Int
 }
 
 public struct ContractContext: Codable, Equatable {
@@ -110,6 +135,7 @@ extension SessionRow {
         let id = entry.requestId ?? (entry.sessionId.isEmpty ? entry.sessionShort : entry.sessionId)
         self.init(
             id: id,
+            sessionId: entry.sessionId,
             sessionShort: entry.sessionShort,
             model: entry.model,
             alias: entry.alias,
@@ -119,6 +145,7 @@ extension SessionRow {
             parkReason: entry.parkReason,
             context: entry.context,
             progress: entry.progress,
-            rate: entry.rate)
+            rate: entry.rate,
+            penalty: entry.penalty)
     }
 }

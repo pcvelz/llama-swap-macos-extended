@@ -78,6 +78,30 @@ type FIFO struct {
 	inFlight map[string]int
 	queued   []HandlerReq
 
+	// penalized holds requests whose SESSION is held by the loop guard
+	// (2026-09-19 phase 2). Deliberately a SEPARATE list from queued, not a
+	// park reason inside it: a penalized request must not block, outrank or
+	// delay anyone. Living in s.queued it would arm the rank barrier against
+	// lower-rank arrivals (blockedByRankBarrier / drainQueue's barrierRank),
+	// count as a queue position, keep cooldownWaitSince alive and be eligible
+	// to NAME the cooldown's NextModel - all of which are exactly the
+	// "rebounding on the box" the penalty exists to stop. Out here it is
+	// inert: it starts no swap, reserves no KV, holds no slot and appears in
+	// no cooldown. Drained by releasePenalized on every tick.
+	penalized []HandlerReq
+
+	// holdOnlyWhenContended is the CONTENTION GATE (config
+	// loopGuard.holdOnlyWhenContended, default true): a penalized request is
+	// held only while somebody else is actually waiting. A penalty exists to
+	// protect OTHER sessions, so with an empty queue there is nobody to
+	// protect and holding buys nothing - it only idles the box.
+	//
+	// WHY (2026-09-20): the guard held a healthy session for an hour against
+	// an EMPTY box. Zero other sessions were queued at any of its last 16
+	// completions; the resident idle-unloaded underneath the held request and
+	// a human had to release it. See LoopGuardConfig.HoldOnlyWhenContended.
+	holdOnlyWhenContended bool
+
 	// granted tracks, per model, the tier + preempt handle of every currently
 	// granted (in-flight) request — the tiered-queue counterpart to inFlight,
 	// which only counts requests. Consulted by the preemption branch when an
@@ -210,8 +234,17 @@ func NewFIFO(name string, logger *logmon.Monitor, planner Swapper, cfg config.Fi
 		idleSince:       make(map[string]time.Time),
 		now:             time.Now,
 		lastServedTier:  make(map[string]swaputil.Tier),
+		// Default ON, mirroring config.DefaultLoopGuardConfig: a bare FIFO
+		// built by a test must not be able to hold a request nobody is
+		// waiting behind.
+		holdOnlyWhenContended: true,
 	}
 }
+
+// SetHoldOnlyWhenContended installs the contention gate
+// (config.LoopGuardConfig.HoldOnlyWhenContended). Called once at
+// construction, before the run loop starts, so no locking is needed.
+func (s *FIFO) SetHoldOnlyWhenContended(on bool) { s.holdOnlyWhenContended = on }
 
 // SetSwapStarvationSeconds installs the global swapStarvationSeconds valve
 // (config.Config.SwapStarvationSeconds): -1 is the "valve off" sentinel
@@ -290,6 +323,29 @@ func (s *FIFO) OnRequest(req HandlerReq) {
 	// forward untouched.
 	s.nextArrivalSeq++
 	req.arrivalSeq = s.nextArrivalSeq
+
+	// (1c) Loop-guard penalty: this request's SESSION is held. Park it in the
+	// penalized list and stop here - it must not reach any branch that could
+	// grant it, start a swap or give it a queue position. Status reads and
+	// count_tokens are exempt (they hold no slot and answer a poller, not the
+	// looping agent), matching every other gate that lets them through.
+	if s.penaltyHeld(req) {
+		// Infof, not Debugf: the 2026-09-20 incident produced NOT ONE log
+		// line while a session sat parked for an hour. A hold is a decision
+		// to delay somebody's work and must always be greppable.
+		_, until, forever := req.PenaltyGate()
+		when := "held until un-penalized"
+		if !forever && !until.IsZero() {
+			when = "until " + until.Format(time.RFC3339)
+		}
+		s.logger.Infof("loopguard: holding request for model %s (%s, %d queued, %d swapping)",
+			req.Model, when, len(s.queued), len(s.active))
+		markParked(&req, ParkPenalized)
+		s.penalized = append(s.penalized, req)
+		s.publishCapacity()
+		s.publishGrace()
+		return
+	}
 
 	// (2) Rank barrier — see decision-tree doc above. Must run before (3) so
 	// joining an in-flight swap cannot bypass it.
@@ -422,6 +478,20 @@ func (s *FIFO) OnCancel(req HandlerReq) {
 		s.publishGrace()
 	}
 
+	// Prune from the penalized list: a held request whose client gave up
+	// waiting must not be re-queued when its hold ends.
+	if len(s.penalized) > 0 {
+		kept := s.penalized[:0]
+		for _, p := range s.penalized {
+			if p.Respond == req.Respond {
+				removed = true
+				continue
+			}
+			kept = append(kept, p)
+		}
+		s.penalized = kept
+	}
+
 	// Prune from any active swap's waiters.
 	for _, sw := range s.active {
 		filtered := sw.waiters[:0]
@@ -519,7 +589,27 @@ func (s *FIFO) OnServeDone(ev ServeDoneEvent) {
 		delete(s.inFlight, ev.ModelID)
 		// Model just went idle — (re)start its swap-grace clock so a competing
 		// request waits the full grace from this moment before evicting it.
-		s.idleSince[ev.ModelID] = s.now()
+		//
+		// EXCEPT for a completion from a session in a degenerate loop
+		// (ev.Looping, see swaputil.LoopTracker). Grace is an idle-STREAK
+		// requirement, so a ~20s-cadence loop resets this timestamp forever
+		// and everything queued for another model starves - witnessed
+		// 2026-09-19: session 934159af made 792 consecutive tool calls in one
+		// turn, 86 of 86 responses at 46-49 output tokens, and two cq35
+		// sessions waited hours. The blunt valve (swapStarvationSeconds)
+		// stays OFF (-1): it cannot tell this from a productive session and
+		// evicted a live one on 2026-09-08. So a looping session keeps being
+		// served in full, it simply stops earning the resident FRESH grace -
+		// the existing idle reference is left alone and runs down. Productive
+		// sessions are untouched.
+		//
+		// An idleSince entry must still EXIST though: a ready model with no
+		// idle reference is treated as evictable by withinGrace, which would
+		// drop the protection entirely rather than merely freeze it.
+		_, hasIdle := s.idleSince[ev.ModelID]
+		if !ev.Looping || !hasIdle {
+			s.idleSince[ev.ModelID] = s.now()
+		}
 	}
 
 	kvReleased := s.releaseKV(ev.ModelID, ev.EstimatedTokens)
@@ -546,7 +636,88 @@ func (s *FIFO) OnServeDone(ev ServeDoneEvent) {
 // at whatever value it read when the resident went idle. Cheap and
 // side-effect free — it is the same snapshot every other publishGrace call
 // site already takes on every state change.
+// penaltyHeld reports whether req's session is currently held by the loop
+// guard. Fail-open in every unknown case: no gate (a bare test harness, a
+// request that never passed the inflight middleware) means not held, and a
+// status read or a count_tokens call is never held at all - holding a poller
+// would punish a bystander for the agent's loop and, for a status read, park
+// a request the scheduler has already promised never to queue (2026-09-10).
+func (s *FIFO) penaltyHeld(req HandlerReq) bool {
+	return s.penaltyHeldUnder(req, s.contended())
+}
+
+// penaltyHeldUnder is penaltyHeld against a PRECOMPUTED contention reading.
+// releasePenalized needs that: it enqueues as it walks, so re-reading
+// s.contended() per entry would let the first released request manufacture
+// the contention that keeps the rest held.
+func (s *FIFO) penaltyHeldUnder(req HandlerReq, contended bool) bool {
+	if req.PenaltyGate == nil || req.StatusRead || req.ConcurrencyExempt {
+		return false
+	}
+	held, _, _ := req.PenaltyGate()
+	if !held {
+		return false
+	}
+	// CONTENTION GATE: a hold protects somebody else. Nobody else waiting,
+	// nobody to protect (2026-09-20).
+	if s.holdOnlyWhenContended && !contended {
+		return false
+	}
+	return true
+}
+
+// contended reports whether anything OTHER than the penalized requests is
+// waiting on the scheduler: a queued request (any model - a same-model
+// request waits behind this session's turn just as a cross-model one waits
+// behind a swap) or an in-flight swap, which is a request that already won
+// its decision and is waiting for a model to load.
+//
+// Requests in s.penalized are deliberately NOT contention: otherwise two held
+// sessions would justify each other's holds forever, and one held session
+// would justify its own.
+func (s *FIFO) contended() bool {
+	return len(s.queued) > 0 || len(s.active) > 0
+}
+
+// releasePenalized moves every request whose hold has ended out of the
+// penalized list and into the normal queue, where drainQueue re-runs the full
+// decision tree on it. Re-entering through enqueue rather than OnRequest is
+// load-bearing: the admission handshake already happened for these requests
+// (OnRequest answered req.Admit before the gate was consulted) and must not
+// be repeated. Returns whether anything moved.
+//
+// This is why OnTick matters for the penalty: a timed hold has no event of
+// its own, so without the tick a released session would wait for some
+// unrelated arrival to wake the queue.
+func (s *FIFO) releasePenalized() bool {
+	if len(s.penalized) == 0 {
+		return false
+	}
+	// ONE reading of contention for the whole pass - see penaltyHeldUnder.
+	contended := s.contended()
+	kept := s.penalized[:0]
+	released := false
+	for _, req := range s.penalized {
+		if s.penaltyHeldUnder(req, contended) {
+			kept = append(kept, req)
+			continue
+		}
+		why := "hold ended"
+		if held, _, _ := req.PenaltyGate(); held {
+			why = "no contention"
+		}
+		s.logger.Infof("loopguard: released request for model %s (%s)", req.Model, why)
+		released = true
+		s.enqueue(req)
+	}
+	s.penalized = kept
+	return released
+}
+
 func (s *FIFO) OnTick() {
+	// Release first: a request whose hold just ended must get this same
+	// tick's drain, not the next one.
+	s.releasePenalized()
 	if len(s.queued) == 0 {
 		// A finish clicked while nothing was held has nothing to end. Drop
 		// it here rather than let it sit armed against the NEXT cooldown,
@@ -723,6 +894,21 @@ func (s *FIFO) OnUnload(targets []string, timeout time.Duration) {
 		s.publishGrace()
 	}
 
+	// Same for requests held by the loop guard: their model is going away, so
+	// the hold can never end in anything but an error. Requests for other
+	// models stay held.
+	if len(s.penalized) > 0 {
+		kept := s.penalized[:0]
+		for _, p := range s.penalized {
+			if targetSet[p.Model] {
+				s.effects.GrantError(p, unloadErr)
+				continue
+			}
+			kept = append(kept, p)
+		}
+		s.penalized = kept
+	}
+
 	// Stop the targeted processes. Done synchronously so Unload's caller can
 	// rely on "after Unload returns, the process is stopped". inFlight is
 	// intentionally NOT cleared here: each dying handler will fire its tracked
@@ -742,6 +928,10 @@ func (s *FIFO) OnShutdown(err error) {
 		}
 	}
 	for _, w := range s.queued {
+		s.effects.GrantError(w, err)
+	}
+	// A penalty is not a reason to leave a caller hanging through shutdown.
+	for _, w := range s.penalized {
 		s.effects.GrantError(w, err)
 	}
 }

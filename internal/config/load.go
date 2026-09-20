@@ -75,6 +75,9 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 		// that are present.
 		MemoryBrake:  DefaultMemoryBrakeConfig(),
 		DebugHistory: DefaultDebugHistoryConfig(),
+		// The loop guard is on by default (absent block = ON), same
+		// decode-only-overwrites-present-keys rule as the brake above.
+		LoopGuard: DefaultLoopGuardConfig(),
 	}
 	if err = node.Decode(&config); err != nil {
 		return Config{}, err
@@ -127,6 +130,36 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 	}
 	if config.DebugHistory.IntervalMs < 1000 {
 		config.DebugHistory.IntervalMs = 1000
+	}
+
+	// A hard error rather than a clamp, matching memoryBrake above: a runBar
+	// of 1 would call every single response a loop and a negative tolerance
+	// is meaningless, so both are typos worth refusing to boot on rather than
+	// silently "correcting" into a policy the operator did not ask for.
+	if lg := config.LoopGuard; lg.RunBar < 2 || lg.ToleranceTokens < 0 {
+		return Config{}, fmt.Errorf("loopGuard: runBar must be >= 2 and toleranceTokens >= 0")
+	}
+	if lg := config.LoopGuard; lg.Strikes < 1 || lg.ClearRequests < 1 {
+		return Config{}, fmt.Errorf("loopGuard: strikes and clearRequests must be >= 1")
+	}
+	// A ceiling of 0 would make EVERY response productive and the guard inert
+	// in a way `enabled: false` already expresses more honestly.
+	if config.LoopGuard.MaxLoopTokens < 1 {
+		return Config{}, fmt.Errorf("loopGuard: maxLoopTokens must be >= 1")
+	}
+	// One entry per strike, so the ladder is read off the yaml with no
+	// implicit padding: a four-entry list under strikes:3 is an operator who
+	// thinks a fourth strike exists, and that must fail loudly.
+	if lg := config.LoopGuard; len(lg.PenaltySeconds) != lg.Strikes {
+		return Config{}, fmt.Errorf("loopGuard: penaltySeconds must have exactly one entry per strike (%d given, strikes: %d)",
+			len(lg.PenaltySeconds), lg.Strikes)
+	}
+	for i, p := range config.LoopGuard.PenaltySeconds {
+		// -1 is the documented "held until un-penalized" sentinel; anything
+		// below it is a typo (same rule as swapStarvationSeconds).
+		if p < -1 {
+			return Config{}, fmt.Errorf("loopGuard: penaltySeconds[%d]=%d must be >= -1 (-1 holds until un-penalized)", i, p)
+		}
 	}
 
 	if config.UnloadTimeout < 0 {

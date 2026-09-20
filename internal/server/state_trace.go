@@ -47,6 +47,13 @@ type traceSnapshot struct {
 	ResidentState process.ProcessState
 	Requests      []swaputil.InflightRequestEntry
 	Cooldown      *swaputil.Cooldown
+	// Penalized are the session ids the loop guard currently holds. A held
+	// session between client retries has NO in-flight request, so without
+	// this the box log would show an idle box and no reason for it
+	// (2026-09-19 phase 2). Rendered as a trailing ` penalized=[...]` only
+	// when non-empty, so every line the box has ever logged without a
+	// penalty keeps its exact shape.
+	Penalized []string
 }
 
 type stateTrace struct {
@@ -163,8 +170,16 @@ func traceLine(snap traceSnapshot) string {
 	for i, s := range slots {
 		texts[i] = s.text
 	}
-	return fmt.Sprintf("resident=%s slots=[%s] queue=[%s] cooldown=%s",
+	line := fmt.Sprintf("resident=%s slots=[%s] queue=[%s] cooldown=%s",
 		resident, strings.Join(texts, " "), strings.Join(queue, " "), cooldown)
+	if len(snap.Penalized) > 0 {
+		held := make([]string, len(snap.Penalized))
+		for i, s := range snap.Penalized {
+			held[i] = short(s)
+		}
+		line += " penalized=[" + strings.Join(held, " ") + "]"
+	}
+	return line
 }
 
 // observeState takes one reading of the live box and feeds the trace. Called
@@ -191,6 +206,7 @@ func (s *Server) observeState() {
 	})
 	snap.Requests = reqs
 	snap.Cooldown = s.currentCooldown()
+	snap.Penalized = s.inflight.loops.HeldSessions()
 	s.trace.Observe(snap)
 }
 

@@ -11,6 +11,7 @@ import (
 
 	"github.com/mostlygeek/llama-swap/internal/config"
 	"github.com/mostlygeek/llama-swap/internal/membrake"
+	"github.com/mostlygeek/llama-swap/internal/swaputil"
 )
 
 // Debug history (fork): a bounded, in-memory record of what the box did over
@@ -54,6 +55,13 @@ type dhSession struct {
 	Progress    *float64 `json:"progress"`
 	TPS         *float64 `json:"tps"`
 	RespTokens  int64    `json:"respTokens"`
+	// Looping / UniformRun mirror the session row's loop verdict
+	// (swaputil.LoopTracker), so "why did the swap to cq35 never happen"
+	// answers itself from the history instead of a live poll (2026-09-19).
+	// omitempty for the same reason as on sessionEntry.
+	Looping    bool            `json:"looping,omitempty"`
+	UniformRun int             `json:"uniformRun,omitempty"`
+	Penalty    *sessionPenalty `json:"penalty,omitempty"`
 }
 
 type dhSample struct {
@@ -188,10 +196,28 @@ func (h *debugHistory) record(now time.Time, b sessionsBody) {
 			Used: s.Context.Used, Cached: s.Context.Cached, Processed: s.Context.Processed,
 			Decoded: s.Context.Decoded, PromptTotal: s.Context.PromptTotal,
 			Progress: s.Progress, TPS: s.Rate.TokensPerSecond, RespTokens: s.RespTokens,
+			Looping: s.Looping, UniformRun: s.UniformRun, Penalty: s.Penalty,
 		})
 	}
 	h.samples = append(h.samples, smp)
 	h.pruneLocked(now)
+}
+
+// penaltyEvent records one loop-guard transition (strike, hold start, hold
+// end, un-penalize) as a "penalty" event. This is the sink installed on the
+// tracker's observer, so "why was cq35 never swapped in" and "why is this
+// session sitting still" are both answerable from one history read
+// (2026-09-19 phase 2).
+func (h *debugHistory) penaltyEvent(now time.Time, ev swaputil.LoopPenaltyEvent) {
+	d := map[string]any{"event": ev.Kind, "reason": ev.Reason, "strike": ev.Strike}
+	if ev.Kind == swaputil.PenaltyEventStrike || ev.Kind == swaputil.PenaltyEventHoldStart {
+		d["holdSeconds"] = ev.HoldSeconds
+		d["uniformRun"] = ev.UniformRun
+	}
+	h.mu.Lock()
+	h.addEventLocked(dhEvent{T: now, Kind: "penalty", Session: shortOf(ev.SessionID), Detail: d})
+	h.pruneLocked(now)
+	h.mu.Unlock()
 }
 
 // requestDone records one finished request from the access-log middleware.
@@ -256,7 +282,9 @@ func (h *debugHistory) view(since time.Time, session string) debugHistoryBody {
 		if e.T.Before(since) {
 			continue
 		}
-		if e.Kind == "phase" && !match(e.Session) {
+		// Phase and penalty events belong to ONE session, so a ?session=
+		// filter narrows them; request and brake events are box-wide.
+		if (e.Kind == "phase" || e.Kind == "penalty") && !match(e.Session) {
 			continue
 		}
 		out.Events = append(out.Events, e)

@@ -39,6 +39,7 @@ const (
 	ParkLoading       = "loading"        // its model's swap is in progress; it joined the waiters
 	ParkRank          = "rank"           // a higher-rank request is queued ahead (rank barrier)
 	ParkSwapCollision = "swap-collision" // collides with another model's in-flight swap
+	ParkPenalized     = "penalized"      // its session is held by the loop guard's penalty
 )
 
 // ErrModelNotLoaded is granted to a ConcurrencyExempt (status read) request
@@ -129,6 +130,7 @@ func New(conf config.Config, name string, logger *logmon.Monitor, planner Swappe
 	case "fifo":
 		s := NewFIFO(name, logger, planner, conf.Routing.Scheduler.Settings.Fifo, conf.Models, eff)
 		s.SetSwapStarvationSeconds(conf.SwapStarvationSeconds)
+		s.SetHoldOnlyWhenContended(conf.LoopGuard.HoldOnlyWhenContended)
 		return s, nil
 	default:
 		return nil, fmt.Errorf("unsupported scheduler type: %q", use)
@@ -170,6 +172,17 @@ type HandlerReq struct {
 	// model that is ready or already loading; it is never allowed to queue
 	// or win a swap (OnRequest step 1a). Set by baseRouter.ServeHTTP.
 	StatusRead bool
+
+	// PenaltyGate, when non-nil, reports whether this request's SESSION is
+	// currently held by the loop guard's penalty (swaputil.LoopTracker). Read
+	// at admission and again on every OnTick while the request sits in the
+	// penalized list, so a hold that elapses releases without needing a new
+	// arrival, and a manual un-penalize is observed within one tick.
+	//
+	// A held request is PARKED, never refused: "a session is always promised
+	// a turn" is a user ruling (2026-09-19). nil for every request that never
+	// passed the inflight middleware, which reads as "cannot be held".
+	PenaltyGate swaputil.PenaltyGate
 
 	// parkReason is the last reason stamped on this request's in-flight
 	// entry (one of the Park* constants, "" when granted or never parked).
@@ -242,6 +255,15 @@ type ServeDoneEvent struct {
 	// on completion (a /slots poller kept a resident inside its grace for as
 	// long as it was watched, 2026-09-10).
 	StatusRead bool
+	// Looping reports that the session behind this request was in a
+	// degenerate loop when it finished (swaputil.LoopTracker: N consecutive
+	// responses of near-identical output size). Evaluated from the request
+	// context in baseRouter.trackedServe. A looping session's completion is
+	// still served in full - it only loses the right to restart the
+	// resident's swap-grace clock, see FIFO.OnServeDone (2026-09-19).
+	// false for every request that carried no verdict (bare test harnesses,
+	// requests that never passed the inflight middleware).
+	Looping bool
 	// EstimatedTokens is the same estimate the originating HandlerReq carried
 	// at grant time, echoed back so the scheduler can release exactly what it
 	// reserved. 0 when KV admission wasn't in play for this request.

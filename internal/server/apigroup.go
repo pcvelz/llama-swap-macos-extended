@@ -442,6 +442,51 @@ func (s *Server) handleAPISwapGraceFinish(w http.ResponseWriter, r *http.Request
 	json.NewEncoder(w).Encode(map[string]string{"msg": "cooldown finished"})
 }
 
+// logPenaltyEvent is the loop tracker's observer: one greppable `loopguard:`
+// line per transition at INFO, plus the debug-history event when that is on.
+// Session ids are shortened to 8 chars, the form every other log line and the
+// menu use.
+func (s *Server) logPenaltyEvent(ev swaputil.LoopPenaltyEvent) {
+	session := shortOf(ev.SessionID)
+	switch ev.Kind {
+	case swaputil.PenaltyEventStrike:
+		s.proxylog.Infof("loopguard: %s reached strike %d/%d (run %d, ~%d tokens/response, hold %ds)",
+			session, ev.Strike, s.cfg.LoopGuard.Strikes, ev.UniformRun, ev.TypicalTokens, ev.HoldSeconds)
+	case swaputil.PenaltyEventHoldStart:
+		if ev.HoldSeconds < 0 {
+			s.proxylog.Infof("loopguard: %s held until un-penalized (strike %d)", session, ev.Strike)
+		} else {
+			s.proxylog.Infof("loopguard: %s held for %ds (strike %d)", session, ev.HoldSeconds, ev.Strike)
+		}
+	case swaputil.PenaltyEventHoldEnd:
+		s.proxylog.Infof("loopguard: %s hold ended (strike %d, timer)", session, ev.Strike)
+	case swaputil.PenaltyEventUnpenalize:
+		s.proxylog.Infof("loopguard: %s un-penalized by operator (was strike %d)", session, ev.Strike)
+	}
+	if s.debugHistory != nil {
+		s.debugHistory.penaltyEvent(time.Now(), ev)
+	}
+}
+
+// handleAPISessionsUnpenalize clears the loop guard's penalty for one
+// session: strikes, any hold, and the response history behind them (see
+// swaputil.LoopTracker.Unpenalize). This is the ONLY place a human is in the
+// chain - everything else about the guard is mechanical - and it is the
+// action behind the menu's penalized-row click.
+//
+// Always reports success, for the same reason handleAPISwapGraceFinish does:
+// un-penalizing a session that has already been forgiven (by clearRequests,
+// or by the tracker's own TTL) is a no-op, and a stricter error path would
+// only add a race for the caller to lose. The full session id is required -
+// the 8-char short form is a rendering convenience, not an identifier, and
+// acting on a prefix could penalize-clear the wrong session.
+func (s *Server) handleAPISessionsUnpenalize(w http.ResponseWriter, r *http.Request) {
+	sessionID := r.PathValue("sessionId")
+	s.inflight.loops.Unpenalize(sessionID)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"msg": "session unpenalized", "sessionId": sessionID})
+}
+
 func parseActivityLimit(raw string) (int, error) {
 	limit, err := strconv.Atoi(raw)
 	if err != nil {

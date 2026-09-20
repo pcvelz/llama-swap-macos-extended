@@ -17,6 +17,7 @@ import (
 	"github.com/mostlygeek/llama-swap/internal/event"
 	"github.com/mostlygeek/llama-swap/internal/membrake"
 	"github.com/mostlygeek/llama-swap/internal/process"
+	"github.com/mostlygeek/llama-swap/internal/router/scheduler"
 	"github.com/mostlygeek/llama-swap/internal/swaputil"
 )
 
@@ -55,6 +56,14 @@ const (
 	phaseDecode  = "DECODE"
 	phaseHot     = "HOT"
 	phaseIdle    = "IDLE"
+	// phasePenalized is the loop guard's hold (2026-09-19 phase 2). It
+	// REPLACES whatever the row would otherwise be, and applies only while
+	// the session is ACTUALLY being held - i.e. it has a request the
+	// scheduler parked as `penalized` (2026-09-20 phase 3: with the
+	// contention gate, having strikes no longer means being held). A
+	// penalized session with no live request keeps its IDLE/HOT row, exempt
+	// from the 60s drop, so it stays visible and clickable between retries.
+	phasePenalized = "PENALIZED"
 )
 
 type sessionsBody struct {
@@ -112,6 +121,39 @@ type sessionEntry struct {
 	ElapsedMs    int64          `json:"elapsedMs"`
 	PhaseSinceMs int64          `json:"phaseSinceMs"`
 	RespTokens   int64          `json:"respTokens"`
+	// Looping / UniformRun expose the loop verdict (swaputil.LoopTracker) for
+	// this session: UniformRun is the trailing run of near-identical output
+	// sizes, Looping whether it cleared the bar. Purely observational - the
+	// scheduler reads the tracker itself. Additive to llama-swap.sessions/v1
+	// and `omitempty` so a session with no run (every session on a box that
+	// has served nothing, and every golden fixture) serialises exactly as it
+	// did before (2026-09-19).
+	Looping    bool `json:"looping,omitempty"`
+	UniformRun int  `json:"uniformRun,omitempty"`
+	// Penalty is the loop guard's strike/hold for this session, omitted when
+	// it has none. Present even for a strike that carries NO hold (the phase
+	// is then unchanged): the strike is real state an operator must be able
+	// to see before it escalates.
+	Penalty *sessionPenalty `json:"penalty,omitempty"`
+}
+
+// sessionPenalty is the published penalty. RemainingSeconds is a POINTER so
+// a hold with no deadline ("held until un-penalized") serialises as JSON
+// null - the one state a countdown cannot express.
+type sessionPenalty struct {
+	Reason           string `json:"reason"`
+	Strike           int    `json:"strike"`
+	Strikes          int    `json:"strikes"`
+	RemainingSeconds *int   `json:"remainingSeconds"`
+	UniformRun       int    `json:"uniformRun"`
+	TypicalTokens    int64  `json:"typicalTokens"`
+	// Held reports that the session is being held RIGHT NOW, as opposed to
+	// merely carrying strikes. The two came apart in phase 3: with the
+	// contention gate a session inside a penalty window is admitted normally
+	// whenever nobody else is waiting (2026-09-20), so "has strikes" no
+	// longer implies "is being held" and a client must be able to tell them
+	// apart.
+	Held bool `json:"held"`
 }
 
 // childSlot is one child /slots row, only the fields the contract folds.
@@ -181,6 +223,11 @@ type sessionsInput struct {
 	Hot         map[string][]swaputil.HotSlot
 	Cooldown    *swaputil.Cooldown
 	MemoryBrake membrake.Status
+	// Loops is the box's loop tracker, read (never written) to stamp the
+	// looping/uniformRun fields onto every row that has a session id. nil in
+	// tests that drive the fold directly, which then leaves both fields at
+	// their zero values.
+	Loops *swaputil.LoopTracker
 }
 
 type phaseMark struct {
@@ -349,10 +396,14 @@ func (b *sessionsBuilder) build(in sessionsInput) sessionsBody {
 		}
 	}
 
+	held := heldNow(in)
 	present := map[string]bool{}
 	for _, key := range order {
 		r := chosen[key]
 		row := b.requestRow(in, r)
+		// Before stampPhaseSince, so a held row's phase clock measures the
+		// PENALIZED phase rather than the phase it was displaced from.
+		b.applyLoopState(in, &row, held)
 		b.stampPhaseSince(key, &row, now, r.Timestamp)
 		b.stampRate(key, &row, now, in, r)
 		present[key] = true
@@ -366,6 +417,7 @@ func (b *sessionsBuilder) build(in sessionsInput) sessionsBody {
 				continue
 			}
 			row := b.hotRow(in, model, h)
+			b.applyLoopState(in, &row, held)
 			present[h.SessionID] = true
 			delete(b.phases, h.SessionID)
 			delete(b.rates, h.SessionID)
@@ -389,11 +441,19 @@ func (b *sessionsBuilder) build(in sessionsInput) sessionsBody {
 		}
 	}
 	for key, m := range b.idle {
-		if now.Sub(m.since) >= sessionsIdleRetention {
+		// A PENALIZED session is exempt from the 60s drop: a hold stops it
+		// sending requests, and the row has to stay visible (and clickable,
+		// for un-penalize) between the client's retries. Keyed on having a
+		// strike rather than on being held right now, so the row does not
+		// blink out every time the contention gate admits it. Everything else
+		// ages out as before.
+		if now.Sub(m.since) >= sessionsIdleRetention && !b.sessionPenalized(in, key) {
 			delete(b.idle, key)
 			continue
 		}
-		body.Sessions = append(body.Sessions, b.idleRow(in, m, now))
+		row := b.idleRow(in, m, now)
+		b.applyLoopState(in, &row, held)
+		body.Sessions = append(body.Sessions, row)
 	}
 
 	// Drop per-key memory for rows that are gone.
@@ -408,6 +468,10 @@ func (b *sessionsBuilder) build(in sessionsInput) sessionsBody {
 		}
 	}
 
+	// Invariant 2 (waiting == count(PARKED)) is counted AFTER applyLoopState
+	// has replaced a held row's phase with PENALIZED, so a penalized row is
+	// never counted as waiting - it is not in the queue at all (the scheduler
+	// keeps it in a separate list, see FIFO.penalized).
 	for _, row := range body.Sessions {
 		if row.Phase == phaseParked {
 			body.Queue.Waiting++
@@ -425,6 +489,85 @@ func (b *sessionsBuilder) build(in sessionsInput) sessionsBody {
 		return a.SessionShort < c.SessionShort
 	})
 	return body
+}
+
+// heldNow is the set of sessions the scheduler is ACTUALLY holding right now:
+// those with an in-flight request parked as `penalized`.
+//
+// The tracker alone cannot answer this since phase 3. With the contention
+// gate a session inside a penalty window is admitted normally whenever nobody
+// else is waiting (2026-09-20), so tracker.Held is "is inside a penalty
+// window", while the park reason on a live request is the scheduler's own
+// record of a request it actually held. The park reason is therefore the
+// authority for the PENALIZED phase, and the thing that stops the menu
+// showing a session as held while it is happily decoding.
+func heldNow(in sessionsInput) map[string]bool {
+	out := map[string]bool{}
+	for _, r := range in.Requests {
+		if sid := r.Metadata["session_id"]; sid != "" && r.Metadata["park_reason"] == scheduler.ParkPenalized {
+			out[sid] = true
+		}
+	}
+	return out
+}
+
+// sessionPenalized reports whether sessionID carries any strike - the
+// condition for keeping its row alive past the IDLE drop, so the row is still
+// there (and clickable) when the operator goes looking.
+func (b *sessionsBuilder) sessionPenalized(in sessionsInput, sessionID string) bool {
+	if in.Loops == nil || sessionID == "" {
+		return false
+	}
+	_, ok := in.Loops.Penalty(sessionID)
+	return ok
+}
+
+// applyLoopState stamps the loop verdict and any penalty onto one row, and
+// replaces the phase with PENALIZED while the session is held. Stamped on
+// EVERY row with a session id whatever its phase: a looping or penalized
+// session is just as worth seeing while it is PARKED or IDLE as mid-DECODE
+// (2026-09-19).
+func (b *sessionsBuilder) applyLoopState(in sessionsInput, row *sessionEntry, held map[string]bool) {
+	if in.Loops == nil || row.SessionID == "" {
+		return
+	}
+	row.UniformRun = in.Loops.Run(row.SessionID)
+	row.Looping = in.Loops.Looping(row.SessionID)
+
+	p, ok := in.Loops.Penalty(row.SessionID)
+	if !ok {
+		return
+	}
+	entry := &sessionPenalty{
+		Reason:        p.Reason,
+		Strike:        p.Strike,
+		Strikes:       p.Strikes,
+		UniformRun:    p.UniformRun,
+		TypicalTokens: p.TypicalTokens,
+		Held:          held[row.SessionID],
+	}
+	// remainingSeconds stays JSON null for a hold with no deadline; a strike
+	// that carries no hold reports 0, which is exactly what it costs.
+	if !p.HeldForever {
+		remaining := 0
+		if !p.Until.IsZero() {
+			if d := p.Until.Sub(in.Now); d > 0 {
+				remaining = int(d.Round(time.Second) / time.Second)
+			}
+		}
+		entry.RemainingSeconds = &remaining
+	}
+	row.Penalty = entry
+	// PENALIZED only while the session is ACTUALLY being held. A session that
+	// has strikes but is being served (nobody else waiting, see the
+	// contention gate) keeps its real phase and simply carries the penalty
+	// object with held:false.
+	if entry.Held {
+		row.Phase = phasePenalized
+		// A penalized row is not parked behind anything in the queue, so the
+		// park reason it may have carried would be a lie.
+		row.ParkReason = nil
+	}
 }
 
 func (b *sessionsBuilder) baseRow(model, sessionID, tier string) sessionEntry {
@@ -782,6 +925,7 @@ func (h *sessionsHub) tick(now time.Time, poll bool) {
 		Hot:         hot,
 		Cooldown:    s.currentCooldown(),
 		MemoryBrake: membrake.CurrentStatus(),
+		Loops:       s.inflight.loops,
 	})
 	h.cur.Store(&body)
 	if s.debugHistory != nil {

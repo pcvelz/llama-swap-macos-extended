@@ -64,6 +64,39 @@ debugHistory:
 
 Query with `?minutes=N` (default: everything retained) and `?session=<id or prefix>`. Returns 404 with a hint when disabled.
 
+## Loop guard (`loopGuard`)
+
+`swapGraceSeconds` is an idle-STREAK requirement: a client whose request cadence is shorter than the grace resets the resident's idle clock forever, so everything queued for another model starves. On 2026-09-19 one session sat in a single turn for 4.5 h making 792 consecutive tool calls - 86 of 86 responses in one 30-minute window at 46-49 output tokens, one request every ~20 s - and two sessions parked for another model waited hours. The blunt valve (`swapStarvationSeconds`) stays off because it cannot tell that apart from a productive session and once evicted a live one.
+
+The loop guard is the missing discriminator. A session whose last `runBar` finished `/v1/messages` responses all had the same real output-token count to within `toleranceTokens` reads as LOOPING, and its completions stop earning the resident fresh grace - the existing idle reference is left alone and runs down. Productive sessions keep full protection, and a looping session is still served in full: nothing is evicted, refused or slowed. ON by default:
+
+Two guards keep that verdict off healthy sessions, both added on 2026-09-20 after the guard held a **healthy** session for an hour against an empty box. That session's 45 responses were all ~1083 tokens +-2 - uniform because the client caps output, not because it was looping:
+
+- **Output ceiling.** A response above `maxLoopTokens` is productive work and can never be loop evidence. It *breaks* the trailing run and counts toward forgiveness. Size was always the tell: the real loop emitted 46-49 tokens a turn, about 4% of that.
+- **Contention gate.** A hold exists to protect somebody else, so with `holdOnlyWhenContended` a penalized session is held only while another request is actually waiting on the scheduler. Nobody waiting, nobody to protect: the request is admitted normally, and anything already held is released on the next tick. In that incident zero other sessions were queued at any of the held session's last 16 completions - the hold bought nobody anything, it only idled the box.
+
+Keeping on looping earns STRIKES. Strike n is reached when the trailing run hits `n * runBar` (20 -> 1, 40 -> 2, 60 -> 3), and `penaltySeconds[n-1]` is what that strike costs: `0` = flag only, `N` = hold the session's next requests for N seconds, `-1` = held until an operator un-penalizes it. A held request is **PARKED, never refused** - a session is always promised its turn, so the penalty delays work, it never destroys it - and the request that earned the strike is never cut mid-flight. While held it is inert: it blocks, outranks and delays nobody, starts no swap, holds no slot and appears in no cooldown. A hold does **not** reset the run, so a session that comes back and keeps emitting the same thing climbs to the next strike rather than rebounding on the box. ON by default:
+
+```yaml
+loopGuard:
+  enabled: true
+  runBar: 20                     # trailing uniform responses before a session reads as looping
+  toleranceTokens: 2             # max (max - min) output tokens inside that run
+  strikes: 3                     # how many strikes exist; the last one is final
+  penaltySeconds: [0, 900, 3600] # per strike: flag only, 15 min, 1 hour
+  clearRequests: 10              # consecutive below-bar requests that forgive the session
+  maxLoopTokens: 256             # above this a response is productive work, not loop evidence
+  holdOnlyWhenContended: true    # hold only while somebody else is actually waiting
+```
+
+`-1` ("held until un-penalized") remains legal configuration but is deliberately not a default: a default that only a human can clear is not a default.
+
+Strikes and any hold clear after `clearRequests` consecutive recorded requests below the run bar, or via `POST /api/sessions/{sessionId}/unpenalize` (the menu's click), which also forgets the session's history so it starts clean. That endpoint is the only place a human is in the chain; everything else is mechanical.
+
+The thresholds are unproven against healthy traffic - that is why they are knobs. `runBar` >= 2, `toleranceTokens` >= 0, `strikes` >= 1, `clearRequests` >= 1, `maxLoopTokens` >= 1, each `penaltySeconds` entry >= -1, and `penaltySeconds` must have exactly one entry per strike, or the config fails to load.
+
+Everything the guard does is visible. Each row of `GET /api/sessions` (and of the debug-history session samples) carries `looping`, `uniformRun` and a `penalty` object whose `held` says whether the session is being held *right now* as opposed to merely carrying strikes; a session is `PENALIZED` only while actually held, and a `PENALIZED` row is never counted in `queue.waiting`. The debug history logs a `penalty` event per strike, hold start, hold end and un-penalize, the state trace gains a `penalized=[...]` field, and every strike, hold, hold end, held request and released request is one `loopguard:` line at INFO in the proxy log.
+
 ## Tiered entry points
 
 By default every request lands on the same `-listen` port and is served

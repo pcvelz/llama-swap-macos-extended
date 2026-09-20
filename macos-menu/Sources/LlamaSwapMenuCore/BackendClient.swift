@@ -263,6 +263,51 @@ public final class BackendClient: ObservableObject {
         }.resume()
     }
 
+    /// Un-penalizes one held session - the menu's PENALIZED row click.
+    /// Modeled 1:1 on `finishCooldown`: the row's PENALIZED reading clears
+    /// optimistically the instant the click lands (dropping `penalty` and
+    /// moving `phase` off "PENALIZED" so `displayLine` stops reading it as
+    /// held at once), and a failed POST restores the row and surfaces an
+    /// error - a dead click and a successful one must never look identical.
+    ///
+    /// `sessionId` must be the FULL session id (session-state-contract.md),
+    /// i.e. `SessionRow.sessionId`, NEVER `SessionRow.id`: the server
+    /// publishes phase PENALIZED both with no request and with one PARKED
+    /// under park reason "penalized" (the common case - the client keeps
+    /// retrying), and `id` is `requestId ?? sessionId ?? sessionShort` -
+    /// with a request present it is the REQUEST id, which would hit the
+    /// always-200 endpoint as a silent no-op. Rows are found here by
+    /// `sessionId` for the same reason, not by `id`.
+    public func unpenalize(sessionId: String) {
+        let previousRows = menuState.sessionRows
+        if let idx = previousRows.firstIndex(where: { $0.sessionId == sessionId }) {
+            var rows = previousRows
+            let row = rows[idx]
+            rows[idx] = SessionRow(
+                id: row.id, sessionId: row.sessionId, sessionShort: row.sessionShort, model: row.model,
+                alias: row.alias, tier: row.tier, priority: row.priority, phase: "IDLE", parkReason: nil,
+                context: row.context, progress: nil, rate: row.rate, penalty: nil)
+            menuState.sessionRows = rows
+        }
+
+        var request = URLRequest(url: baseURL.appendingPathComponent("/api/sessions/\(sessionId)/unpenalize"))
+        request.httpMethod = "POST"
+        URLSession.shared.dataTask(with: request) { [weak self] _, response, error in
+            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+            let failed = error != nil || status < 200 || status >= 300
+            guard failed, let self else { return }
+            DispatchQueue.main.async {
+                // Restore only if SSE has not already re-published a
+                // non-penalized row in the meantime.
+                if let current = self.menuState.sessionRows.first(where: { $0.sessionId == sessionId }),
+                   current.phase != "PENALIZED" {
+                    self.menuState.sessionRows = previousRows
+                }
+                self.menuState.lastSwitchError = "unpenalize failed"
+            }
+        }.resume()
+    }
+
     /// Ends the current cooldown immediately - the menu's cooldown row click.
     /// The row clears optimistically the moment the click lands (the click IS
     /// the operator ending the cooldown; waiting for the next swapGrace SSE

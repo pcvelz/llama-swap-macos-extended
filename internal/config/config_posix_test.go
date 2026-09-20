@@ -301,6 +301,8 @@ groups:
 		MemoryBrake: DefaultMemoryBrakeConfig(),
 		// Seeded when the debugHistory block is absent: off.
 		DebugHistory: DefaultDebugHistoryConfig(),
+		// Seeded when the loopGuard block is absent: the guard defaults ON.
+		LoopGuard: DefaultLoopGuardConfig(),
 		// Seeded by LoadConfigFromReader when the peerStall block is absent;
 		// see Config.PeerStall.
 		PeerStall: PeerStallConfig{

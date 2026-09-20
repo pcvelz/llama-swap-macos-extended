@@ -378,6 +378,21 @@
                 "retainMinutes": {"type": "integer", "minimum": 1, "default": 15}
             }
         },
+        "loopGuard": {
+            "type": "object",
+            "additionalProperties": false,
+            "description": "Degenerate-loop detection. A session whose last runBar finished /v1/messages responses all had the same real output-token count to within toleranceTokens reads as looping, and its completions no longer restart the resident model's swapGraceSeconds clock - so one looping session cannot starve sessions parked for another model (2026-09-19: 792 consecutive tool calls in one 4.5h turn at 46-49 output tokens, one request every ~20s). A looping session is still served in full; nothing is evicted or refused. The thresholds come from that one capture and are unproven against healthy traffic. ON when the block is absent.",
+            "properties": {
+                "enabled": {"type": "boolean", "default": true, "description": "Arm the loop guard. false records nothing and every verdict is false."},
+                "runBar": {"type": "integer", "minimum": 2, "default": 20, "description": "Trailing consecutive same-size responses before a session reads as looping."},
+                "toleranceTokens": {"type": "integer", "minimum": 0, "default": 2, "description": "Maximum spread (max - min) of output tokens allowed inside that run. 0 means byte-identical sizes only."},
+                "strikes": {"type": "integer", "minimum": 1, "default": 3, "description": "How many strikes exist. Strike n is reached when the trailing run hits n * runBar (20 -> 1, 40 -> 2, 60 -> 3), capped here."},
+                "penaltySeconds": {"type": "array", "items": {"type": "integer", "minimum": -1}, "default": [0, 900, 3600], "description": "One entry per strike (length must equal strikes): 0 = flag only, N = hold the session's next requests N seconds, -1 = held until POST /api/sessions/{id}/unpenalize. -1 is legal but deliberately not a default: a default only a human can clear is not a default. A held request is PARKED, never refused, and is inert - it blocks, outranks and delays nobody. A hold does not reset the run, so a session that keeps looping climbs to the next strike."},
+                "clearRequests": {"type": "integer", "minimum": 1, "default": 10, "description": "Consecutive recorded requests below the run bar that wipe the session's strikes and any hold."},
+                "maxLoopTokens": {"type": "integer", "minimum": 1, "default": 256, "description": "OUTPUT CEILING: a response larger than this is productive work and can never be loop evidence, however uniform. It breaks the trailing run and counts toward clearRequests. 2026-09-20: the guard held a healthy session whose 45 responses were all ~1083 tokens +-2 (a client-side output cap, not a loop) for an hour; the real loop emitted 46-49 tokens a turn."},
+                "holdOnlyWhenContended": {"type": "boolean", "default": true, "description": "CONTENTION GATE: hold a penalized session only while another request is actually waiting on the scheduler. A penalty exists to protect somebody else, so with an empty queue the request is admitted normally and anything already held is released on the next tick. false restores the unconditional behaviour."}
+            }
+        },
         "memoryBrake": {
             "type": "object",
             "additionalProperties": false,

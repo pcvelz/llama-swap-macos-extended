@@ -52,9 +52,32 @@ public struct MenuView: View {
         // Each row is a Button: clicking evicts the request - a PARKED one
         // drops out of the scheduler's queue, a granted one aborts
         // (BackendClient.cancelInflight -> POST /api/inflight/<id>/cancel).
+        // A PENALIZED row (its `penalty` is present, which is also what
+        // drives its dedicated displayLine shape and the tooltip below)
+        // clicks to un-penalize instead - releasing the hold rather than
+        // evicting a request. This MUST send `row.sessionId`, never `row.id`:
+        // a PENALIZED session commonly still has one PARKED request (the
+        // client keeps retrying), which makes `id` the request id, not the
+        // session id the endpoint is keyed on (BackendClient.unpenalize). A
+        // row whose `sessionId` came back empty (a server predating the
+        // field) has nothing valid to send, so it renders as a disabled,
+        // non-clickable line instead of a click that would silently no-op.
         ForEach(state.sessionRows) { row in
-            Button(row.displayLine) {
-                client.cancelInflight(id: row.id)
+            if let tooltip = row.penaltyTooltip {
+                if row.sessionId.isEmpty {
+                    Text(row.displayLine)
+                        .help(tooltip)
+                        .disabled(true)
+                } else {
+                    Button(row.displayLine) {
+                        client.unpenalize(sessionId: row.sessionId)
+                    }
+                    .help(tooltip)
+                }
+            } else {
+                Button(row.displayLine) {
+                    client.cancelInflight(id: row.id)
+                }
             }
         }
 

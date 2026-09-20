@@ -254,6 +254,10 @@ func New(cfg config.Config, muxlog *logmon.Monitor, proxylog *logmon.Monitor, up
 		shutdownCtx:   shutdownCtx,
 		shutdownFn:    shutdownFn,
 	}
+	// Loop guard: the degenerate-loop detector whose verdict stops a looping
+	// session from restarting the resident's swap-grace (2026-09-19). Install
+	// the configured thresholds before anything can serve.
+	s.inflight.setLoopGuard(cfg.LoopGuard)
 	// SysProvider is constructed here because this is where perf and hardware
 	// are in scope; wiring those in later is a change to internal/mcptools.
 	tools, err := mcptools.New(
@@ -275,6 +279,12 @@ func New(cfg config.Config, muxlog *logmon.Monitor, proxylog *logmon.Monitor, up
 		sampler, _ := membrake.NewNativeSampler()
 		s.debugHistory = newDebugHistory(cfg.DebugHistory, sampler)
 	}
+	// Every loop-guard transition is LOGGED, and additionally recorded as a
+	// "penalty" event when the debug history is on. Installed unconditionally
+	// and at INFO: the 2026-09-20 incident produced not one log line while a
+	// healthy session sat held for an hour, and a decision to delay somebody's
+	// work must always be greppable, history or no history.
+	s.inflight.loops.SetPenaltyObserver(s.logPenaltyEvent)
 	// Stored unconditionally: a Server rebuilt with the history off must not
 	// leave the access-log middleware feeding the previous one.
 	activeDebugHistory.Store(s.debugHistory)
@@ -605,6 +615,7 @@ func (s *Server) routes() {
 	mux.Handle("POST /api/swap-grace/finish", apiChain.ThenFunc(s.handleAPISwapGraceFinish))
 	mux.Handle("GET /api/slots", apiChain.ThenFunc(s.handleAPISlots))
 	mux.Handle("GET /api/sessions", apiChain.ThenFunc(s.handleAPISessions))
+	mux.Handle("POST /api/sessions/{sessionId}/unpenalize", apiChain.ThenFunc(s.handleAPISessionsUnpenalize))
 	mux.Handle("GET /api/debug/history", apiChain.ThenFunc(s.handleAPIDebugHistory))
 	mux.Handle("GET /api/state-trace", apiChain.ThenFunc(s.handleAPIStateTrace))
 

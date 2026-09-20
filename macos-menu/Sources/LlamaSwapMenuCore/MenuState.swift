@@ -222,6 +222,17 @@ public struct HotSlotRow: Identifiable, Codable, Equatable {
 /// not already contain (invariant 3).
 public struct SessionRow: Identifiable, Encodable, Equatable {
     public let id: String
+    /// The FULL session id (`ContractSession.sessionId`), verbatim -
+    /// distinct from `id`, which is `requestId ?? sessionId ?? sessionShort`
+    /// and so is the REQUEST id whenever one is present (the common case for
+    /// a PENALIZED session: the server publishes PENALIZED both with no
+    /// request and with one PARKED under park reason "penalized", because
+    /// the client keeps retrying). `unpenalize` needs the session id
+    /// specifically - the endpoint is keyed on the session, not the request
+    /// - so this field exists precisely so that click never sends `id` by
+    /// mistake. Defaults to "" for the memberwise init's existing callers
+    /// that predate this field; empty means "unknown, do not act on it".
+    public let sessionId: String
     public let sessionShort: String
     public let model: String
     public let alias: String
@@ -240,11 +251,18 @@ public struct SessionRow: Identifiable, Encodable, Equatable {
     /// PREFILL only, 0...1; nil otherwise.
     public let progress: Double?
     public let rate: ContractRate
+    /// Present only for a PENALIZED row's hold detail (SessionStateContract's
+    /// `PenaltyInfo`); nil for every other phase, and nil for a PENALIZED row
+    /// from a server that predates the penalty box (invariant 5 fallback:
+    /// see `displayLine`).
+    public let penalty: PenaltyInfo?
 
-    public init(id: String, sessionShort: String, model: String, alias: String, tier: String,
+    public init(id: String, sessionId: String = "", sessionShort: String, model: String, alias: String, tier: String,
                 priority: Int, phase: String, parkReason: String? = nil,
-                context: ContractContext, progress: Double? = nil, rate: ContractRate) {
+                context: ContractContext, progress: Double? = nil, rate: ContractRate,
+                penalty: PenaltyInfo? = nil) {
         self.id = id
+        self.sessionId = sessionId
         self.sessionShort = sessionShort
         self.model = model
         self.alias = alias
@@ -255,6 +273,7 @@ public struct SessionRow: Identifiable, Encodable, Equatable {
         self.context = context
         self.progress = progress
         self.rate = rate
+        self.penalty = penalty
     }
 
     /// Known park reasons in words, the same vocabulary the fork's scheduler
@@ -312,10 +331,27 @@ public struct SessionRow: Identifiable, Encodable, Equatable {
     ///
     /// A segment the body did not supply (no progress, no rate yet, default
     /// tier) is dropped rather than shown empty.
+    ///
+    /// A PENALIZED row with `penalty` present takes a dedicated shape instead
+    /// (user-approved format): `[id] alias · PENALIZED (reason strike/
+    /// strikes) · used/window · m:ss`, or `· held` when `remainingSeconds` is
+    /// null (a final-strike hold with no timer). No progress/rate segments -
+    /// a held session carries neither. If `phase == "PENALIZED"` but
+    /// `penalty` is absent (an older/odd server), this falls through to the
+    /// generic path below, which renders "PENALIZED" verbatim rather than
+    /// inventing a reason/strike count it was not given (invariant 5).
     public var displayLine: String {
-        var segments: [String] = []
         let bracket = sessionShort.isEmpty ? "-" : sessionShort
-        segments.append("[\(bracket)] \(alias.isEmpty ? model : alias)")
+        let idAndAlias = "[\(bracket)] \(alias.isEmpty ? model : alias)"
+
+        if let penalty {
+            let phaseSegment = "PENALIZED (\(penalty.reason) \(penalty.strike)/\(penalty.strikes))"
+            let tokensSegment = "\(CompactFormatter.tokens(context.used))/\(CompactFormatter.tokens(context.window))"
+            let holdSegment = penalty.remainingSeconds.map(CompactFormatter.countdown) ?? "held"
+            return [idAndAlias, phaseSegment, tokensSegment, holdSegment].joined(separator: " · ")
+        }
+
+        var segments: [String] = [idAndAlias]
 
         var phaseSegment = phase
         if let phrase = SessionRow.parkPhrase(parkReason) { phaseSegment += " (\(phrase))" }
@@ -326,6 +362,14 @@ public struct SessionRow: Identifiable, Encodable, Equatable {
         if let rateText { segments.append(rateText) }
         if let tierText { segments.append(tierText) }
         return segments.joined(separator: " · ")
+    }
+
+    /// The loop detector's evidence behind a PENALIZED hold, shown only in
+    /// the menu item's tooltip (not the row text itself) - nil whenever
+    /// `penalty` is absent.
+    public var penaltyTooltip: String? {
+        guard let penalty else { return nil }
+        return "\(penalty.uniformRun) requests in a row, ~\(penalty.typicalTokens) tokens each"
     }
 }
 

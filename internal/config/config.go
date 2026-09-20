@@ -198,6 +198,10 @@ type Config struct {
 	// GET /api/debug/history; see DebugHistoryConfig. Off by default.
 	DebugHistory DebugHistoryConfig `yaml:"debugHistory"`
 
+	// LoopGuard detects sessions stuck in a degenerate tool loop; see
+	// LoopGuardConfig. On by default.
+	LoopGuard LoopGuardConfig `yaml:"loopGuard"`
+
 	Models    map[string]ModelConfig    `yaml:"models"` /* key is model ID */
 	Profiles  map[string]ProfileConfig  `yaml:"profiles"`
 	Selectors map[string]SelectorConfig `yaml:"selectors"`
@@ -381,6 +385,95 @@ type DebugHistoryConfig struct {
 // DefaultDebugHistoryConfig is off; a deployment turns it on.
 func DefaultDebugHistoryConfig() DebugHistoryConfig {
 	return DebugHistoryConfig{Enabled: false, IntervalMs: 1000, RetainMinutes: 15}
+}
+
+// LoopGuardConfig: the degenerate-loop detector (internal/swaputil,
+// LoopTracker). A session whose last RunBar finished /v1/messages responses
+// all had the same real output-token count to within ToleranceTokens is
+// reading as a LOOP, and its completions stop restarting the resident's
+// swap-grace clock (internal/router/scheduler, FIFO.OnServeDone).
+//
+// WHY it exists, 2026-09-19: session 934159af sat in ONE turn for 4.5h making
+// 792 consecutive tool calls at 46-49 output tokens each, one request every
+// ~20s. Swap-grace is an idle-STREAK requirement, so that cadence pinned the
+// resident forever and two sessions parked for another model starved for
+// hours. The blunt valve (SwapStarvationSeconds) stays off because it cannot
+// tell a productive session from that one.
+//
+// RunBar and ToleranceTokens are UNPROVEN: they were read off that ONE
+// captured loop and have never been measured against healthy traffic, which
+// is exactly why they are knobs rather than constants. Enabled: false records
+// nothing and every verdict is false, i.e. byte-for-byte the pre-2026-09-19
+// behaviour.
+//
+// Phase 2 adds STRIKES and a penalty hold. Strike n is reached when the
+// trailing run reaches n * RunBar, capped at Strikes; PenaltySeconds[n-1] is
+// what that strike costs: 0 = flag only, N = hold the session's NEXT requests
+// for N seconds, -1 = hold until an operator un-penalizes it (POST
+// /api/sessions/{id}/unpenalize, the menu's click). A held request is PARKED,
+// never refused - a session is always promised its turn - and the in-flight
+// request that triggered the strike is never cut. Strikes and any hold clear
+// after ClearRequests consecutive recorded requests whose run is below RunBar,
+// or on un-penalize (which also forgets the session's history entirely).
+type LoopGuardConfig struct {
+	Enabled         bool `yaml:"enabled"`
+	RunBar          int  `yaml:"runBar"`
+	ToleranceTokens int  `yaml:"toleranceTokens"`
+	// Strikes is how many strikes exist; the last one is final.
+	Strikes int `yaml:"strikes"`
+	// PenaltySeconds is the per-strike cost, one entry per strike (so its
+	// length must equal Strikes): 0 = no hold, N > 0 = hold N seconds,
+	// -1 = hold until un-penalized.
+	PenaltySeconds []int `yaml:"penaltySeconds"`
+	// ClearRequests is how many consecutive recorded requests below the run
+	// bar wipe the session's strikes and any hold.
+	ClearRequests int `yaml:"clearRequests"`
+	// MaxLoopTokens is the OUTPUT CEILING: a response bigger than this is
+	// productive work, never loop evidence. It BREAKS the trailing run and
+	// counts toward ClearRequests instead of extending the run.
+	//
+	// WHY (2026-09-20, the guard's own false positive): a Hermes session
+	// (ef043b3f) made 45 requests that each decoded for 142-159s and emitted
+	// ~1083 tokens, +-2. Uniform BY CONSTRUCTION - that is an output cap, not
+	// a loop - and every one of them was real generation work. It reached
+	// strike 3/3 and was held for an hour against an EMPTY box. Size is the
+	// discriminator the original capture always had: the real loop
+	// (934159af) emitted 46-49 tokens a turn.
+	MaxLoopTokens int `yaml:"maxLoopTokens"`
+	// HoldOnlyWhenContended makes a hold conditional on somebody else
+	// actually waiting: a penalty exists to protect OTHER sessions, so with
+	// an empty queue there is nobody to protect and the held request is
+	// admitted (and anything already held is released on the next tick).
+	// false restores the unconditional phase-2 behaviour.
+	//
+	// WHY: in the same 2026-09-20 incident, ZERO other sessions were queued
+	// at any of ef043b3f's last 16 completions. The hold bought nobody
+	// anything; it only idled the box.
+	HoldOnlyWhenContended bool `yaml:"holdOnlyWhenContended"`
+}
+
+// DefaultLoopGuardConfig is ON, at the thresholds derived from the 2026-09-19
+// capture (20 consecutive responses within a 2-token spread: ~7 minutes at
+// the observed cadence, far past any legitimate run of same-length turns).
+// The strike ladder is deliberately gentle at the top: the first strike only
+// flags (the session keeps serving, it just stops earning fresh grace - phase
+// 1 behaviour), the second costs 15 minutes, the third an hour.
+//
+// NO INFINITE DEFAULT (2026-09-20): -1 ("held until a human clicks") remains
+// legal configuration but is no longer shipped. The guard held a healthy
+// session for an hour against an empty box and nothing but a human ended it;
+// a default that can only be cleared by a human is not a default.
+func DefaultLoopGuardConfig() LoopGuardConfig {
+	return LoopGuardConfig{
+		Enabled:               true,
+		RunBar:                20,
+		ToleranceTokens:       2,
+		Strikes:               3,
+		PenaltySeconds:        []int{0, 900, 3600},
+		ClearRequests:         10,
+		MaxLoopTokens:         256,
+		HoldOnlyWhenContended: true,
+	}
 }
 
 // DefaultMemoryBrakeConfig returns the defaults applied when the yaml omits

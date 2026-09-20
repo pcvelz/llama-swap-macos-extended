@@ -65,6 +65,15 @@ type inflightTracker struct {
 	needsSnapshot    atomic.Bool
 	publisherRunning atomic.Bool
 	publish          func(swaputil.InFlightRequestsEvent)
+
+	// loops is the box's ONE loop tracker (see swaputil.LoopTracker). The
+	// inflight tracker owns it because this is the single place that sees
+	// both a request's session id and its final real output-token count:
+	// Remove() feeds it every completed /v1/messages turn, and the verdict it
+	// answers rides the request context out to the scheduler
+	// (swaputil.WithLoopVerdict) so a looping session's completion cannot
+	// restart the resident's swap-grace clock (2026-09-19).
+	loops *swaputil.LoopTracker
 }
 
 type inflightRequest struct {
@@ -99,8 +108,46 @@ func newInflightTrackerWithPublisher(size int, publish func(swaputil.InFlightReq
 		updates:   make(chan swaputil.InFlightRequestsEvent, size),
 		publish:   publish,
 		tierNames: tierNames,
+		// Seeded at the package defaults so a bare tracker (every test call
+		// site) behaves like an enabled loop guard; the server overrides it
+		// from `loopGuard:` at construction, see setLoopGuard.
+		loops: swaputil.NewLoopTracker(swaputil.DefaultLoopGuard()),
 	}
 	return t
+}
+
+// setLoopGuard installs the configured loop guard (`loopGuard:`, see
+// config.LoopGuardConfig). enabled:false leaves a NIL tracker, which is the
+// disabled tracker: it records nothing, every verdict is false, and
+// OnServeDone behaves exactly as it did before 2026-09-19. Called once at
+// server construction, before any request can be tracked.
+func (t *inflightTracker) setLoopGuard(cfg config.LoopGuardConfig) {
+	if !cfg.Enabled {
+		t.loops = nil
+		return
+	}
+	t.loops = swaputil.NewLoopTracker(swaputil.LoopGuard{
+		RunBar:          cfg.RunBar,
+		ToleranceTokens: int64(cfg.ToleranceTokens),
+		Strikes:         cfg.Strikes,
+		PenaltySeconds:  cfg.PenaltySeconds,
+		ClearRequests:   cfg.ClearRequests,
+		MaxLoopTokens:   int64(cfg.MaxLoopTokens),
+	})
+}
+
+// penaltyGateFor builds the callback the scheduler reads at admission and on
+// every tick while the request is parked: is this request's session held? It
+// resolves the session id LAZILY for the same reason loopVerdictFor does -
+// the id is stamped onto the live entry, possibly after Add().
+func (t *inflightTracker) penaltyGateFor(id string) swaputil.PenaltyGate {
+	return func() (bool, time.Time, bool) {
+		sessionID := t.sessionIDOf(id)
+		if sessionID == "" {
+			return false, time.Time{}, false
+		}
+		return t.loops.Held(sessionID)
+	}
 }
 
 // tierSnapshotLocked returns the per-tier in-flight counts: "default" plus
@@ -196,10 +243,70 @@ func (t *inflightTracker) Add(r *http.Request, cancel context.CancelFunc) string
 	return id
 }
 
+// loopCountedPath is the one route whose completions feed the loop tracker:
+// a real Anthropic turn. Matched as a SUFFIX so both the front path
+// (/v1/messages) and the stripped upstream path
+// (/upstream/<model>/v1/messages -> /v1/messages, see
+// CreateUpstreamInflightMiddleware) count the same.
+const loopCountedPath = "/v1/messages"
+
+// recordLoopLocked feeds one COMPLETED request into the loop tracker, if it is
+// the kind of request a loop verdict may be built from: a POST turn on
+// /v1/messages that carries a session id AND actually produced output. Status
+// reads, count_tokens and anything without a session are skipped - they carry
+// no model turn, and a run of their zero token counts would fake a perfect
+// loop.
+//
+// RespTokens <= 0 is skipped for the same reason and a sharper one (review,
+// 2026-09-19): a request that produced nothing says NOTHING about what the
+// session generates. The session that gets starved is exactly the one that
+// parks, times out at 300s and retries - six 499s in 30 minutes, all
+// zero-token - so counting those would make the VICTIM read as the looper and
+// penalize it. Called from Remove
+// while the entry is still in the map, because RespTokens only reaches its
+// final value as the last response bytes are written. Callers must hold t.mu.
+func (t *inflightTracker) recordLoopLocked(req *inflightRequest) {
+	if t.loops == nil || req.entry.Method != http.MethodPost {
+		return
+	}
+	if !strings.HasSuffix(req.entry.ReqPath, loopCountedPath) || req.entry.RespTokens <= 0 {
+		return
+	}
+	t.loops.Record(req.entry.Metadata["session_id"], req.entry.RespTokens)
+}
+
+// sessionIDOf returns the session id stamped on the LIVE entry for id, or ""
+// once the request is gone / was never stamped. Read lazily by the loop
+// verdict bound in the middlewares below: the session id arrives in the
+// request context bag and may be stamped after Add().
+func (t *inflightTracker) sessionIDOf(id string) string {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	req, ok := t.requests[id]
+	if !ok {
+		return ""
+	}
+	return req.entry.Metadata["session_id"]
+}
+
+// loopVerdictFor builds the callback bound onto a request's context: is the
+// session behind THIS request currently in a degenerate loop? A request with
+// no session id is never looping.
+func (t *inflightTracker) loopVerdictFor(id string) swaputil.LoopVerdict {
+	return func() bool {
+		sessionID := t.sessionIDOf(id)
+		if sessionID == "" || t.loops == nil {
+			return false
+		}
+		return t.loops.Looping(sessionID)
+	}
+}
+
 func (t *inflightTracker) Remove(id string) {
 	t.mu.Lock()
 	req, ok := t.requests[id]
 	if ok {
+		t.recordLoopLocked(req)
 		delete(t.requests, id)
 		if req.timer != nil {
 			req.timer.Stop()
@@ -626,6 +733,13 @@ func CreateInflightMiddleware(t *inflightTracker, cfg config.Config) chain.Middl
 			r = r.WithContext(swaputil.WithInflightMetadataSetter(r.Context(), func(key, value string) {
 				t.SetMetadata(id, key, value)
 			}))
+			// Carry the loop verdict for this request's session the same way,
+			// and for the same import-cycle reason: the scheduler must know at
+			// OnServeDone whether this completion came from a degenerate loop
+			// (2026-09-19) and cannot reach the tracker directly. The penalty
+			// gate rides along for the admission side of the same story.
+			r = r.WithContext(swaputil.WithLoopVerdict(r.Context(), t.loopVerdictFor(id)))
+			r = r.WithContext(swaputil.WithPenaltyGate(r.Context(), t.penaltyGateFor(id)))
 
 			next.ServeHTTP(&inflightResponseWriter{ResponseWriter: w, tracker: t, id: id}, r)
 		})
@@ -667,10 +781,12 @@ func CreateUpstreamInflightMiddleware(t *inflightTracker, cfg config.Config) cha
 			tracked.URL.Path = remainingPath
 			id := t.Add(tracked, cancel)
 			defer t.Remove(id)
-			// See the matching comment in CreateInflightMiddleware above.
+			// See the matching comments in CreateInflightMiddleware above.
 			r = r.WithContext(swaputil.WithInflightMetadataSetter(r.Context(), func(key, value string) {
 				t.SetMetadata(id, key, value)
 			}))
+			r = r.WithContext(swaputil.WithLoopVerdict(r.Context(), t.loopVerdictFor(id)))
+			r = r.WithContext(swaputil.WithPenaltyGate(r.Context(), t.penaltyGateFor(id)))
 
 			next.ServeHTTP(&inflightResponseWriter{ResponseWriter: w, tracker: t, id: id}, r)
 		})

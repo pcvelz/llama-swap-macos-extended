@@ -175,6 +175,13 @@ func newBaseRouter(
 			break
 		}
 	}
+	// The loop guard needs the same ticker for a different reason: a timed
+	// penalty hold has no event of its own, so OnTick is the only thing that
+	// releases a held request once its deadline passes (and the only thing
+	// that notices a manual un-penalize) - see FIFO.releasePenalized.
+	if conf.LoopGuard.Enabled {
+		b.graceTick = time.Second
+	}
 
 	sched, err := scheduler.New(conf, name, logger, planner, b)
 	if err != nil {
@@ -514,13 +521,31 @@ func (b *baseRouter) StopProcesses(timeout time.Duration, ids []string) {
 func (b *baseRouter) trackedServe(modelID string, p process.Process, estimatedTokens int, statusRead bool, preempted *atomic.Bool, replayWanted *atomic.Bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		defer func() {
+			// Read the loop verdict HERE, not at grant time: it is a property
+			// of the session's history as of this completion (see
+			// swaputil.LoopVerdict). Absent verdict = productive, which is the
+			// pre-2026-09-19 behaviour for every path that never passed the
+			// inflight middleware.
+			looping := false
+			if verdict, ok := swaputil.LoopVerdictFromContext(r.Context()); ok && verdict != nil {
+				looping = verdict()
+			}
 			select {
-			case b.serveDoneCh <- scheduler.ServeDoneEvent{ModelID: modelID, EstimatedTokens: estimatedTokens, StatusRead: statusRead}:
+			case b.serveDoneCh <- scheduler.ServeDoneEvent{ModelID: modelID, EstimatedTokens: estimatedTokens, StatusRead: statusRead, Looping: looping}:
 			case <-b.shutdownCtx.Done():
 			}
 		}()
 		p.ServeHTTP(newPreemptResponseWriter(w, preempted, replayWanted), r)
 	}
+}
+
+// penaltyGateOf lifts the loop guard's admission gate off r's context, or nil
+// when there is none. Split out so the HandlerReq literal stays readable.
+func penaltyGateOf(r *http.Request) swaputil.PenaltyGate {
+	if gate, ok := swaputil.PenaltyGateFromContext(r.Context()); ok {
+		return gate
+	}
+	return nil
 }
 
 // Eviction is a LAST resort, never routine: unloading a resident model forces a
@@ -1135,6 +1160,12 @@ func (b *baseRouter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 			// A websocket upgrade is a GET but is a real session that may
 			// start a model (TestBaseRouter_WebsocketStartsModelWhenCompatDisabled).
 			StatusRead: swaputil.IsStatusRead(attemptReq),
+			// The loop guard's admission gate (2026-09-19 phase 2). Carried
+			// on the request context by the inflight middleware because the
+			// router cannot import internal/server, where the tracker lives;
+			// nil when the request never passed that middleware, which reads
+			// as "cannot be held".
+			PenaltyGate: penaltyGateOf(attemptReq),
 			// Inert unless the target model has a KVPoolTokens budget configured
 			// (see scheduler.FIFO.kvAdmit) — see swaputil.EstimateTokens for the
 			// estimation rule.
