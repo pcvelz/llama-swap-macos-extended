@@ -52,7 +52,7 @@ final class ModelSwitchTests: XCTestCase {
         client.load(modelID: "cq35")
 
         XCTAssertTrue(waitUntil {
-            self.stub.recorded.contains(StubBackend.Recorded(method: "POST", path: "/upstream/cq35/"))
+            self.stub.recorded.contains(where: { $0.method == "POST" && $0.path == "/upstream/cq35/" })
         }, "expected POST /upstream/cq35/, got \(stub.recorded)")
     }
 

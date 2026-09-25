@@ -93,6 +93,11 @@ public struct ContractSession: Decodable {
     /// "PENALIZED"). nil on every other phase and on servers that predate
     /// the penalty box.
     public let penalty: PenaltyInfo?
+    /// The dispatching session's id from X-Claude-Code-Parent-Session-Id;
+    /// absent on older servers and on direct (non-dispatched) rows.
+    public let parentSessionId: String?
+    /// First 8 chars of parentSessionId; absent when there is no parent.
+    public let parentSessionShort: String?
 }
 
 /// The PENALIZED hold's detail - session-state-contract.md's `penalty`
@@ -137,6 +142,7 @@ extension SessionRow {
             id: id,
             sessionId: entry.sessionId,
             sessionShort: entry.sessionShort,
+            parentSessionShort: entry.parentSessionShort,
             model: entry.model,
             alias: entry.alias,
             tier: entry.tier,

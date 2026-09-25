@@ -43,9 +43,8 @@ public struct MenuView: View {
         Text(state.waitingSummary)
 
         // One row per in-flight request, in the server's order as given: the
-        // PARKED rows ARE the queue, top row = next request a slot takes, so
-        // there is no separate queue-order line (and no re-sorting here).
-        // Rows are in the grammar llama-cm's
+        // PARKED rows ARE the queue, top row = next request a slot takes (and
+        // no re-sorting here). Rows are in the grammar llama-cm's
         // session-identity contract fixes for both renderers - the row text
         // itself lives on SessionRow.displayLine, so cm-menu and this menu
         // can never disagree about how a request is described.
@@ -80,6 +79,13 @@ public struct MenuView: View {
                 }
             }
         }
+
+        // The scheduler's own wait list - "Queue: idle" when nothing is
+        // parked, one summary line otherwise (never inferred per-row; see
+        // SessionThroughput.swift's header on why PARKED isn't a per-request
+        // word here). Restored by user ruling 2026-09-25; do not remove
+        // again without the user.
+        Text(MenuState.queueSummary(state.sessionRows))
 
         // The memory brake's admission gate: after a brake kill, loads wait
         // for the killed model's file cache to drain. Absent while open.

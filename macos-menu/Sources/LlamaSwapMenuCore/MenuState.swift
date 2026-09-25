@@ -39,7 +39,8 @@ public struct MenuState: Encodable {
     /// never re-sorting it. The PARKED rows ARE the wait list: top to bottom is
     /// the pick order (tier rank descending - priority, default, background -
     /// then the order the scheduler will grant), so the top row is the next
-    /// request a slot takes. There is deliberately no separate queue-order line.
+    /// request a slot takes. `queueSummary` below restates that same order as
+    /// one line (user ruling 2026-09-25: the summary line stays).
     public var sessionRows: [SessionRow] = []
 
     /// The current swap-grace cooldown (llama-cm llama-swap.yaml
@@ -118,6 +119,23 @@ public struct MenuState: Encodable {
     /// characters, the same short form the session rows use.
     public static func hotSlotLabel(_ s: HotSlotRow) -> String {
         "  slot \(s.slot) · [\(String(s.sessionId.prefix(8)))] · hot, idle \(CompactFormatter.countdown(s.idleSeconds))"
+    }
+
+    /// The "Queue: idle" line the design calls for when nothing is parked,
+    /// else one summary per queued entry - built straight from the contract's
+    /// own `sessions[]` (PARKED rows), the single source `sessionRows`
+    /// already comes from. There is no second "scheduler queue" list to keep
+    /// in sync with it: llama-swap's PARKED entries ARE the wait list, in the
+    /// order it already sorted them (priority descending, then elapsedMs
+    /// descending - session-state-contract.md § "sessions"). Restored by
+    /// user ruling 2026-09-25 after 40db173 removed it; do not remove again
+    /// without the user.
+    public static func queueSummary(_ rows: [SessionRow]) -> String {
+        let parked = rows.filter { $0.phase == "PARKED" }
+        guard !parked.isEmpty else { return "Queue: idle" }
+        return parked.enumerated()
+            .map { i, row in "\(i + 1). \(row.tier)/\(row.alias.isEmpty ? row.model : row.alias)" }
+            .joined(separator: ", ")
     }
 
     /// Derived, never stored: storing it meant recomputing at three call sites
@@ -234,12 +252,15 @@ public struct SessionRow: Identifiable, Encodable, Equatable {
     /// that predate this field; empty means "unknown, do not act on it".
     public let sessionId: String
     public let sessionShort: String
+    /// The dispatching parent's short id (8 hex), set when the row represents
+    /// a dispatched child. nil for direct CLI, curl, or non-dispatched rows.
+    public let parentSessionShort: String?
     public let model: String
     public let alias: String
     public let tier: String
     /// The tier's configured rank; default tier 0, background negative.
     /// Reserved by the contract for a future per-session override - this
-    /// menu only renders it (see `priorityText`).
+    /// menu only renders it (see `tierText`).
     public let priority: Int
     /// `PARKED`, `LOADING`, `PREFILL`, `DECODE`, `HOT`, `IDLE`, or any value
     /// the server has not documented yet - rendered verbatim either way
@@ -257,13 +278,14 @@ public struct SessionRow: Identifiable, Encodable, Equatable {
     /// see `displayLine`).
     public let penalty: PenaltyInfo?
 
-    public init(id: String, sessionId: String = "", sessionShort: String, model: String, alias: String, tier: String,
+    public init(id: String, sessionId: String = "", sessionShort: String, parentSessionShort: String? = nil, model: String, alias: String, tier: String,
                 priority: Int, phase: String, parkReason: String? = nil,
                 context: ContractContext, progress: Double? = nil, rate: ContractRate,
                 penalty: PenaltyInfo? = nil) {
         self.id = id
         self.sessionId = sessionId
         self.sessionShort = sessionShort
+        self.parentSessionShort = parentSessionShort
         self.model = model
         self.alias = alias
         self.tier = tier
@@ -311,44 +333,50 @@ public struct SessionRow: Identifiable, Encodable, Equatable {
         return "\(kind) \(String(format: "%.1f", tokensPerSecond)) t/s"
     }
 
-    /// The tier NAME ("priority" / "background"), nothing for the default
-    /// tier. There are exactly three tiers (llama-cm docs/intent/llama-swap-
-    /// tiers.md), and a raw rank like "P10" read as if there were more
-    /// layers, so the name is shown instead. Derived from `tier`, not from
-    /// `priority`: the rank is reserved for a future per-session override and
-    /// says nothing about which tier a row is in. The default tier is the
-    /// common case, so it is the one that renders nothing; an unknown tier
-    /// name renders verbatim (invariant 5).
-    private var tierText: String? {
-        tier.isEmpty || tier == "default" ? nil : tier
+    /// "<tier> P<priority>", e.g. "default P0" / "priority P10" /
+    /// "background P-10" - ALWAYS rendered, including the default tier
+    /// (user ruling 2026-09-25, overriding 40db173's "P0 is noise" and
+    /// "default renders nothing" reasoning: every row shows both its tier
+    /// AND its rank, with no case dropped). Straight from the contract's own
+    /// `tier` and `priority` fields (invariant 3); an unknown tier name
+    /// renders verbatim (invariant 5).
+    private var tierText: String {
+        "\(tier.isEmpty ? "-" : tier) P\(priority)"
     }
 
     /// The row as the menu shows it, purely from contract fields, in the
     /// order the contract documents them:
     ///
     ///   `[<sessionShort>] <alias> · <PHASE[ (reason)]> · <used>/<window> ·
-    ///   [<progress>%] · [<rate kind> <N.n> t/s] · [<tier>]`
+    ///   [<progress>%] · [<rate kind> <N.n> t/s] · <tier> P<priority>`
     ///
-    /// A segment the body did not supply (no progress, no rate yet, default
-    /// tier) is dropped rather than shown empty.
+    /// A segment the body did not supply (no progress, no rate yet) is
+    /// dropped rather than shown empty; the tier/priority segment is never
+    /// dropped.
     ///
     /// A PENALIZED row with `penalty` present takes a dedicated shape instead
-    /// (user-approved format): `[id] alias · PENALIZED (reason strike/
-    /// strikes) · used/window · m:ss`, or `· held` when `remainingSeconds` is
-    /// null (a final-strike hold with no timer). No progress/rate segments -
-    /// a held session carries neither. If `phase == "PENALIZED"` but
-    /// `penalty` is absent (an older/odd server), this falls through to the
-    /// generic path below, which renders "PENALIZED" verbatim rather than
-    /// inventing a reason/strike count it was not given (invariant 5).
+    /// (user-approved format): `[parent > child] alias · PENALIZED (reason
+    /// strike/strikes) · used/window · m:ss · tier P<priority>`, or
+    /// `· held` when `remainingSeconds` is null (a final-strike hold with no
+    /// timer). No progress/rate segments - a held session carries neither.
+    /// If `phase == "PENALIZED"` but `penalty` is absent (an older/odd server),
+    /// this falls through to the generic path below, which renders "PENALIZED"
+    /// verbatim rather than inventing a reason/strike count it was not given
+    /// (invariant 5).
     public var displayLine: String {
-        let bracket = sessionShort.isEmpty ? "-" : sessionShort
+        let bracket: String
+        if let parentSessionShort, !parentSessionShort.isEmpty {
+            bracket = "\(parentSessionShort) > \(sessionShort.isEmpty ? "-" : sessionShort)"
+        } else {
+            bracket = sessionShort.isEmpty ? "-" : sessionShort
+        }
         let idAndAlias = "[\(bracket)] \(alias.isEmpty ? model : alias)"
 
         if let penalty {
             let phaseSegment = "PENALIZED (\(penalty.reason) \(penalty.strike)/\(penalty.strikes))"
             let tokensSegment = "\(CompactFormatter.tokens(context.used))/\(CompactFormatter.tokens(context.window))"
             let holdSegment = penalty.remainingSeconds.map(CompactFormatter.countdown) ?? "held"
-            return [idAndAlias, phaseSegment, tokensSegment, holdSegment].joined(separator: " · ")
+            return [idAndAlias, phaseSegment, tokensSegment, holdSegment, tierText].joined(separator: " · ")
         }
 
         var segments: [String] = [idAndAlias]
@@ -360,7 +388,7 @@ public struct SessionRow: Identifiable, Encodable, Equatable {
         segments.append("\(CompactFormatter.tokens(context.used))/\(CompactFormatter.tokens(context.window))")
         if let progressText { segments.append(progressText) }
         if let rateText { segments.append(rateText) }
-        if let tierText { segments.append(tierText) }
+        segments.append(tierText)
         return segments.joined(separator: " · ")
     }
 

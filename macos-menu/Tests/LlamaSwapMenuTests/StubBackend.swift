@@ -11,6 +11,7 @@ final class StubBackend {
     struct Recorded: Equatable {
         let method: String
         let path: String
+        let headers: [String: String]
     }
 
     /// Decides the reply for a non-SSE request. Returns (status, body).
@@ -125,6 +126,18 @@ final class StubBackend {
             let method = String(parts[0])
             let path = String(parts[1])
 
+            // Parse headers into a dictionary.
+            var headers: [String: String] = [:]
+            for line in lines.dropFirst() {
+                if let colonIdx = line.firstIndex(of: ":") {
+                    let key = String(line[line.startIndex..<colonIdx]).trimmingCharacters(in: .whitespaces)
+                    let val = String(line[line.index(colonIdx, offsetBy: 1)...]).trimmingCharacters(in: .whitespaces)
+                    if !key.isEmpty, !val.isEmpty {
+                        headers[key] = val
+                    }
+                }
+            }
+
             // Drain any declared body before replying so the client's write
             // completes cleanly (a POST with a body must not be half-read).
             let contentLength = lines
@@ -136,13 +149,13 @@ final class StubBackend {
                 return
             }
 
-            self.handle(conn, method: method, path: path)
+            self.handle(conn, method: method, path: path, headers: headers)
         }
     }
 
-    private func handle(_ conn: NWConnection, method: String, path: String) {
+    private func handle(_ conn: NWConnection, method: String, path: String, headers: [String: String]) {
         lock.lock()
-        _recorded.append(Recorded(method: method, path: path))
+        _recorded.append(Recorded(method: method, path: path, headers: headers))
         lock.unlock()
 
         if path == "/api/events" {

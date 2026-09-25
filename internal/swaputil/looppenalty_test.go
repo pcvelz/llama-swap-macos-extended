@@ -258,7 +258,7 @@ func TestLoopTracker_UnpenalizeForgetsHistory(t *testing.T) {
 	lt := newTestLoopTrackerGuard(DefaultLoopGuard(), &clk)
 	feed(lt, "s", 60, 48)
 
-	lt.Unpenalize("s")
+	lt.Unpenalize("s", "test", "")
 	if _, ok := lt.Penalty("s"); ok {
 		t.Fatalf("un-penalize must clear the penalty")
 	}
@@ -273,7 +273,7 @@ func TestLoopTracker_UnpenalizeForgetsHistory(t *testing.T) {
 	if _, ok := lt.Penalty("s"); ok {
 		t.Fatalf("one response after un-penalize must not re-penalize")
 	}
-	lt.Unpenalize("unknown-session") // no-op, must not panic
+	lt.Unpenalize("unknown-session", "test", "") // no-op, must not panic
 }
 
 // A HELD session is exempt from the idle TTL: not sending requests is exactly
@@ -311,8 +311,8 @@ func TestLoopTracker_PenaltyObserverSeesEveryTransition(t *testing.T) {
 	feed(lt, "s", 20, 48) // strike 1, no hold
 	feed(lt, "s", 20, 48) // strike 2 + hold-start
 	clk = clk.Add(901 * time.Second)
-	lt.Held("s")       // expires the hold -> hold-end
-	lt.Unpenalize("s") // -> unpenalize
+	lt.Held("s")                   // expires the hold -> hold-end
+	lt.Unpenalize("s", "test", "") // -> unpenalize
 
 	want := []string{PenaltyEventStrike, PenaltyEventStrike, PenaltyEventHoldStart, PenaltyEventHoldEnd, PenaltyEventUnpenalize}
 	if len(kinds) != len(want) {
@@ -329,7 +329,7 @@ func TestLoopTracker_PenaltyObserverSeesEveryTransition(t *testing.T) {
 func TestLoopTracker_NilTrackerIsInert(t *testing.T) {
 	var lt *LoopTracker
 	lt.Record("s", 48)
-	lt.Unpenalize("s")
+	lt.Unpenalize("s", "test", "")
 	lt.SetPenaltyObserver(func(LoopPenaltyEvent) {})
 	if held, _, _ := lt.Held("s"); held {
 		t.Fatalf("a disabled tracker must never hold anything")

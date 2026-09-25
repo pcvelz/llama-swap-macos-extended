@@ -461,7 +461,11 @@ func (s *Server) logPenaltyEvent(ev swaputil.LoopPenaltyEvent) {
 	case swaputil.PenaltyEventHoldEnd:
 		s.proxylog.Infof("loopguard: %s hold ended (strike %d, timer)", session, ev.Strike)
 	case swaputil.PenaltyEventUnpenalize:
-		s.proxylog.Infof("loopguard: %s un-penalized by operator (was strike %d)", session, ev.Strike)
+		if ev.Source != "" {
+			s.proxylog.Infof("loopguard: %s un-penalized via %s (%s) (was strike %d)", session, ev.Source, ev.UserAgent, ev.Strike)
+		} else {
+			s.proxylog.Infof("loopguard: %s un-penalized via API (%s) (was strike %d)", session, ev.UserAgent, ev.Strike)
+		}
 	}
 	if s.debugHistory != nil {
 		s.debugHistory.penaltyEvent(time.Now(), ev)
@@ -482,7 +486,9 @@ func (s *Server) logPenaltyEvent(ev swaputil.LoopPenaltyEvent) {
 // acting on a prefix could penalize-clear the wrong session.
 func (s *Server) handleAPISessionsUnpenalize(w http.ResponseWriter, r *http.Request) {
 	sessionID := r.PathValue("sessionId")
-	s.inflight.loops.Unpenalize(sessionID)
+	source := r.Header.Get("X-Action-Source")
+	userAgent := r.UserAgent()
+	s.inflight.loops.Unpenalize(sessionID, source, userAgent)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"msg": "session unpenalized", "sessionId": sessionID})
 }
@@ -813,13 +819,30 @@ func (s *Server) handleAPIUnpin(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleAPICancelInflight cancels an active model-dispatched request by its
-// inflight ID. Normal request cleanup removes the row and emits the update.
+// inflight ID. Logs the cancel event with source and caller identity.
 func (s *Server) handleAPICancelInflight(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	if id == "" || !s.inflight.Cancel(id) {
+	source := r.Header.Get("X-Action-Source")
+	userAgent := r.UserAgent()
+	// Resolve the session BEFORE cancelling: the tracker forgets the request
+	// once it is cancelled, so a lookup afterwards reads "(unknown)".
+	session := "(unknown)"
+	if id != "" {
+		if sid := s.inflight.sessionIDOf(id); sid != "" {
+			session = shortOf(sid)
+		}
+	}
+	if id == "" || !s.inflight.CancelWithSource(id, source, userAgent) {
 		swaputil.SendResponse(w, r, http.StatusNotFound, "inflight request not found")
 		return
 	}
+
+	// Same shape as un-penalize: where the action came from and who sent it.
+	via := "API"
+	if source != "" {
+		via = source
+	}
+	s.proxylog.Infof("cancel: %s request %s cancelled via %s (%s)", session, id, via, userAgent)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"msg": "ok"})

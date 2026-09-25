@@ -565,7 +565,10 @@ func (t *inflightTracker) discardQueuedUpdates() {
 	}
 }
 
-func (t *inflightTracker) Cancel(id string) bool {
+// CancelWithSource cancels an inflight request by id. Returns true if the
+// request existed and was cancelled. The old Cancel(id) remains for callers
+// that do not need logging.
+func (t *inflightTracker) CancelWithSource(id, source, userAgent string) bool {
 	t.mu.RLock()
 	req, ok := t.requests[id]
 	t.mu.RUnlock()
@@ -574,6 +577,10 @@ func (t *inflightTracker) Cancel(id string) bool {
 	}
 	req.cancel()
 	return true
+}
+
+func (t *inflightTracker) Cancel(id string) bool {
+	return t.CancelWithSource(id, "", "")
 }
 
 func (t *inflightTracker) Current() swaputil.InFlightRequestsEvent {

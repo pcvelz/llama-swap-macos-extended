@@ -144,6 +144,13 @@ type LoopPenaltyEvent struct {
 	// needs to be actionable rather than just alarming.
 	UniformRun    int
 	TypicalTokens int64
+	// Source describes where an action came from (e.g. "menu-click", the HTTP
+	// User-Agent). Only populated on un-penalize and cancel events. Empty for
+	// mechanical events like strike / hold-start / hold-end.
+	Source string
+	// UserAgent is the HTTP User-Agent of the caller, logged alongside Source
+	// so a log line names who did what (e.g. "llama-swap-menu" vs "curl/7.0").
+	UserAgent string
 }
 
 // PenaltyState is a session's published penalty. Zero value means "no
@@ -538,8 +545,9 @@ func (t *LoopTracker) Penalty(sessionID string) (PenaltyState, bool) {
 // response history - so the session starts clean rather than one uniform
 // response away from its old strike. A no-op for an unknown session; that is
 // deliberate, the endpoint answers 200 either way so a click never has to
-// race the tracker's own TTL.
-func (t *LoopTracker) Unpenalize(sessionID string) {
+// race the tracker's own TTL. The source string (e.g. "menu-click") describes
+// where the action came from; empty means the caller did not provide one.
+func (t *LoopTracker) Unpenalize(sessionID, source, userAgent string) {
 	if t == nil || sessionID == "" {
 		return
 	}
@@ -553,7 +561,7 @@ func (t *LoopTracker) Unpenalize(sessionID string) {
 	delete(t.sessions, sessionID)
 	t.mu.Unlock()
 	t.emit([]LoopPenaltyEvent{{SessionID: sessionID, Kind: PenaltyEventUnpenalize,
-		Reason: PenaltyReasonLoop, Strike: strike}})
+		Reason: PenaltyReasonLoop, Strike: strike, Source: source, UserAgent: userAgent}})
 }
 
 // HeldSessions returns the session ids with an ACTIVE hold, sorted, for the

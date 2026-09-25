@@ -105,21 +105,22 @@ final class PenalizedRowTests: XCTestCase {
 
     func testDisplayLineTimedPenalty() {
         XCTAssertEqual(row(strike: 2, remainingSeconds: 760).displayLine,
-                       "[934159af] ALIAS · PENALIZED (loop 2/3) · 228.1k/262.1k · 12:40")
+                       "[934159af] ALIAS · PENALIZED (loop 2/3) · 228.1k/262.1k · 12:40 · default P0")
     }
 
     func testDisplayLineHeldPenalty() {
         XCTAssertEqual(row(strike: 3, remainingSeconds: nil).displayLine,
-                       "[934159af] ALIAS · PENALIZED (loop 3/3) · 228.1k/262.1k · held")
+                       "[934159af] ALIAS · PENALIZED (loop 3/3) · 228.1k/262.1k · held · default P0")
     }
 
     /// The common PENALIZED shape: a request is still PARKED under park
     /// reason "penalized" while the hold is in effect. The park phrase must
     /// NOT be appended a second time alongside the PENALIZED segment - the
-    /// line is exactly the same as the no-request case.
+    /// line is exactly the same as the no-request case. Every row shows tier
+    /// + rank, including PENALIZED (user ruling).
     func testDisplayLineWithRequestAndParkReasonDoesNotDoubleUpTheReason() {
         XCTAssertEqual(row(strike: 2, remainingSeconds: 760, parkReason: "penalized").displayLine,
-                       "[934159af] ALIAS · PENALIZED (loop 2/3) · 228.1k/262.1k · 12:40")
+                       "[934159af] ALIAS · PENALIZED (loop 2/3) · 228.1k/262.1k · 12:40 · default P0")
     }
 
     /// `phase == "PENALIZED"` without a `penalty` box falls back to the
@@ -131,7 +132,7 @@ final class PenalizedRowTests: XCTestCase {
             priority: 0, phase: "PENALIZED",
             context: ContractContext(used: 0, cached: 0, processed: 0, decoded: 0, promptTotal: 0, window: 262_144),
             rate: ContractRate(kind: nil, tokensPerSecond: nil, windowSeconds: 30))
-        XCTAssertEqual(row.displayLine, "[aaaaaaaa] cq35 · PENALIZED · 0/262.1k")
+        XCTAssertEqual(row.displayLine, "[aaaaaaaa] cq35 · PENALIZED · 0/262.1k · default P0")
     }
 
     /// Strike-1 (looping, not yet PENALIZED) renders exactly as today - no
@@ -145,7 +146,7 @@ final class PenalizedRowTests: XCTestCase {
          "elapsedMs":0,"phaseSinceMs":0,"respTokens":0,"looping":true,"uniformRun":12}
         """)
         let row = SessionRow(contract: entry)
-        XCTAssertEqual(row.displayLine, "[aaaaaaaa] cq35 · DECODE · 0/262.1k")
+        XCTAssertEqual(row.displayLine, "[aaaaaaaa] cq35 · DECODE · 0/262.1k · default P0")
     }
 
     // MARK: - tooltip
@@ -211,11 +212,9 @@ final class PenalizedRowTests: XCTestCase {
                        "clicked row must stop reading PENALIZED at once")
 
         XCTAssertTrue(waitUntil {
-            self.stub.recorded.contains(StubBackend.Recorded(
-                method: "POST", path: "/api/sessions/\(penalized.sessionId)/unpenalize"))
+            self.stub.recorded.contains(where: { $0.path == "/api/sessions/\(penalized.sessionId)/unpenalize" })
         }, "expected POST /api/sessions/<full sessionId>/unpenalize, got \(stub.recorded)")
-        XCTAssertFalse(self.stub.recorded.contains(StubBackend.Recorded(
-            method: "POST", path: "/api/sessions/\(penalized.id)/unpenalize")),
+        XCTAssertFalse(self.stub.recorded.contains(where: { $0.path == "/api/sessions/\(penalized.id)/unpenalize" }),
             "must never POST the request id's path")
     }
 
@@ -244,11 +243,9 @@ final class PenalizedRowTests: XCTestCase {
         client.unpenalize(sessionId: penalized.sessionId)
 
         XCTAssertTrue(waitUntil {
-            self.stub.recorded.contains(StubBackend.Recorded(
-                method: "POST", path: "/api/sessions/934159af-0000-0000-0000-000000000000/unpenalize"))
+            self.stub.recorded.contains(where: { $0.path == "/api/sessions/934159af-0000-0000-0000-000000000000/unpenalize" })
         }, "expected POST to the full sessionId path, got \(stub.recorded)")
-        XCTAssertFalse(self.stub.recorded.contains(StubBackend.Recorded(
-            method: "POST", path: "/api/sessions/req-999/unpenalize")),
+        XCTAssertFalse(self.stub.recorded.contains(where: { $0.path == "/api/sessions/req-999/unpenalize" }),
             "must never POST the request id's path - that endpoint call would silently no-op")
     }
 

@@ -59,8 +59,7 @@ final class GraceFinishClickTests: XCTestCase {
                      "clicked cooldown must clear the row at once, not on the next SSE tick")
 
         XCTAssertTrue(waitUntil {
-            self.stub.recorded.contains(StubBackend.Recorded(
-                method: "POST", path: "/api/swap-grace/finish"))
+            self.stub.recorded.contains(where: { $0.method == "POST" && $0.path == "/api/swap-grace/finish" })
         }, "expected POST /api/swap-grace/finish, got \(stub.recorded)")
     }
 

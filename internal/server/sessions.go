@@ -121,6 +121,12 @@ type sessionEntry struct {
 	ElapsedMs    int64          `json:"elapsedMs"`
 	PhaseSinceMs int64          `json:"phaseSinceMs"`
 	RespTokens   int64          `json:"respTokens"`
+	// ParentSessionId / ParentSessionShort carry the dispatching session's id
+	// from X-Claude-Code-Parent-Session-Id. When present, a renderer can show
+	// which interactive Claude Code session fired a headless dispatch row;
+	// absent on rows that are not dispatched children (direct CLI, curl, etc).
+	ParentSessionId    string `json:"parentSessionId,omitempty"`
+	ParentSessionShort string `json:"parentSessionShort,omitempty"`
 	// Looping / UniformRun expose the loop verdict (swaputil.LoopTracker) for
 	// this session: UniformRun is the trailing run of near-identical output
 	// sizes, Looping whether it cleared the bar. Purely observational - the
@@ -598,6 +604,11 @@ func (b *sessionsBuilder) requestRow(in sessionsInput, r swaputil.InflightReques
 	}
 	row.RespTokens = r.RespTokens
 	row.Context.Window = b.window(in, r.Model)
+
+	if pid := m["parent_session_id"]; pid != "" {
+		row.ParentSessionId = pid
+		row.ParentSessionShort = shortOf(pid)
+	}
 
 	if requestRank(m) != 0 {
 		row.Phase = phaseParked

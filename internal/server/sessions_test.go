@@ -17,6 +17,7 @@ import (
 	"github.com/mostlygeek/llama-swap/internal/membrake"
 	"github.com/mostlygeek/llama-swap/internal/process"
 	"github.com/mostlygeek/llama-swap/internal/swaputil"
+	"github.com/stretchr/testify/require"
 )
 
 // The session-state contract (llama-swap.sessions/v1) is owned by llama-cm:
@@ -342,6 +343,103 @@ func TestSessions_PollerNeverTouchesRouter(t *testing.T) {
 	if childHits.Load() != 1 || routerCalls.Load() != 0 {
 		t.Fatalf("GET /api/sessions proxied: child=%d router=%d", childHits.Load(), routerCalls.Load())
 	}
+}
+
+// Parent session id carried by X-Claude-Code-Parent-Session-Id surfaces on the
+// row: parentSessionId is the full id, parentSessionShort the first 8 chars.
+// Absent when the header was not set (no change to existing rows).
+func TestSessions_ParentSessionId(t *testing.T) {
+	now := time.Date(2026, 9, 18, 12, 0, 0, 0, time.UTC)
+	running := map[string]process.ProcessState{sessModel: process.StateReady}
+
+	t.Run("dispatched request carries parent", func(t *testing.T) {
+		b := newSessionsBuilder(sessionsTestConfig())
+		req := swaputil.InflightRequestEntry{
+			ID: "r-dispatch", Model: sessModel, Timestamp: now,
+			Metadata: map[string]string{
+				"session_id":        "2679c154-0000-0000-0000-000000000001",
+				"parent_session_id": "3f9cb5bb-aaaa-bbbb-cccc-dddddddddddd",
+				"park_reason":       "kv",
+				"kv_parked":         "1",
+				"tier":              "default",
+			},
+		}
+		got := b.build(sessionsInput{Now: now, Running: running, Requests: []swaputil.InflightRequestEntry{req}, MemoryBrake: enabledBrake()})
+		assertSessionsInvariants(t, got)
+		require.Len(t, got.Sessions, 1)
+		s := got.Sessions[0]
+		if s.ParentSessionId != "3f9cb5bb-aaaa-bbbb-cccc-dddddddddddd" {
+			t.Errorf("ParentSessionId = %q, want %q", s.ParentSessionId, "3f9cb5bb-aaaa-bbbb-cccc-dddddddddddd")
+		}
+		if s.ParentSessionShort != "3f9cb5bb" {
+			t.Errorf("ParentSessionShort = %q, want %q", s.ParentSessionShort, "3f9cb5bb")
+		}
+	})
+
+	t.Run("no parent header leaves fields empty", func(t *testing.T) {
+		b := newSessionsBuilder(sessionsTestConfig())
+		req := swaputil.InflightRequestEntry{
+			ID: "r-direct", Model: sessModel, Timestamp: now,
+			Metadata: map[string]string{
+				"session_id": "abcdef01-0000-0000-0000-000000000002",
+				"tier":       "default",
+			},
+		}
+		got := b.build(sessionsInput{Now: now, Running: running, Requests: []swaputil.InflightRequestEntry{req}, MemoryBrake: enabledBrake()})
+		assertSessionsInvariants(t, got)
+		require.Len(t, got.Sessions, 1)
+		s := got.Sessions[0]
+		if s.ParentSessionId != "" {
+			t.Errorf("ParentSessionId = %q, want empty", s.ParentSessionId)
+		}
+		if s.ParentSessionShort != "" {
+			t.Errorf("ParentSessionShort = %q, want empty", s.ParentSessionShort)
+		}
+	})
+
+	t.Run("short parent id (8 hex)", func(t *testing.T) {
+		b := newSessionsBuilder(sessionsTestConfig())
+		req := swaputil.InflightRequestEntry{
+			ID: "r-short-parent", Model: sessModel, Timestamp: now,
+			Metadata: map[string]string{
+				"session_id":        "cccccccc-0000-0000-0000-000000000003",
+				"parent_session_id": "abcd1234",
+				"tier":              "default",
+			},
+		}
+		got := b.build(sessionsInput{Now: now, Running: running, Requests: []swaputil.InflightRequestEntry{req}, MemoryBrake: enabledBrake()})
+		assertSessionsInvariants(t, got)
+		require.Len(t, got.Sessions, 1)
+		s := got.Sessions[0]
+		if s.ParentSessionId != "abcd1234" {
+			t.Errorf("ParentSessionId = %q, want %q", s.ParentSessionId, "abcd1234")
+		}
+		if s.ParentSessionShort != "abcd1234" {
+			t.Errorf("ParentSessionShort = %q, want %q", s.ParentSessionShort, "abcd1234")
+		}
+	})
+
+	t.Run("short parent from full uuid uses first 8", func(t *testing.T) {
+		b := newSessionsBuilder(sessionsTestConfig())
+		req := swaputil.InflightRequestEntry{
+			ID: "r-full-parent", Model: sessModel, Timestamp: now,
+			Metadata: map[string]string{
+				"session_id":        "dddddddd-0000-0000-0000-000000000004",
+				"parent_session_id": "ef012345-aaaa-bbbb-cccc-dddddddddddd",
+				"tier":              "default",
+			},
+		}
+		got := b.build(sessionsInput{Now: now, Running: running, Requests: []swaputil.InflightRequestEntry{req}, MemoryBrake: enabledBrake()})
+		assertSessionsInvariants(t, got)
+		require.Len(t, got.Sessions, 1)
+		s := got.Sessions[0]
+		if s.ParentSessionId != "ef012345-aaaa-bbbb-cccc-dddddddddddd" {
+			t.Errorf("ParentSessionId = %q, want %q", s.ParentSessionId, "ef012345-aaaa-bbbb-cccc-dddddddddddd")
+		}
+		if s.ParentSessionShort != "ef012345" {
+			t.Errorf("ParentSessionShort = %q, want %q", s.ParentSessionShort, "ef012345")
+		}
+	})
 }
 
 // The "sessions" push fires on change and at most once per second.

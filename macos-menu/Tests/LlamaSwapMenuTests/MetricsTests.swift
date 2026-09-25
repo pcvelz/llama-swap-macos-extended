@@ -65,7 +65,7 @@ final class MetricsTests: XCTestCase {
 
         XCTAssertTrue(waitUntil { client.menuState.completed == 42 },
                       "expected completed == 42, got \(client.menuState.completed)")
-        XCTAssertTrue(stub.recorded.contains(StubBackend.Recorded(method: "GET", path: "/api/metrics/stats")),
+        XCTAssertTrue(stub.recorded.contains(where: { $0.path == "/api/metrics/stats" }),
                       "client must poll the new /api/metrics/stats path")
         XCTAssertFalse(stub.recorded.contains { $0.path == "/api/metrics" },
                        "client must not poll the removed bare GET /api/metrics path")

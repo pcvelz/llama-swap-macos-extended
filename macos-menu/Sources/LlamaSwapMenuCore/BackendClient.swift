@@ -248,6 +248,7 @@ public final class BackendClient: ObservableObject {
 
         var request = URLRequest(url: baseURL.appendingPathComponent("/api/inflight/\(id)/cancel"))
         request.httpMethod = "POST"
+        request.setValue("menu-click", forHTTPHeaderField: "X-Action-Source")
         URLSession.shared.dataTask(with: request) { [weak self] _, response, error in
             let status = (response as? HTTPURLResponse)?.statusCode ?? 0
             let failed = error != nil || status < 200 || status >= 300
@@ -292,6 +293,7 @@ public final class BackendClient: ObservableObject {
 
         var request = URLRequest(url: baseURL.appendingPathComponent("/api/sessions/\(sessionId)/unpenalize"))
         request.httpMethod = "POST"
+        request.setValue("menu-click", forHTTPHeaderField: "X-Action-Source")
         URLSession.shared.dataTask(with: request) { [weak self] _, response, error in
             let status = (response as? HTTPURLResponse)?.statusCode ?? 0
             let failed = error != nil || status < 200 || status >= 300

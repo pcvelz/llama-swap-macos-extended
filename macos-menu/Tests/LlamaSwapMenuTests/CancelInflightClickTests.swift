@@ -67,8 +67,7 @@ final class CancelInflightClickTests: XCTestCase {
                       "the click evicts only its own row")
 
         XCTAssertTrue(waitUntil {
-            self.stub.recorded.contains(StubBackend.Recorded(
-                method: "POST", path: "/api/inflight/41/cancel"))
+            self.stub.recorded.contains(where: { $0.method == "POST" && $0.path == "/api/inflight/41/cancel" })
         }, "expected POST /api/inflight/41/cancel, got \(stub.recorded)")
     }
 

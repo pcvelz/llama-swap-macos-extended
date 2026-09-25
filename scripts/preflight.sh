@@ -269,6 +269,28 @@ if touched '^macos-menu/'; then
         # Not a CI step, but the helper has a test target and it is cheap.
         run "swift test (macos-menu)" swift test --package-path macos-menu
     fi
+
+    # Test-weakening guard: the same script the llama-cm sibling checkout
+    # runs from its own pre-commit (llama/tests/lib/test-weakening-guard.sh),
+    # pointed at THIS repo's macos-menu/Tests/*.swift via TWG_TEST_PATH_RE.
+    # See that script's own header for what it blocks (a deleted test file,
+    # net-removed assertions, and any line inside an "@user-gated" block -
+    # incl. 40db173's rewrite-in-place shape, which a net-count check alone
+    # misses). llama-cm is a sibling checkout, not a dependency of this repo,
+    # so this lane skips quietly when it is not found (e.g. CI, or a clone
+    # without it) rather than failing the build over a missing neighbour.
+    # LLAMA_CM_ROOT overrides the default sibling-directory guess.
+    _twg="${LLAMA_CM_ROOT:-$(dirname "$REPO")/llama-cm}/llama/tests/lib/test-weakening-guard.sh"
+    if [[ -r "$_twg" ]]; then
+        if TWG_TEST_PATH_RE='^macos-menu/Tests/.*\.swift$' bash "$_twg" "$REPO" >/tmp/preflight-twg.log 2>&1; then
+            pass "test-weakening guard (macos-menu/Tests)"
+        else
+            fail "test-weakening guard (macos-menu/Tests)"
+            sed 's/^/        /' /tmp/preflight-twg.log
+        fi
+    else
+        skip "test-weakening guard — llama-cm sibling checkout not found ($_twg)"
+    fi
 fi
 
 # ---------------------------------------------------------------------------

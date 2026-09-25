@@ -14,10 +14,12 @@ import XCTest
 ///   - the waiting counter comes from body.queue, and is naturally in parity
 ///     with the PARKED rows because both come from the same decode
 ///     (testWaitingCounterParityFromTheSameSnapshot).
-///   - the tier renders by NAME (priority / background), default omitted
-///     (testTierRendering); PARKED rows keep the server's queue order and
-///     no separate queue-order line exists (testParkedRowsKeepServerOrder,
-///     testMenuHasNoQueueSummaryLine).
+///   - EVERY row shows its tier NAME and its rank, including the default
+///     tier ("default P0" / "priority P10" / "background P-10") - user
+///     ruling 2026-09-25, restoring what 40db173 removed (testTierRendering);
+///     PARKED rows keep the server's queue order (testParkedRowsKeepServerOrder,
+///     testParkedRowsRenderInServerPickOrder) and the "Queue: idle" /
+///     numbered summary line is back (testQueueSummaryLine).
 ///   - the empty box decodes to zero rows and zero waiting
 ///     (testEmptyBoxDecodesToNoRowsAndNoWaiting).
 ///   - unknown fields, an unknown phase and an unknown parkReason never
@@ -57,7 +59,7 @@ final class SessionStateContractTests: XCTestCase {
         XCTAssertEqual(row.context.used, row.context.cached + row.context.processed + row.context.decoded)
 
         XCTAssertEqual(row.displayLine,
-                       "[69699f8b] cq27 · PREFILL · 92.2k/262.1k · 90.0% · prefill 50.7 t/s",
+                       "[69699f8b] cq27 · PREFILL · 92.2k/262.1k · 90.0% · prefill 50.7 t/s · default P0",
                        "every segment must come straight from the body: k-units, one-decimal "
                        + "percent and rate are formatting, not derivation")
     }
@@ -69,15 +71,15 @@ final class SessionStateContractTests: XCTestCase {
 
         let parked = try XCTUnwrap(rows.first { $0.phase == "PARKED" })
         XCTAssertEqual(parked.parkReason, "kv")
-        XCTAssertEqual(parked.displayLine, "[a1b2c3d4] cq27 · PARKED (kv pool) · 0/262.1k · priority")
+        XCTAssertEqual(parked.displayLine, "[a1b2c3d4] cq27 · PARKED (kv pool) · 0/262.1k · priority P10")
 
         let decode = try XCTUnwrap(rows.first { $0.phase == "DECODE" })
-        XCTAssertEqual(decode.displayLine, "[69699f8b] cq27 · DECODE · 102.6k/262.1k · decode 7.1 t/s")
+        XCTAssertEqual(decode.displayLine, "[69699f8b] cq27 · DECODE · 102.6k/262.1k · decode 7.1 t/s · default P0")
 
         let hot = try XCTUnwrap(rows.first { $0.phase == "HOT" })
         // HOT carries no rate and no progress: neither segment appears, and
         // nothing here invents one.
-        XCTAssertEqual(hot.displayLine, "[0f0e0d0c] cq27 · HOT · 31.8k/262.1k")
+        XCTAssertEqual(hot.displayLine, "[0f0e0d0c] cq27 · HOT · 31.8k/262.1k · default P0")
     }
 
     // MARK: - the waiting counter comes from body.queue
@@ -110,41 +112,38 @@ final class SessionStateContractTests: XCTestCase {
         return SessionRow(contract: try JSONDecoder().decode(ContractSession.self, from: json))
     }
 
+    // @user-gated 2026-09-25: user ruling - every row shows tier + rank incl. default, and the queue summary line stays. Removed once by 40db173; do not change without the user.
     func testTierRendering() throws {
         let snapshot = try decode("decode-parked-hot")
         let rows = snapshot.sessions.map(SessionRow.init(contract:))
 
-        // There are exactly three tiers; a raw rank like "P10" reads as if
-        // there were more layers, so the tier NAME renders instead.
+        // Every row shows BOTH the tier name and its rank, including the
+        // default tier - a "<tier> P<priority>" segment is never dropped.
         let priorityTier = try XCTUnwrap(rows.first { $0.phase == "PARKED" })
         XCTAssertEqual(priorityTier.tier, "priority")
-        XCTAssertTrue(priorityTier.displayLine.hasSuffix(" · priority"),
-                      "tier name must render, got '\(priorityTier.displayLine)'")
-        XCTAssertNil(priorityTier.displayLine.range(of: #"\bP-?\d+\b"#, options: .regularExpression),
-                     "no P<rank> token may render, got '\(priorityTier.displayLine)'")
+        XCTAssertEqual(priorityTier.priority, 10)
+        XCTAssertTrue(priorityTier.displayLine.hasSuffix(" · priority P10"),
+                      "tier + rank must render, got '\(priorityTier.displayLine)'")
 
-        // The default tier is the common case: nothing rendered for it.
+        // The default tier renders too: "default P0", never omitted.
         let defaultTier = try XCTUnwrap(rows.first { $0.phase == "DECODE" })
-        XCTAssertFalse(defaultTier.displayLine.contains("default"))
-        XCTAssertFalse(defaultTier.displayLine.contains("P0"))
+        XCTAssertEqual(defaultTier.tier, "default")
+        XCTAssertEqual(defaultTier.priority, 0)
+        XCTAssertTrue(defaultTier.displayLine.hasSuffix(" · default P0"),
+                      "default tier must render its own row too, got '\(defaultTier.displayLine)'")
 
         let background = try row(tier: "background", priority: -10, phase: "IDLE")
-        XCTAssertTrue(background.displayLine.hasSuffix(" · background"),
+        XCTAssertTrue(background.displayLine.hasSuffix(" · background P-10"),
                       "got '\(background.displayLine)'")
-        XCTAssertNil(background.displayLine.range(of: #"\bP-?\d+\b"#, options: .regularExpression),
-                     "no P-10 token may render, got '\(background.displayLine)'")
     }
 
-    /// The tier field decides, not the number: a default-tier row with an
-    /// unexpected nonzero rank prints no rank, and an unknown tier name
-    /// renders verbatim (invariant 5).
-    func testTierNameIsDerivedFromTierNotPriority() throws {
-        let oddRank = try row(tier: "default", priority: 10)
-        XCTAssertFalse(oddRank.displayLine.contains("P10"))
-        XCTAssertFalse(oddRank.displayLine.contains("priority"),
-                       "default tier must not render as priority just because rank is 10")
+    /// @user-gated 2026-09-25: user ruling - every row shows tier + rank incl. default, and the queue summary line stays. Removed once by 40db173; do not change without the user.
+    /// An unknown tier name still renders verbatim, with its own priority
+    /// (invariant 5) - the segment is always "<tier> P<priority>" straight
+    /// from the contract fields, never derived or filtered.
+    func testUnknownTierRendersVerbatimWithItsRank() throws {
         let unknown = try row(tier: "batch", priority: -5)
-        XCTAssertTrue(unknown.displayLine.hasSuffix(" · batch"), "got '\(unknown.displayLine)'")
+        XCTAssertTrue(unknown.displayLine.hasSuffix(" · batch P-5"), "got '\(unknown.displayLine)'")
     }
 
     // MARK: - queue order is the row order
@@ -212,24 +211,43 @@ final class SessionStateContractTests: XCTestCase {
                        "higher tiers on top, background last")
         XCTAssertEqual(shown.first?.sessionShort, "zzzzzzzz", "top row is the next request a slot takes")
         XCTAssertEqual(shown.map(\.displayLine), [
-            "[zzzzzzzz] cq35 · PARKED (slots full) · 0/262.1k · priority",
-            "[yyyyyyyy] cq27 · PARKED (slots full) · 0/262.1k",
-            "[xxxxxxxx] cq35 · PARKED (slots full) · 0/262.1k",
-            "[bbbbbbbb] cq27 · PARKED (slots full) · 0/262.1k · background",
-            "[aaaaaaaa] cq35 · PARKED (slots full) · 0/262.1k · background",
+            "[zzzzzzzz] cq35 · PARKED (slots full) · 0/262.1k · priority P10",
+            "[yyyyyyyy] cq27 · PARKED (slots full) · 0/262.1k · default P0",
+            "[xxxxxxxx] cq35 · PARKED (slots full) · 0/262.1k · default P0",
+            "[bbbbbbbb] cq27 · PARKED (slots full) · 0/262.1k · background P-10",
+            "[aaaaaaaa] cq35 · PARKED (slots full) · 0/262.1k · background P-10",
         ])
     }
 
-    /// MenuView is SwiftUI and cannot be rendered in a unit test, so this is
-    /// a source guard: the view must not build a queue-order summary line.
-    func testMenuHasNoQueueSummaryLine() throws {
+    // @user-gated 2026-09-25: user ruling - every row shows tier + rank incl. default, and the queue summary line stays. Removed once by 40db173; do not change without the user.
+    /// "Queue: idle" when nothing is parked, else the parked rows in server
+    /// order as "1. <tier>/<alias>, 2. ...". Restored after 40db173 removed
+    /// it; MenuView must actually render it too (checked via source guard,
+    /// SwiftUI views cannot be rendered in a unit test).
+    func testQueueSummaryLine() throws {
+        XCTAssertEqual(MenuState.queueSummary([]), "Queue: idle")
+
+        let first = try row(tier: "priority", priority: 10, alias: "cq35", short: "aaaaaaaa")
+        let second = try row(tier: "background", priority: -10, alias: "cq27", short: "bbbbbbbb")
+        XCTAssertEqual(MenuState.queueSummary([first, second]), "1. priority/cq35, 2. background/cq27")
+
         let dir = URL(fileURLWithPath: String(#filePath))
             .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
         let view = try String(contentsOf: dir.appendingPathComponent("Sources/LlamaSwapMenuCore/MenuView.swift"))
-        let state = try String(contentsOf: dir.appendingPathComponent("Sources/LlamaSwapMenuCore/MenuState.swift"))
-        XCTAssertFalse(view.contains("queueSummary"), "MenuView must not render a queue-order line")
-        XCTAssertFalse(state.contains("queueSummary"), "queueSummary must be removed")
-        XCTAssertFalse(view.contains("Queue: idle"), "no dangling idle line")
+        XCTAssertTrue(view.contains("MenuState.queueSummary(state.sessionRows)"),
+                     "MenuView must render the queue-order summary line")
+    }
+
+    // @user-gated: user ruling - the queue summary line lists exactly the requests that wait for a slot, default tier included
+    /// The summary is the WAIT list: one parked default request reads as that
+    /// one entry, and a request that is running (not PARKED) never appears in
+    /// it, even when it sits in the same row list.
+    func testQueueSummaryListsOnlyWaitingRequests() throws {
+        let waiting = try row(tier: "default", priority: 0, alias: "cq35", short: "cccccccc")
+        XCTAssertEqual(MenuState.queueSummary([waiting]), "1. default/cq35")
+
+        let running = try row(tier: "priority", priority: 10, alias: "cq27", short: "dddddddd", phase: "DECODE")
+        XCTAssertEqual(MenuState.queueSummary([running, waiting]), "1. default/cq35")
     }
 
     // MARK: - empty box
