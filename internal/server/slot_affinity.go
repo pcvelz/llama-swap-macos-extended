@@ -52,9 +52,12 @@ import (
 //     activity entry shows what was injected.
 //
 // Policies, all deliberate:
-//   - Busy slot: always inject the learned slot. llama.cpp queues the request
-//     on a busy slot; no /slots probe per request (an extra round trip and a
-//     race for nothing).
+//   - Busy slot: the id_slot injected here is the lane's PREFERENCE only.
+//     The router rebinds every granted request to a slot no other granted
+//     request holds (internal/router/slotbind.go) and the lane follows via
+//     swaputil.SlotRebound. Sending a granted request to a busy slot made
+//     llama.cpp queue it while the other slot idled, and the cap counted it
+//     as a holder (llama-cm incident 2026-09-25 phantom holder).
 //   - Client-supplied id_slot: OVERRIDDEN once a slot has been learned.
 //     Behind a proxy the client cannot know the child's slot layout, so a
 //     client value is at best stale. Before anything is learned the client's
@@ -694,7 +697,15 @@ func CreateSlotAffinityMiddleware(store *slotAffinityStore, cfg config.Config) c
 			}
 			data.Metadata[slotAffinityMetadataKey] = strconv.Itoa(slot)
 			data.Body = body
-			*r = *r.WithContext(swaputil.SetContext(r.Context(), data))
+			ctx := swaputil.SetContext(r.Context(), data)
+			if sessionID != "" {
+				// The router binds the GRANTED request to a slot of its own
+				// (internal/router/slotbind.go); when that is not this lane's
+				// slot, the lane follows it to where its KV cache now is.
+				lane := sessionID
+				ctx = swaputil.WithSlotRebound(ctx, func(bound int) { store.learn(modelID, lane, bound) })
+			}
+			*r = *r.WithContext(ctx)
 			// The activity entry gets this from the context at serve-done;
 			// the LIVE entry (/api/events, what the menu joins /slots on)
 			// was published before this middleware ran and only learns it

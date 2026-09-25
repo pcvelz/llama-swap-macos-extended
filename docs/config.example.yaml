@@ -274,6 +274,31 @@ slotStall:
   enabled: true
   timeoutSeconds: 180
 
+# prefillStall: reclaim a serving slot whose UPSTREAM PREFILL has stopped
+# moving before the first token - the window slotStall leaves out.
+# - optional, default: enabled, 600 second budget, 120 second restart backstop
+# - why slotStall cannot see it: llama-server sends an SSE comment ping (":")
+#   every 30s from the moment a task launches, so a stuck prefill looks like a
+#   live byte stream to any byte counter
+# - THE SIGNAL IS THE UPSTREAM'S OWN COUNTER: llama-server /slots
+#   n_prompt_tokens_processed for the same slot and task, exactly flat across
+#   successful polls a full budget apart. Never a rate: a prefill that advances
+#   at all (a slow 250k-token prefill included) is never cut. A /slots poll that
+#   fails or times out is no evidence either way.
+# - who is cut: the model's requests that have produced no token and were
+#   granted before the counter went flat. While another slot of the model is
+#   still advancing a prefill the cut waits, since a candidate could be its owner
+# - on detection: the same path as slotStall - an SSE error event, the request
+#   cancelled (closing the upstream connection, which makes llama-server cancel
+#   the task), and one greppable line:
+#     prefill-stalled: reclaimed slot model=<id> after=<duration>
+# - restartAfterSeconds: if the same task is still flat that long after the
+#   cut, the child is unloaded and reloads on the next request. 0 disables it
+prefillStall:
+  enabled: true
+  timeoutSeconds: 600
+  restartAfterSeconds: 120
+
 # globalConcurrencyLimit: caps the number of inference requests served at once
 # across all models combined
 # - optional, default: 0 (no limit)

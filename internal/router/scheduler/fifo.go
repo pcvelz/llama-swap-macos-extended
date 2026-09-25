@@ -37,13 +37,17 @@ var largePrefillThreshold = 8192
 
 // grantedReq is one currently-granted (in-flight) request's tier bookkeeping,
 // tracked alongside FIFO.inFlight so the preemption branch can find victims
-// for an arrival that cannot be granted because of in-flight work. Order
-// within a model's slice carries no meaning; entries are removed on any
-// OnServeDone for that model, not necessarily the one that produced them —
-// exactly mirroring the existing inFlight counter's per-model granularity.
+// for an arrival that cannot be granted because of in-flight work. Entries
+// are in grant order. OnServeDone removes the entry of the request that
+// finished (matched on id = HandlerReq.Preempted, echoed back as
+// ServeDoneEvent.Holder). Removing "any one" entry instead left a finished
+// request's stale handle as a victim and the running one unpreemptible
+// (llama-cm incident 2026-09-25 phantom holder). A nil id (bare test
+// harnesses) falls back to removing the last entry.
 type grantedReq struct {
 	tier    swaputil.Tier
 	preempt func()
+	id      *atomic.Bool
 }
 
 // activeSwap tracks one in-flight swap and the callers waiting on it.
@@ -572,18 +576,22 @@ func (s *FIFO) OnServeDone(ev ServeDoneEvent) {
 	if ev.StatusRead {
 		return
 	}
-	s.inFlight[ev.ModelID]--
-	// Drop one granted-tracking entry for this model, mirroring the inFlight
-	// decrement above. Which specific entry is immaterial — only the count of
-	// currently-granted requests (and their tiers, for future preemption
-	// decisions) matters, not which physical request this ServeDoneEvent
-	// belongs to.
-	if g := s.granted[ev.ModelID]; len(g) > 0 {
-		s.granted[ev.ModelID] = g[:len(g)-1]
-		if len(s.granted[ev.ModelID]) == 0 {
-			delete(s.granted, ev.ModelID)
+	if ev.CapReleaseOnly {
+		// A phantom holder (router slot table): still served, but it holds
+		// no upstream slot. Give its cap place to whoever waits; it stays a
+		// granted entry (preemptable) until its real completion, which then
+		// carries CapReleased and does not decrement again.
+		if s.inFlight[ev.ModelID] > 0 {
+			s.inFlight[ev.ModelID]--
 		}
+		s.publishCapacity()
+		s.drainQueue()
+		return
 	}
+	if !ev.CapReleased {
+		s.inFlight[ev.ModelID]--
+	}
+	s.dropGranted(ev.ModelID, ev.Holder)
 	wentIdle := s.inFlight[ev.ModelID] <= 0
 	if wentIdle {
 		delete(s.inFlight, ev.ModelID)
@@ -977,7 +985,7 @@ func (s *FIFO) grantHandler(req HandlerReq, modelID string) {
 		// against a bare fakeEffects) — harmless to skip tracking those; they
 		// simply can never be preemption victims.
 		if req.Preempt != nil {
-			s.granted[modelID] = append(s.granted[modelID], &grantedReq{tier: req.Tier, preempt: req.Preempt})
+			s.granted[modelID] = append(s.granted[modelID], &grantedReq{tier: req.Tier, preempt: req.Preempt, id: req.Preempted})
 		}
 		// lastServedTier records the tier of the most recently granted request
 		// for this model. It powers the rank-aware grace-break rule: the cooldown
@@ -1075,6 +1083,32 @@ func (s *FIFO) limit(modelID string) int {
 // 2026-09-01 follow-up). The swap path (a different model must be evicted)
 // keeps 0: the swap cannot start until that model's in-flight count is zero,
 // so every holder has to go.
+// dropGranted removes the finished request's granted entry (see grantedReq).
+func (s *FIFO) dropGranted(model string, id *atomic.Bool) {
+	g := s.granted[model]
+	if len(g) == 0 {
+		return
+	}
+	idx := len(g) - 1
+	if id != nil {
+		idx = -1
+		for i, e := range g {
+			if e.id == id {
+				idx = i
+				break
+			}
+		}
+		if idx < 0 {
+			// Never tracked (granted without a preempt handle): nothing to drop.
+			return
+		}
+	}
+	s.granted[model] = append(g[:idx:idx], g[idx+1:]...)
+	if len(s.granted[model]) == 0 {
+		delete(s.granted, model)
+	}
+}
+
 func (s *FIFO) tryPreempt(req HandlerReq, evict []string, limit int) bool {
 	booted := 0
 	for _, m := range evict {

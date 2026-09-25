@@ -268,4 +268,18 @@ type ServeDoneEvent struct {
 	// at grant time, echoed back so the scheduler can release exactly what it
 	// reserved. 0 when KV admission wasn't in play for this request.
 	EstimatedTokens int
+	// Holder identifies WHICH granted request this event is about: the same
+	// pointer as that request's HandlerReq.Preempted. The scheduler drops
+	// exactly that request's preemption entry, so a finished request never
+	// leaves its stale handle behind as a "victim" while the still-running
+	// one becomes unpreemptible (llama-cm incident 2026-09-25 phantom
+	// holder). nil (bare test harnesses) falls back to dropping any entry.
+	Holder *atomic.Bool
+	// CapReleaseOnly: the request is still being served but no longer
+	// occupies an upstream slot (the router's slot table found it a phantom:
+	// bound to a slot the upstream has shown idle for slotPhantomAfter). Only
+	// its concurrency-cap place is given back; its final ServeDoneEvent then
+	// carries CapReleased so the place is not given back twice.
+	CapReleaseOnly bool
+	CapReleased    bool
 }

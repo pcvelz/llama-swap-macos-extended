@@ -77,6 +77,19 @@ package router
 // built on polling those endpoints fails exactly when it is needed. That is why
 // this guard reads a counter the proxy already owns in-process and never polls
 // the child.
+//
+// CORRECTION (2026-09-25, llama-cm incident
+// 2026-09-25-prefill-frozen-slot-never-reclaimed-phantom-holder-parks-free-slot):
+// "bytes only flow when the child produces tokens" is FALSE for current
+// llama-server. From the moment a task launches it sends an SSE comment
+// (":\n\n") every sse_ping_interval (default 30s) while it waits for tokens,
+// in prefill and mid-decode alike. Those are body bytes here, so neither this
+// verdict nor zero-output-budget can see a task that stopped on the upstream
+// side: the byte counter never stays flat for more than 30s. The pre-first-
+// token window is now owned by prefillstall.go, which reads the upstream's
+// own prefill counter and treats a failed /slots poll as no evidence, which is
+// the answer to the trap above. The mid-decode gap (a task that stops after
+// its first token) is still masked by the same pings and is NOT covered.
 
 import (
 	"context"
@@ -281,6 +294,19 @@ func (g *peerStallGuard) reclaimStalledSlot(flat time.Duration, w http.ResponseW
 func (g *peerStallGuard) reclaimZeroOutputSlot(zero time.Duration, w http.ResponseWriter) {
 	g.fire("zero-output-budget", zero, w,
 		"no output was produced within the budget")
+}
+
+// reclaimPrefillStalledSlot logs the prefill-stalled verdict once and cancels
+// the request: its upstream slot's own prefill counter
+// (llama-server /slots n_prompt_tokens_processed) stayed flat for the whole
+// budget while the request had produced no token. See prefillstall.go. Its own
+// verdict name because "the prompt stopped being processed" is a different
+// fact for an operator than "never started" (zero-output-budget) or "went flat
+// mid-stream" (slot-stalled); the cancel mechanics are identical, and closing
+// the upstream connection is what makes llama-server cancel the task.
+func (g *peerStallGuard) reclaimPrefillStalledSlot(flat time.Duration, w http.ResponseWriter) {
+	g.fire("prefill-stalled", flat, w,
+		"the upstream prefill counter did not move for the whole budget")
 }
 
 // fire is the single reclaim path every verdict goes through: latch, log one

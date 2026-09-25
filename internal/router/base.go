@@ -104,6 +104,11 @@ type baseRouter struct {
 	procCtx    context.Context
 	procCancel context.CancelFunc
 
+	// prefillWatches holds one prefill-stall watcher per model, created on the
+	// first grant (see prefillWatchFor and prefillstall.go).
+	prefillMu      sync.Mutex
+	prefillWatches map[string]*prefillWatch
+
 	handlerCh   chan scheduler.HandlerReq
 	cancelCh    chan scheduler.HandlerReq
 	shutdownCh  chan shutdownReq
@@ -135,6 +140,12 @@ type baseRouter struct {
 	// fires). 0 disables the ticker entirely — zero overhead when no model has a
 	// swap-grace configured.
 	graceTick time.Duration
+
+	// slots binds each granted request to an upstream slot of its own
+	// (slotbind.go). slotPhantomAfter is how long a bound slot may read idle
+	// upstream before its holder counts as a phantom.
+	slots            *slotTable
+	slotPhantomAfter time.Duration
 }
 
 func newBaseRouter(
@@ -163,6 +174,9 @@ func newBaseRouter(
 		serveDoneCh: make(chan scheduler.ServeDoneEvent),
 		runDone:     make(chan struct{}),
 		pinned:      make(map[string]time.Time),
+
+		slots:            newSlotTable(),
+		slotPhantomAfter: slotPhantomAfterDefault,
 	}
 
 	// Arm the run-loop ticker only when at least one model has a swap-grace
@@ -520,6 +534,12 @@ func (b *baseRouter) StopProcesses(timeout time.Duration, ids []string) {
 // see preemptResponseWriter's type doc for the v2 replay behavior it enables.
 func (b *baseRouter) trackedServe(modelID string, p process.Process, estimatedTokens int, statusRead bool, preempted *atomic.Bool, replayWanted *atomic.Bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		// capReleased: the slot table declared this request a phantom and
+		// already gave its cap place back (see slotbind.go).
+		var capReleased atomic.Bool
+		// orphan: this request was cut while the upstream kept its slot
+		// busy; its cap place is held until the slot reads idle.
+		var orphan <-chan struct{}
 		defer func() {
 			// Read the loop verdict HERE, not at grant time: it is a property
 			// of the session's history as of this completion (see
@@ -530,11 +550,26 @@ func (b *baseRouter) trackedServe(modelID string, p process.Process, estimatedTo
 			if verdict, ok := swaputil.LoopVerdictFromContext(r.Context()); ok && verdict != nil {
 				looping = verdict()
 			}
-			select {
-			case b.serveDoneCh <- scheduler.ServeDoneEvent{ModelID: modelID, EstimatedTokens: estimatedTokens, StatusRead: statusRead, Looping: looping}:
-			case <-b.shutdownCtx.Done():
+			ev := scheduler.ServeDoneEvent{ModelID: modelID, EstimatedTokens: estimatedTokens, StatusRead: statusRead, Looping: looping,
+				Holder: preempted, CapReleased: capReleased.Load()}
+			if orphan == nil {
+				b.sendServeDone(ev)
+				return
 			}
+			go b.sendServeDoneWhenSlotIdle(ev, orphan)
 		}()
+		if !statusRead && !isSlotFreeRequest(r) {
+			release := func() {
+				if capReleased.CompareAndSwap(false, true) {
+					b.logger.Warnf("%s: phantom holder on %s: its upstream slot read idle for %s while it was still being served; cap place released", b.name, modelID, b.slotPhantomAfter)
+					b.sendServeDone(scheduler.ServeDoneEvent{ModelID: modelID, Holder: preempted, CapReleaseOnly: true})
+				}
+			}
+			if h := b.bindSlot(modelID, r, release); h != nil {
+				// Runs before the done-event defer above (LIFO).
+				defer func() { orphan = b.slots.unbind(modelID, h, r.Context().Err() != nil) }()
+			}
+		}
 		p.ServeHTTP(newPreemptResponseWriter(w, preempted, replayWanted), r)
 	}
 }
@@ -1395,7 +1430,15 @@ func (b *baseRouter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 			// empty value deletes the key - see inflightTracker.SetMetadata.
 			setter("kv_parked", "")
 		}
+		// Register the grant with the prefill-stall watcher for as long as the
+		// upstream is serving it. Status reads and count_tokens hold no slot,
+		// so they neither start the watcher nor count as holders.
+		removePrefill := func() {}
+		if !hr.StatusRead && !hr.ConcurrencyExempt {
+			removePrefill = b.prefillWatchFor(data.ModelID).add(pw, time.Now())
+		}
 		resp.HandleFunc(w, attemptReq)
+		removePrefill()
 
 		if replayWanted != nil && replayWanted.Load() {
 			// GUARD on the pinger/replay interaction. preemptResponseWriter

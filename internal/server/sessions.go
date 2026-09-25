@@ -850,6 +850,9 @@ func (h *sessionsHub) pollSlots(running map[string]process.ProcessState) map[str
 		go func(id, url string) {
 			defer wg.Done()
 			slots, err := fetchChildSlots(url)
+			if err == nil {
+				observeSlots(h.s.local, id, slots)
+			}
 			if err != nil {
 				// A busy child answers /slots only between batches, so a
 				// long prefill ubatch outlasts the timeout. Keep the last
@@ -868,6 +871,37 @@ func (h *sessionsHub) pollSlots(running map[string]process.ProcessState) map[str
 	}
 	wg.Wait()
 	return out
+}
+
+// slotObserver is the router's slot table (internal/router/slotbind.go): it
+// binds each granted request to an upstream slot of its own and needs the
+// child's own busy map to keep the cap on the upstream's reality.
+type slotObserver interface {
+	ObserveSlots(modelID string, busy []bool)
+}
+
+// observeSlots hands one FRESH reading (the child answered) to the router.
+// A kept-over reading is never passed: a busy child answers /slots only
+// between batches, and a stale "idle" would start the phantom clock on a
+// slot that is in fact working.
+func observeSlots(local any, model string, slots []childSlot) {
+	obs, ok := local.(slotObserver)
+	if !ok {
+		return
+	}
+	n := 0
+	for _, sl := range slots {
+		if sl.ID+1 > n {
+			n = sl.ID + 1
+		}
+	}
+	busy := make([]bool, n)
+	for _, sl := range slots {
+		if sl.ID >= 0 {
+			busy[sl.ID] = sl.IsProcessing
+		}
+	}
+	obs.ObserveSlots(model, busy)
 }
 
 func fetchChildSlots(base string) ([]childSlot, error) {

@@ -70,6 +70,9 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 			Enabled:        true,
 			TimeoutSeconds: 180,
 		},
+		// Prefill-flat reclaim is on by default too; see PrefillStallConfig
+		// for why 600s cannot catch a merely slow prefill.
+		PrefillStall: DefaultPrefillStallConfig(),
 		// The memory brake is on by default (absent block = ON); fields the
 		// yaml omits keep these defaults because Decode only overwrites keys
 		// that are present.

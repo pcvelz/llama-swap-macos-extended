@@ -280,6 +280,11 @@ type Config struct {
 	// SlotStallConfig.
 	SlotStall SlotStallConfig `yaml:"slotStall"`
 
+	// PrefillStall configures server-side reclaim of a serving slot whose
+	// upstream prefill counter has stopped moving before the first token. See
+	// PrefillStallConfig.
+	PrefillStall PrefillStallConfig `yaml:"prefillStall"`
+
 	// Tiers declares extra HTTP entry points into the one shared FIFO queue,
 	// each pre-tagging every request that arrives through it with a rank
 	// before it joins the queue. The main `-listen` port is always the
@@ -581,6 +586,70 @@ func (c *SlotStallConfig) UnmarshalYAML(unmarshal func(interface{}) error) error
 	}
 
 	*c = SlotStallConfig(defaults)
+	return nil
+}
+
+// PrefillStallConfig bounds how long a request may hold a slot whose UPSTREAM
+// PREFILL COUNTER (llama-server /slots n_prompt_tokens_processed, per slot and
+// task) does not move, before it has produced a token.
+//
+// It covers the window SlotStallConfig leaves out ("prefill is progress"), and
+// it is needed because the byte counter cannot: llama-server writes an SSE
+// comment ping every 30s from the moment a task launches, so a stuck prefill
+// looks like a live byte stream. See internal/router/prefillstall.go.
+//
+// THE SIGNAL IS A FLAT COUNTER, NEVER A RATE. A prefill that advances at all is
+// slow, not stuck, and is never cut. Failed or slow /slots polls are no
+// evidence either way.
+type PrefillStallConfig struct {
+	// Enabled turns the guard on. Default true.
+	Enabled bool `yaml:"enabled"`
+	// TimeoutSeconds is how long the same task's prefill counter may stay
+	// exactly flat before the request is cut. Default 600. The counter moves
+	// once per --batch-size chunk (2048 tokens), so its honest gaps are the
+	// time one chunk takes: ~27s at 75 tok/s, ~70s at the ~30 tok/s measured
+	// under slot contention, and a first update 190s in under host paging
+	// (llama-cm 2026-08-23 incident). 600s is 3x the worst witnessed gap; a
+	// chunk would need to run below ~3.4 tok/s for ten minutes to trip it.
+	// Size does not matter, only flatness: a 250k-token prefill advances every
+	// chunk and is never cut. 0 or negative disables the guard.
+	TimeoutSeconds int `yaml:"timeoutSeconds"`
+	// RestartAfterSeconds is the backstop: if the same task is still flat this
+	// long after the cut, the child is restarted (llama-server cannot cancel a
+	// busy slot any other way). Default 120, far above the ~1s llama-server
+	// needs to cancel a task whose client disconnected. 0 disables the restart.
+	RestartAfterSeconds int `yaml:"restartAfterSeconds"`
+}
+
+// StallTimeout is the effective budget: zero when the guard is off.
+func (c PrefillStallConfig) StallTimeout() time.Duration {
+	if !c.Enabled || c.TimeoutSeconds <= 0 {
+		return 0
+	}
+	return time.Duration(c.TimeoutSeconds) * time.Second
+}
+
+// RestartAfter is the effective backstop delay: zero when disabled.
+func (c PrefillStallConfig) RestartAfter() time.Duration {
+	if c.RestartAfterSeconds <= 0 {
+		return 0
+	}
+	return time.Duration(c.RestartAfterSeconds) * time.Second
+}
+
+// DefaultPrefillStallConfig is the seeded value when the block is absent.
+func DefaultPrefillStallConfig() PrefillStallConfig {
+	return PrefillStallConfig{Enabled: true, TimeoutSeconds: 600, RestartAfterSeconds: 120}
+}
+
+// UnmarshalYAML sets default values for PrefillStallConfig
+func (c *PrefillStallConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	type rawPrefillStallConfig PrefillStallConfig
+	defaults := rawPrefillStallConfig(DefaultPrefillStallConfig())
+	if err := unmarshal(&defaults); err != nil {
+		return err
+	}
+	*c = PrefillStallConfig(defaults)
 	return nil
 }
 

@@ -368,6 +368,28 @@
                 }
             }
         },
+        "prefillStall": {
+            "type": "object",
+            "additionalProperties": false,
+            "description": "Reclaim a serving slot whose UPSTREAM prefill counter (llama-server /slots n_prompt_tokens_processed, per slot and task) stays exactly flat before the first token. Covers the window slotStall leaves out: llama-server sends an SSE comment ping every 30s from task launch, so a stuck prefill looks like a live byte stream. A flat counter, never a rate: a prefill that advances at all is never cut, and a failed /slots poll is no evidence. Candidates are the model's requests that produced no token and were granted before the counter went flat; the cut waits while another slot is still advancing a prefill.",
+            "properties": {
+                "enabled": {
+                    "type": "boolean",
+                    "default": true,
+                    "description": "Arm the prefill-stall guard."
+                },
+                "timeoutSeconds": {
+                    "type": "integer",
+                    "default": 600,
+                    "description": "How long the same task's prefill counter may stay exactly flat before its request is cut with an SSE error and cancelled (llama-server then cancels the task). The counter moves once per batch (2048 tokens); the worst witnessed legitimate gap is 190s under host paging, so 600s is 3x that. 0 or negative disables the guard."
+                },
+                "restartAfterSeconds": {
+                    "type": "integer",
+                    "default": 120,
+                    "description": "Backstop: if the same task is still flat this long after the cut, the child is unloaded (llama-server cannot free a busy slot any other way). 0 disables the restart."
+                }
+            }
+        },
         "debugHistory": {
             "type": "object",
             "additionalProperties": false,

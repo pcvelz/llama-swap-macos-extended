@@ -126,6 +126,17 @@ type pingWriter struct {
 	lastBodyWrite time.Time
 	tail          string // trailing bytes (<=2) of the last upstream Write
 
+	// wroteContent: upstream wrote something other than SSE comment lines.
+	// Distinct from wroteBody ON PURPOSE: llama-server sends an SSE comment
+	// (":\n\n") every sse_ping_interval (default 30s) from the moment its
+	// task launches, so during a prefill wroteBody goes true and
+	// lastBodyWrite keeps refreshing although no token exists. The existing
+	// byte-based verdicts keep their accounting (it is what currently keeps
+	// pingZeroBudget off a legitimately long prefill); only the prefill-stall
+	// verdict (prefillstall.go) reads this, to tell "still prefilling" from
+	// "streaming tokens".
+	wroteContent bool
+
 	// slotStart is the moment the scheduler granted this request a serving
 	// slot, or the zero time while it is still parked in the queue. It is the
 	// clock pingZeroBudget measures against.
@@ -412,6 +423,9 @@ func (pw *pingWriter) Write(p []byte) (int, error) {
 	pw.mu.Lock()
 	pw.wroteBody = true
 	pw.lastBodyWrite = time.Now()
+	if !pw.wroteContent && !isSSECommentOnly(p) {
+		pw.wroteContent = true
+	}
 	// WHY reset the gap threshold: fresh upstream bytes already fed the
 	// client's watchdog, so the next ping is due a full quiet delay later.
 	pw.pingedThisGap = false
@@ -469,6 +483,69 @@ func (pw *pingWriter) WriteHeader(code int) {
 }
 
 func (pw *pingWriter) Header() http.Header { return pw.writer.Header() }
+
+// isSSECommentOnly reports whether p holds nothing but SSE comment lines
+// (lines starting with ':') and blank lines - llama-server's keepalive. A
+// chunk that splits a comment across writes reads as content, which errs on
+// the safe side: it marks the request as streaming, and a streaming request is
+// never a prefill-stall candidate.
+func isSSECommentOnly(p []byte) bool {
+	sawComment := false
+	for _, line := range strings.Split(string(p), "\n") {
+		line = strings.TrimSuffix(line, "\r")
+		switch {
+		case line == "":
+		case strings.HasPrefix(line, ":"):
+			sawComment = true
+		default:
+			return false
+		}
+	}
+	return sawComment
+}
+
+// preFirstToken reports whether upstream has written nothing but SSE
+// comments so far, i.e. the request is still in (or queued before) prefill.
+func (pw *pingWriter) preFirstToken() bool {
+	pw.mu.Lock()
+	defer pw.mu.Unlock()
+	return !pw.wroteContent
+}
+
+// prefillStallCut ends a request whose upstream prefill counter went flat for
+// the budget (prefillstall.go) the same way the other pinger verdicts end a
+// stream: one Anthropic SSE error frame the client can parse and retry on,
+// then the shared reclaim (latch, log, access-log cut=, cancel). Returns false
+// when there was nothing to cut: the stream already ended, errored, or started
+// streaming tokens in the meantime.
+func (pw *pingWriter) prefillStallCut(flat time.Duration) bool {
+	pw.mu.Lock()
+	if pw.stopped || pw.errored || pw.wroteContent {
+		pw.mu.Unlock()
+		return false
+	}
+	if !pw.headersSent {
+		// Nothing committed yet (a muted replay-eligible request): commit the
+		// SSE status line ourselves so the frame below is readable.
+		h := pw.writer.Header()
+		h.Set("Content-Type", "text/event-stream")
+		h.Set("Cache-Control", "no-cache")
+		pw.writer.WriteHeader(http.StatusOK)
+		pw.headersSent = true
+		pw.pingsStarted = true
+	}
+	pw.writeSSEErrorLocked("api_error", fmt.Sprintf(
+		"llama-swap: the upstream prefill made no progress for %s and the stream was ended so this request can be retried. The prompt stopped being processed.",
+		flat.Round(time.Second)))
+	pw.logger.Warnf("<%s> prefill stall: upstream prefill counter flat for %s, ended stream with SSE error",
+		pw.model, flat.Round(time.Second))
+	w := pw.writer
+	pw.mu.Unlock()
+	// Outside pw.mu: fire cancels the request, and the unwinding handler may
+	// call back into this writer.
+	pw.stall.reclaimPrefillStalledSlot(flat, w)
+	return true
+}
 
 // Flush drains buffered body bytes to the client under the stall guard. A
 // frozen peer can block here rather than in Write: the write only fills the

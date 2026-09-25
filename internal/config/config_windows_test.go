@@ -304,6 +304,12 @@ groups:
 			Enabled:        true,
 			TimeoutSeconds: 180,
 		},
+		// Likewise seeded when the prefillStall block is absent.
+		PrefillStall: PrefillStallConfig{
+			Enabled:             true,
+			TimeoutSeconds:      600,
+			RestartAfterSeconds: 120,
+		},
 		// Seeded when residentAliasGraceSeconds is absent; see
 		// Config.ResidentAliasGraceSeconds.
 		ResidentAliasGraceSeconds: 15,
