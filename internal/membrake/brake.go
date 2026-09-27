@@ -98,10 +98,10 @@ const (
 	drainSettle = 60 * time.Second
 	// holdLogEvery is how often a still-shut gate says so in the log.
 	holdLogEvery = 5 * time.Minute
-	// purgeTimeout bounds one purge attempt: PurgeCommand is typically
-	// `sudo -n purge`, which either returns fast or hangs forever asking for a
-	// password sudo -n cannot supply.
-	purgeTimeout = 120 * time.Second
+	// purgeTimeout bounds one purge attempt. `sudo -n` fails fast without a
+	// password rule, but a permitted purge of a ~40 GB cache ran for more than
+	// 2 minutes on this box, so the bound only has to catch a truly hung run.
+	purgeTimeout = 10 * time.Minute
 )
 
 // Reading is one memory sample, in bytes. Only FileBacked is the signal;
@@ -359,9 +359,24 @@ func New(cfg config.MemoryBrakeConfig, sampler Sampler, children ChildSource, ki
 // stderr/stdout into the error on failure (e.g. sudo refusing without a
 // password). Empty cmd means the valve cannot run even if armed.
 func purgeCommand(cmd []string) func() error {
+	return purgeCommandWith(cmd, purgeProcessRunning)
+}
+
+// purgeProcessRunning reports whether a purge process is alive. A permitted
+// purge was seen to drop the cache in ~2 minutes and then keep running for
+// 25+; a timed-out attempt cannot kill it (it runs as root under sudo), so
+// without this check every retry would start one more.
+func purgeProcessRunning() bool {
+	return exec.Command("pgrep", "-x", "purge").Run() == nil
+}
+
+func purgeCommandWith(cmd []string, running func() bool) func() error {
 	return func() error {
 		if len(cmd) == 0 {
 			return fmt.Errorf("memoryBrake.purgeCommand is empty")
+		}
+		if running() {
+			return fmt.Errorf("a purge is still running; not starting another")
 		}
 		c := exec.Command(cmd[0], cmd[1:]...)
 		out, err := c.CombinedOutput()
