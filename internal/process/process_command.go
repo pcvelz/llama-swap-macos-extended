@@ -381,6 +381,7 @@ func (p *ProcessCommand) run() {
 					// can unload it on the first one-second ticker tick.
 					p.lastUse.Store(time.Now().UnixNano())
 					setState(StateReady)
+					resolveLiveFiles(p)
 					notifyWaiters(nil)
 					if req.block {
 						// Park the Run response — Run blocks until the process

@@ -363,16 +363,24 @@ type TierConfig struct {
 // killed model still in the file cache). holdMinutes is accepted, ignored and
 // warned about at startup (LegacyHoldMinutes).
 type MemoryBrakeConfig struct {
-	Enabled             bool    `yaml:"enabled"`
-	SampleIntervalMs    int     `yaml:"sampleIntervalMs"`
-	WindowMinutes       int     `yaml:"windowMinutes"`
-	GrowthGB            float64 `yaml:"growthGB"`
-	ArmAfterMinutes     int     `yaml:"armAfterMinutes"`
-	ConfirmSamples      int     `yaml:"confirmSamples"`
-	DrainBelowGB        float64 `yaml:"drainBelowGB"`
-	MarkerPath          string  `yaml:"markerPath"`
-	LegacyWindowSeconds int     `yaml:"windowSeconds"` // ignored; warned about at startup
-	LegacyHoldMinutes   int     `yaml:"holdMinutes"`   // ignored; warned about at startup
+	Enabled          bool    `yaml:"enabled"`
+	SampleIntervalMs int     `yaml:"sampleIntervalMs"`
+	WindowMinutes    int     `yaml:"windowMinutes"`
+	GrowthGB         float64 `yaml:"growthGB"`
+	ArmAfterMinutes  int     `yaml:"armAfterMinutes"`
+	ConfirmSamples   int     `yaml:"confirmSamples"`
+	DrainBelowGB     float64 `yaml:"drainBelowGB"`
+	// ReleaseWhenModelsEvictedBelowGB is the gate's second release path: it
+	// opens once every model file a child was seen with holds, in total, less
+	// than this many GB of the file cache (mincore), for the same settle time.
+	// drainBelowGB measures the whole box, and on an idle box the memory a
+	// killed server freed refills with unrelated clean cache that macOS does
+	// not drop without pressure, so that level can stay out of reach for hours
+	// after the hazard - the killed model's own pages - is gone. 0 = off.
+	ReleaseWhenModelsEvictedBelowGB float64 `yaml:"releaseWhenModelsEvictedBelowGB"`
+	MarkerPath                      string  `yaml:"markerPath"`
+	LegacyWindowSeconds             int     `yaml:"windowSeconds"` // ignored; warned about at startup
+	LegacyHoldMinutes               int     `yaml:"holdMinutes"`   // ignored; warned about at startup
 }
 
 // DebugHistoryConfig: a bounded ring of box-state samples (memory, resident
@@ -445,6 +453,12 @@ type LoopGuardConfig struct {
 	// discriminator the original capture always had: the real loop
 	// (934159af) emitted 46-49 tokens a turn.
 	MaxLoopTokens int `yaml:"maxLoopTokens"`
+	// MaxPeriod is the longest cycle of response sizes the run counts: 1 is a
+	// constant run only, 2 also catches an A-B-A-B alternation, 3 an A-B-C
+	// cycle. A loop can cycle through a few tool calls rather than repeat one;
+	// a 278/281-token alternation went unseen for 1h37m under a constant-only
+	// rule. Each position of the cycle must stay within ToleranceTokens.
+	MaxPeriod int `yaml:"maxPeriod"`
 	// HoldOnlyWhenContended makes a hold conditional on somebody else
 	// actually waiting: a penalty exists to protect OTHER sessions, so with
 	// an empty queue there is nobody to protect and the held request is
@@ -477,6 +491,7 @@ func DefaultLoopGuardConfig() LoopGuardConfig {
 		PenaltySeconds:        []int{0, 900, 3600},
 		ClearRequests:         10,
 		MaxLoopTokens:         256,
+		MaxPeriod:             3,
 		HoldOnlyWhenContended: true,
 	}
 }
@@ -492,7 +507,10 @@ func DefaultMemoryBrakeConfig() MemoryBrakeConfig {
 		ArmAfterMinutes:  0,
 		ConfirmSamples:   2,
 		DrainBelowGB:     10,
-		MarkerPath:       "~/Library/Logs/llama-cm/LLAMA-SWAP-MEMORY-BRAKE",
+		// Half a gigabyte of a 20-30 GB GGUF: the eviction left its pages
+		// gone, not a first chunk re-read by a stray reader.
+		ReleaseWhenModelsEvictedBelowGB: 0.5,
+		MarkerPath:                      "~/Library/Logs/llama-cm/LLAMA-SWAP-MEMORY-BRAKE",
 	}
 }
 

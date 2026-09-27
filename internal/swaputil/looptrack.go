@@ -65,6 +65,12 @@ const (
 	// turn, roughly 4% of that.
 	DefaultMaxLoopTokens = int64(256)
 
+	// DefaultLoopMaxPeriod is the longest repeating pattern the run detects: a
+	// loop need not emit ONE size, it can cycle through a few tool calls (a
+	// 278/281-token alternation went unseen for 1h37m because its spread of 3
+	// broke a constant run at every step). 1 = constant runs only.
+	DefaultLoopMaxPeriod = 3
+
 	// loopHistoryMin is the FLOOR on one session's ring. The real bound is
 	// runBar * strikes + 1 (computed per tracker), so the top strike is
 	// always reachable; this floor only keeps a tiny configuration from
@@ -112,6 +118,9 @@ type LoopGuard struct {
 	// productive work and BREAKS the trailing run (see runLocked). 0 falls
 	// back to DefaultMaxLoopTokens.
 	MaxLoopTokens int64
+	// MaxPeriod is the longest cycle of response sizes counted as a run (see
+	// runLocked). 0 falls back to DefaultLoopMaxPeriod.
+	MaxPeriod int
 }
 
 // DefaultLoopGuard mirrors config.DefaultLoopGuardConfig for callers that
@@ -124,6 +133,7 @@ func DefaultLoopGuard() LoopGuard {
 		PenaltySeconds:  []int{0, 900, 3600},
 		ClearRequests:   10,
 		MaxLoopTokens:   DefaultMaxLoopTokens,
+		MaxPeriod:       DefaultLoopMaxPeriod,
 	}
 }
 
@@ -235,6 +245,9 @@ func NewLoopTracker(g LoopGuard) *LoopTracker {
 	if g.MaxLoopTokens < 1 {
 		g.MaxLoopTokens = DefaultMaxLoopTokens
 	}
+	if g.MaxPeriod < 1 {
+		g.MaxPeriod = DefaultLoopMaxPeriod
+	}
 	// The ring must be able to HOLD the top strike's run, or that strike
 	// could never be reached however long the loop went on.
 	historyMax := g.RunBar*g.Strikes + 1
@@ -325,7 +338,7 @@ func (t *LoopTracker) Record(sessionID string, respTokens int64) {
 // advanceLocked applies one recorded request to the strike ladder and returns
 // the events it produced. Callers must hold t.mu.
 func (t *LoopTracker) advanceLocked(sessionID string, h *loopHistory, now time.Time) []LoopPenaltyEvent {
-	run := runLocked(h.tokens, t.guard.ToleranceTokens, t.guard.MaxLoopTokens)
+	run := runLocked(h.tokens, t.guard.ToleranceTokens, t.guard.MaxLoopTokens, t.guard.MaxPeriod)
 
 	if run < t.guard.RunBar {
 		// Below the bar: this is evidence of recovery. Enough of it in a row
@@ -359,7 +372,7 @@ func (t *LoopTracker) advanceLocked(sessionID string, h *loopHistory, now time.T
 	}
 	h.strike = target
 	hold := t.holdSecondsFor(target)
-	typical := medianOfRun(h.tokens, t.guard.ToleranceTokens, t.guard.MaxLoopTokens)
+	typical := medianOfRun(h.tokens, t.guard.ToleranceTokens, t.guard.MaxLoopTokens, t.guard.MaxPeriod)
 	events := []LoopPenaltyEvent{{SessionID: sessionID, Kind: PenaltyEventStrike,
 		Reason: PenaltyReasonLoop, Strike: target, HoldSeconds: hold, UniformRun: run, TypicalTokens: typical}}
 	switch {
@@ -414,7 +427,7 @@ func (t *LoopTracker) Run(sessionID string) int {
 	if !ok {
 		return 0
 	}
-	return runLocked(h.tokens, t.guard.ToleranceTokens, t.guard.MaxLoopTokens)
+	return runLocked(h.tokens, t.guard.ToleranceTokens, t.guard.MaxLoopTokens, t.guard.MaxPeriod)
 }
 
 // runLocked is the trailing-run computation over a raw history.
@@ -425,25 +438,56 @@ func (t *LoopTracker) Run(sessionID string) int {
 // read as run 0 rather than as a perfect loop (2026-09-20, ef043b3f), and it
 // is also why such a response counts toward ClearRequests - advanceLocked
 // sees a run below the bar and treats it as evidence of recovery.
-func runLocked(tokens []int64, tolerance, maxTokens int64) int {
-	if len(tokens) == 0 {
-		return 0
+//
+// The run is PERIODIC: the longest trailing stretch that repeats a cycle of up
+// to maxPeriod sizes, each position in the cycle staying within tolerance.
+// Period 1 is the constant run. A period p >= 2 counts only once every
+// position has at least two samples (run >= 2p): p arbitrary sizes in a row
+// are not yet a repetition, and without that floor any two unequal responses
+// would read as a 2-run.
+func runLocked(tokens []int64, tolerance, maxTokens int64, maxPeriod int) int {
+	best := 0
+	for p := 1; p <= maxPeriod; p++ {
+		run := periodRun(tokens, tolerance, maxTokens, p)
+		if p > 1 && run < 2*p {
+			run = 0
+		}
+		if run > best {
+			best = run
+		}
 	}
-	lo, hi := tokens[len(tokens)-1], tokens[len(tokens)-1]
+	return best
+}
+
+// periodRun is the trailing run for one period p: walking back from the
+// newest response, response d steps back belongs to phase d mod p, and the
+// walk stops at the first response above maxTokens or the first that widens
+// its phase's spread past tolerance.
+func periodRun(tokens []int64, tolerance, maxTokens int64, p int) int {
+	var loBuf, hiBuf [8]int64
+	lo, hi := loBuf[:0], hiBuf[:0]
+	if p > len(loBuf) {
+		lo, hi = make([]int64, 0, p), make([]int64, 0, p)
+	}
 	run := 0
 	for i := len(tokens) - 1; i >= 0; i-- {
 		v := tokens[i]
 		if v > maxTokens {
 			break
 		}
-		if v < lo {
-			lo = v
-		}
-		if v > hi {
-			hi = v
-		}
-		if hi-lo > tolerance {
-			break
+		ph := run % p
+		if ph == len(lo) { // first sample of this phase
+			lo, hi = append(lo, v), append(hi, v)
+		} else {
+			if v < lo[ph] {
+				lo[ph] = v
+			}
+			if v > hi[ph] {
+				hi[ph] = v
+			}
+			if hi[ph]-lo[ph] > tolerance {
+				break
+			}
 		}
 		run++
 	}
@@ -453,8 +497,8 @@ func runLocked(tokens []int64, tolerance, maxTokens int64) int {
 // medianOfRun returns the median of the trailing run - the session's
 // "typical" response size, published so a reader can see WHAT it kept
 // emitting, not just that it did.
-func medianOfRun(tokens []int64, tolerance, maxTokens int64) int64 {
-	run := runLocked(tokens, tolerance, maxTokens)
+func medianOfRun(tokens []int64, tolerance, maxTokens int64, maxPeriod int) int64 {
+	run := runLocked(tokens, tolerance, maxTokens, maxPeriod)
 	if run == 0 {
 		return 0
 	}
@@ -528,8 +572,8 @@ func (t *LoopTracker) Penalty(sessionID string) (PenaltyState, bool) {
 		Strikes:       t.guard.Strikes,
 		Held:          h.heldForever || !h.heldUntil.IsZero(),
 		HeldForever:   h.heldForever,
-		UniformRun:    runLocked(h.tokens, t.guard.ToleranceTokens, t.guard.MaxLoopTokens),
-		TypicalTokens: medianOfRun(h.tokens, t.guard.ToleranceTokens, t.guard.MaxLoopTokens),
+		UniformRun:    runLocked(h.tokens, t.guard.ToleranceTokens, t.guard.MaxLoopTokens, t.guard.MaxPeriod),
+		TypicalTokens: medianOfRun(h.tokens, t.guard.ToleranceTokens, t.guard.MaxLoopTokens, t.guard.MaxPeriod),
 	}
 	if !h.heldForever {
 		out.Until = h.heldUntil

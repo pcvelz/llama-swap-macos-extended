@@ -1,6 +1,7 @@
 package process
 
 import (
+	"slices"
 	"strings"
 	"sync"
 )
@@ -64,6 +65,41 @@ func registerLive(p *ProcessCommand, pgid int, args []string) {
 	e := liveEntry{pgid: pgid, files: ModelFiles(args)}
 	liveMu.Lock()
 	live[p] = e
+	liveMu.Unlock()
+}
+
+// resolveLiveFiles adds the model files named in the child's CURRENT argv to
+// its registry entry. Called once when the child turns ready: a wrapper script
+// (llama-cm's llama-child-*.sh) is what llama-swap started, and only the
+// llama-server it exec'd into carries --model, so the start argv alone left the
+// memory brake with nothing to evict. Ready is after the exec because the
+// health check is answered by the server. Runs off the brake's sampling path,
+// so its allocations never land there.
+func resolveLiveFiles(p *ProcessCommand) {
+	liveMu.Lock()
+	e, ok := live[p]
+	liveMu.Unlock()
+	if !ok {
+		return
+	}
+	argv, err := processArgv(e.pgid)
+	if err != nil {
+		return
+	}
+	merged := append([]string(nil), e.files...)
+	for _, f := range ModelFiles(argv) {
+		if !slices.Contains(merged, f) {
+			merged = append(merged, f)
+		}
+	}
+	if len(merged) == len(e.files) {
+		return
+	}
+	liveMu.Lock()
+	if cur, ok := live[p]; ok && cur.pgid == e.pgid {
+		cur.files = merged
+		live[p] = cur
+	}
 	liveMu.Unlock()
 }
 

@@ -133,6 +133,7 @@ func (t *inflightTracker) setLoopGuard(cfg config.LoopGuardConfig) {
 		PenaltySeconds:  cfg.PenaltySeconds,
 		ClearRequests:   cfg.ClearRequests,
 		MaxLoopTokens:   int64(cfg.MaxLoopTokens),
+		MaxPeriod:       cfg.MaxPeriod,
 	})
 }
 

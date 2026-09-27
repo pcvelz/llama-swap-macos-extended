@@ -2,6 +2,7 @@ package membrake
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -16,6 +17,8 @@ import (
 
 // Everything here uses an injected sampler, child source and killer: no real
 // memory pressure is ever produced and no real process is ever signalled.
+
+var errNotMeasured = errors.New("residency not measured in this rig")
 
 type fakeSampler struct{ r Reading }
 
@@ -71,6 +74,9 @@ func newRig(t *testing.T, cfg config.MemoryBrakeConfig) *rig {
 	kill := func(pgid int) error { r.rec.add(fmt.Sprintf("kill:%d", pgid)); return nil }
 	r.b = New(cfg, r.s, r.k.snap, kill, r.rec, r.hold)
 	r.b.alive = func(pgid int) bool { return r.alive[pgid] }
+	// The fake model paths do not exist; residency is "unknown" so only the
+	// drain level can open the gate unless a test measures real files.
+	r.b.resident = func(string) (int64, error) { return 0, errNotMeasured }
 	r.b.evict = func(path string) error {
 		r.rec.add("evict:" + path)
 		if r.onEvict != nil {

@@ -124,8 +124,9 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 	}
 
 	if mb := config.MemoryBrake; mb.SampleIntervalMs <= 0 || mb.WindowMinutes <= 0 ||
-		mb.GrowthGB <= 0 || mb.ArmAfterMinutes < 0 || mb.ConfirmSamples < 1 || mb.DrainBelowGB < 0 {
-		return Config{}, fmt.Errorf("memoryBrake: sampleIntervalMs, windowMinutes, growthGB must be > 0, armAfterMinutes >= 0, confirmSamples >= 1, drainBelowGB >= 0 (windowSeconds and holdMinutes are obsolete and ignored)")
+		mb.GrowthGB <= 0 || mb.ArmAfterMinutes < 0 || mb.ConfirmSamples < 1 || mb.DrainBelowGB < 0 ||
+		mb.ReleaseWhenModelsEvictedBelowGB < 0 {
+		return Config{}, fmt.Errorf("memoryBrake: sampleIntervalMs, windowMinutes, growthGB must be > 0, armAfterMinutes >= 0, confirmSamples >= 1, drainBelowGB >= 0, releaseWhenModelsEvictedBelowGB >= 0 (windowSeconds and holdMinutes are obsolete and ignored)")
 	}
 
 	if dh := config.DebugHistory; dh.Enabled && (dh.IntervalMs <= 0 || dh.RetainMinutes <= 0) {
@@ -149,6 +150,12 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 	// in a way `enabled: false` already expresses more honestly.
 	if config.LoopGuard.MaxLoopTokens < 1 {
 		return Config{}, fmt.Errorf("loopGuard: maxLoopTokens must be >= 1")
+	}
+	// Refused rather than clamped for the same reason as runBar: 0 would
+	// silently mean "the default", and a period beyond a quarter of the run
+	// bar leaves each position too few samples to call anything a repetition.
+	if lg := config.LoopGuard; lg.MaxPeriod < 1 || lg.MaxPeriod*4 > lg.RunBar {
+		return Config{}, fmt.Errorf("loopGuard: maxPeriod must be >= 1 and <= runBar/4")
 	}
 	// One entry per strike, so the ladder is read off the yaml with no
 	// implicit padding: a four-entry list under strikes:3 is an operator who
