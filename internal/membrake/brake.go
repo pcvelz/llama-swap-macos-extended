@@ -262,16 +262,11 @@ type Brake struct {
 	// replace both.
 	evict func(path string) error
 	alive func(pgid int) bool
-	// resident reports how many bytes of a file are in the file cache
-	// (residentBytes); tests replace it.
-	resident func(path string) (int64, error)
 
 	window     time.Duration
 	armAfter   time.Duration
 	threshold  int64
 	drainBelow int64
-	// releaseModels is releaseWhenModelsEvictedBelowGB in bytes; 0 = off.
-	releaseModels int64
 
 	// files is every model file any child was seen with: after a kill the
 	// file cache can hold the weights of earlier models too.
@@ -302,10 +297,6 @@ type postKill struct {
 	lastEvict  int64
 	belowSince int64 // 0 = not below the drain level
 	lastLog    int64
-	// modelsOut: at the last check, the known model files held less than
-	// releaseModels of the file cache. Re-checked every reEvictEvery, not per
-	// sample: a mincore pass maps every model file.
-	modelsOut bool
 }
 
 // New builds a brake. sampler/children/kill/hold may be nil to use the
@@ -324,25 +315,23 @@ func New(cfg config.MemoryBrakeConfig, sampler Sampler, children ChildSource, ki
 	window := time.Duration(cfg.WindowMinutes) * time.Minute
 	capacity := int(window/interval) + 8
 	return &Brake{
-		cfg:           cfg,
-		sampler:       sampler,
-		children:      children,
-		kill:          kill,
-		log:           log,
-		hold:          hold,
-		evict:         evictFile,
-		alive:         groupAlive,
-		resident:      residentBytes,
-		window:        window,
-		armAfter:      time.Duration(cfg.ArmAfterMinutes) * time.Minute,
-		threshold:     int64(cfg.GrowthGB * gib),
-		drainBelow:    int64(cfg.DrainBelowGB * gib),
-		releaseModels: int64(cfg.ReleaseWhenModelsEvictedBelowGB * gib),
-		files:         map[string]struct{}{},
-		post:          postKill{pgids: make([]int, 0, 16)},
-		kids:          make([]process.LiveChild, 0, 16),
-		dqT:           make([]int64, capacity),
-		dqV:           make([]int64, capacity),
+		cfg:        cfg,
+		sampler:    sampler,
+		children:   children,
+		kill:       kill,
+		log:        log,
+		hold:       hold,
+		evict:      evictFile,
+		alive:      groupAlive,
+		window:     window,
+		armAfter:   time.Duration(cfg.ArmAfterMinutes) * time.Minute,
+		threshold:  int64(cfg.GrowthGB * gib),
+		drainBelow: int64(cfg.DrainBelowGB * gib),
+		files:      map[string]struct{}{},
+		post:       postKill{pgids: make([]int, 0, 16)},
+		kids:       make([]process.LiveChild, 0, 16),
+		dqT:        make([]int64, capacity),
+		dqV:        make([]int64, capacity),
 	}
 }
 
@@ -491,29 +480,26 @@ func (b *Brake) drain(now time.Time, r Reading) {
 		}
 		b.evictAll(now, r, true)
 		p.evicted, p.lastEvict, p.lastLog = true, ts, ts
-		p.modelsOut = b.modelsEvicted()
 		return
 	}
-	belowLevel := r.metric() < b.drainBelow || b.drainBelow == 0
-	if ts-p.lastEvict >= int64(reEvictEvery) {
-		// Re-evict only while it can still help: below the level or with the
-		// model files already out there is nothing left to drop.
-		if !belowLevel && !p.modelsOut {
-			b.evictAll(now, r, false)
-		}
-		p.lastEvict = ts
-		p.modelsOut = b.modelsEvicted()
-	}
-	if belowLevel || p.modelsOut {
+	// The ONLY release condition: file-backed below the drain level for the
+	// settle time. Nothing else may open the gate - a path that opened once
+	// the killed model's own file had left the cache reloaded into 32 GB of
+	// file-backed memory and the machine died (watchdog panic, 2026-09-27).
+	if r.metric() < b.drainBelow || b.drainBelow == 0 {
 		if p.belowSince == 0 {
 			p.belowSince = ts
 		}
 		if ts-p.belowSince >= int64(drainSettle) || b.drainBelow == 0 {
-			b.releaseAfterDrain(now, r, belowLevel)
+			b.releaseAfterDrain(now, r)
 		}
 		return
 	}
 	p.belowSince = 0
+	if ts-p.lastEvict >= int64(reEvictEvery) {
+		b.evictAll(now, r, false)
+		p.lastEvict = ts
+	}
 	if ts-p.lastLog >= int64(holdLogEvery) {
 		p.lastLog = ts
 		if b.log != nil {
@@ -523,47 +509,19 @@ func (b *Brake) drain(now time.Time, r Reading) {
 	}
 }
 
-// releaseAfterDrain opens the gate. belowLevel says which path opened it:
-// file-backed under drainBelowGB, or (false) the model files out of the cache.
-func (b *Brake) releaseAfterDrain(now time.Time, r Reading, belowLevel bool) {
+func (b *Brake) releaseAfterDrain(now time.Time, r Reading) {
 	held := time.Duration(now.UnixNano() - b.post.killedAt).Round(time.Second)
 	b.post.active = false
 	if !b.hold.Holding() {
 		return
 	}
 	b.hold.Release()
-	reason := "drain"
-	why := fmt.Sprintf("file-backed %.2f GB has stayed below %.2f GB for %s", float64(r.FileBacked)/gib, b.cfg.DrainBelowGB, drainSettle)
-	if !belowLevel {
-		reason = "models-evicted"
-		why = fmt.Sprintf("the model files have held less than %.2f GB of the file cache for %s (file-backed %.2f GB is other cache)",
-			b.cfg.ReleaseWhenModelsEvictedBelowGB, drainSettle, float64(r.FileBacked)/gib)
-	}
 	if b.log != nil {
-		b.log.Warnf("MEMORY BRAKE HOLD RELEASED: %s; local-model loads admitted again (held %s after the kill)", why, held)
+		b.log.Warnf("MEMORY BRAKE HOLD RELEASED: file-backed %.2f GB has stayed below %.2f GB for %s; local-model loads admitted again (held %s after the kill)",
+			float64(r.FileBacked)/gib, b.cfg.DrainBelowGB, drainSettle, held)
 	}
-	b.mark(fmt.Sprintf("%s MEMORY-BRAKE-RELEASE filebacked_gb=%.2f drain_below_gb=%.2f held_s=%d reason=%s",
-		now.Format("2006-01-02 15:04:05"), float64(r.FileBacked)/gib, b.cfg.DrainBelowGB, int(held/time.Second), reason))
-}
-
-// modelsEvicted reports whether every model file any child was seen with
-// holds, in total, less than releaseModels of the file cache. A file whose
-// residency cannot be read makes the answer no: an unknown is not evidence
-// that the hazard is gone. With no known file there is nothing to measure, so
-// only drainBelowGB can open the gate.
-func (b *Brake) modelsEvicted() bool {
-	if b.releaseModels <= 0 || len(b.files) == 0 {
-		return false
-	}
-	var sum int64
-	for _, p := range expandSplits(b.files) {
-		n, err := b.resident(p)
-		if err != nil {
-			return false
-		}
-		sum += n
-	}
-	return sum < b.releaseModels
+	b.mark(fmt.Sprintf("%s MEMORY-BRAKE-RELEASE filebacked_gb=%.2f drain_below_gb=%.2f held_s=%d",
+		now.Format("2006-01-02 15:04:05"), float64(r.FileBacked)/gib, b.cfg.DrainBelowGB, int(held/time.Second)))
 }
 
 // evictAll drops every known model file from the file cache and logs

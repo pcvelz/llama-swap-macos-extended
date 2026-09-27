@@ -370,13 +370,9 @@ type MemoryBrakeConfig struct {
 	ArmAfterMinutes  int     `yaml:"armAfterMinutes"`
 	ConfirmSamples   int     `yaml:"confirmSamples"`
 	DrainBelowGB     float64 `yaml:"drainBelowGB"`
-	// ReleaseWhenModelsEvictedBelowGB is the gate's second release path: it
-	// opens once every model file a child was seen with holds, in total, less
-	// than this many GB of the file cache (mincore), for the same settle time.
-	// drainBelowGB measures the whole box, and on an idle box the memory a
-	// killed server freed refills with unrelated clean cache that macOS does
-	// not drop without pressure, so that level can stay out of reach for hours
-	// after the hazard - the killed model's own pages - is gone. 0 = off.
+	// ReleaseWhenModelsEvictedBelowGB is REMOVED: load refuses any value but 0.
+	// It opened the gate once the killed model's files left the cache; the
+	// reload went into 32 GB of file-backed memory and the machine died.
 	ReleaseWhenModelsEvictedBelowGB float64 `yaml:"releaseWhenModelsEvictedBelowGB"`
 	MarkerPath                      string  `yaml:"markerPath"`
 	LegacyWindowSeconds             int     `yaml:"windowSeconds"` // ignored; warned about at startup
@@ -507,10 +503,7 @@ func DefaultMemoryBrakeConfig() MemoryBrakeConfig {
 		ArmAfterMinutes:  0,
 		ConfirmSamples:   2,
 		DrainBelowGB:     10,
-		// Half a gigabyte of a 20-30 GB GGUF: the eviction left its pages
-		// gone, not a first chunk re-read by a stray reader.
-		ReleaseWhenModelsEvictedBelowGB: 0.5,
-		MarkerPath:                      "~/Library/Logs/llama-cm/LLAMA-SWAP-MEMORY-BRAKE",
+		MarkerPath:       "~/Library/Logs/llama-cm/LLAMA-SWAP-MEMORY-BRAKE",
 	}
 }
 

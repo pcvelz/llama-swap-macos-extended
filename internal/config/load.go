@@ -124,9 +124,14 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 	}
 
 	if mb := config.MemoryBrake; mb.SampleIntervalMs <= 0 || mb.WindowMinutes <= 0 ||
-		mb.GrowthGB <= 0 || mb.ArmAfterMinutes < 0 || mb.ConfirmSamples < 1 || mb.DrainBelowGB < 0 ||
-		mb.ReleaseWhenModelsEvictedBelowGB < 0 {
-		return Config{}, fmt.Errorf("memoryBrake: sampleIntervalMs, windowMinutes, growthGB must be > 0, armAfterMinutes >= 0, confirmSamples >= 1, drainBelowGB >= 0, releaseWhenModelsEvictedBelowGB >= 0 (windowSeconds and holdMinutes are obsolete and ignored)")
+		mb.GrowthGB <= 0 || mb.ArmAfterMinutes < 0 || mb.ConfirmSamples < 1 || mb.DrainBelowGB < 0 {
+		return Config{}, fmt.Errorf("memoryBrake: sampleIntervalMs, windowMinutes, growthGB must be > 0, armAfterMinutes >= 0, confirmSamples >= 1, drainBelowGB >= 0 (windowSeconds and holdMinutes are obsolete and ignored)")
+	}
+	// Refused, not ignored: opening the gate on the model files leaving the cache
+	// reloaded into 32 GB of file-backed memory and the machine died (watchdog
+	// panic, 2026-09-27). A config that asks for it must not boot.
+	if config.MemoryBrake.ReleaseWhenModelsEvictedBelowGB != 0 {
+		return Config{}, fmt.Errorf("memoryBrake.releaseWhenModelsEvictedBelowGB is removed and must be 0: only drainBelowGB may reopen the gate")
 	}
 
 	if dh := config.DebugHistory; dh.Enabled && (dh.IntervalMs <= 0 || dh.RetainMinutes <= 0) {

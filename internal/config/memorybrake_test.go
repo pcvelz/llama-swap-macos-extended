@@ -45,6 +45,18 @@ func TestMemoryBrakeLegacyHoldMinutesAcceptedAndIgnored(t *testing.T) {
 	}
 }
 
+// The removed release path cannot be switched back on: a config that asks the
+// gate to open on the model files leaving the cache must not boot. That path
+// reloaded into 32 GB of file-backed memory and the machine died (2026-09-27).
+func TestMemoryBrakeModelsEvictedReleaseRefused(t *testing.T) {
+	if _, err := LoadConfigFromReader(strings.NewReader("memoryBrake:\n  releaseWhenModelsEvictedBelowGB: 0.5\n")); err == nil {
+		t.Fatal("releaseWhenModelsEvictedBelowGB: 0.5 loaded; it must be refused")
+	}
+	if _, err := LoadConfigFromReader(strings.NewReader("memoryBrake:\n  releaseWhenModelsEvictedBelowGB: 0\n")); err != nil {
+		t.Fatalf("an explicit 0 must load: %v", err)
+	}
+}
+
 func TestMemoryBrakeCanBeDisabled(t *testing.T) {
 	cfg, err := LoadConfigFromReader(strings.NewReader("memoryBrake:\n  enabled: false\n"))
 	if err != nil {

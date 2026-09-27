@@ -34,15 +34,9 @@ func cachedModel(t *testing.T) string {
 	return path
 }
 
-// realRig is newRig measuring REAL file-cache residency, with the release
-// threshold scaled to the 32 MB stand-in (16 MB) the way 0.5 GB is scaled to
-// a 20-30 GB GGUF.
+// realRig is newRig around a real model file on disk.
 func realRig(t *testing.T) *rig {
-	cfg := testCfg(t)
-	cfg.ReleaseWhenModelsEvictedBelowGB = 16.0 / 1024
-	r := newRig(t, cfg)
-	r.b.resident = residentBytes
-	return r
+	return newRig(t, testCfg(t))
 }
 
 // tripThenExit drives the rig through a trip with one child on path and lets
@@ -63,15 +57,13 @@ func tripThenExit(t *testing.T, r *rig, path string, fbGB float64) int {
 	return sec
 }
 
-// 2026-09-27: after the 12:43 kill the cq27 weights left the cache, but the
-// memory the server freed filled with UNRELATED file cache (29.9 -> 39.0 GB
-// over 2h10m on an idle box; macOS does not drop clean cache without
-// pressure). An absolute "file-backed < 10 GB" level measures the whole box,
-// not the hazard - the killed model's own pages - so the gate never opened and
-// every local load was held until a restart. Once the eviction has verifiably
-// emptied the known model files from the cache, the hazard is gone and the
-// gate must open after the settle time, whatever the unrelated cache does.
-func TestBrake_ReleasesOnceModelFilesAreOutOfTheCache(t *testing.T) {
+// The invariant: the gate NEVER opens while file-backed is at or above the
+// drain level, whatever else says the hazard is gone. On 2026-09-27 a release
+// path that opened once the killed model's own file had left the cache let a
+// reload through at 32 GB file-backed; the machine died in a watchdog panic
+// four minutes later. Here the model file is really evicted and file-backed
+// stays at 36 GB: the gate must stay shut, even with the old knob set.
+func TestBrake_NeverReleasesAboveTheDrainLevel(t *testing.T) {
 	path := cachedModel(t)
 	r := realRig(t)
 	r.b.evict = evictFile // the real eviction on a real file
@@ -79,15 +71,15 @@ func TestBrake_ReleasesOnceModelFilesAreOutOfTheCache(t *testing.T) {
 	if res, total := residentPages(t, path); res > total/50 {
 		t.Fatalf("setup: eviction left %d/%d pages resident", res, total)
 	}
-	for end := sec + int(drainSettle/time.Second) + 3; sec < end && r.hold.Holding(); sec++ {
+	for end := sec + 5*int(drainSettle/time.Second); sec < end; sec++ {
 		r.step(sec+1, 36)
-	}
-	if r.hold.Holding() {
-		t.Fatalf("gate still shut %v after the kill although the model file is out of the cache; only unrelated cache (36 GB) keeps file-backed above the drain level", drainSettle+3*time.Second)
+		if !r.hold.Holding() {
+			t.Fatalf("gate opened at file-backed 36 GB (drain level %.0f GB) %ds after the kill", r.b.cfg.DrainBelowGB, sec+1)
+		}
 	}
 	data, _ := os.ReadFile(r.b.cfg.MarkerPath)
-	if !strings.Contains(string(data), "MEMORY-BRAKE-RELEASE") {
-		t.Errorf("release not marked:\n%s", data)
+	if strings.Contains(string(data), "MEMORY-BRAKE-RELEASE") {
+		t.Errorf("a release was marked above the drain level:\n%s", data)
 	}
 }
 
