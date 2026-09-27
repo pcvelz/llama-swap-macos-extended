@@ -133,6 +133,12 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 	if config.MemoryBrake.ReleaseWhenModelsEvictedBelowGB != 0 {
 		return Config{}, fmt.Errorf("memoryBrake.releaseWhenModelsEvictedBelowGB is removed and must be 0: only drainBelowGB may reopen the gate")
 	}
+	if config.MemoryBrake.PurgeAfterMinutes < 0 {
+		return Config{}, fmt.Errorf("memoryBrake.purgeAfterMinutes must be >= 0 (0 disables the purge valve)")
+	}
+	if config.MemoryBrake.PurgeAfterMinutes > 0 && len(config.MemoryBrake.PurgeCommand) == 0 {
+		return Config{}, fmt.Errorf("memoryBrake.purgeCommand must be non-empty when purgeAfterMinutes > 0")
+	}
 
 	if dh := config.DebugHistory; dh.Enabled && (dh.IntervalMs <= 0 || dh.RetainMinutes <= 0) {
 		return Config{}, fmt.Errorf("debugHistory: intervalMs and retainMinutes must be > 0 when enabled")

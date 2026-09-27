@@ -377,6 +377,25 @@ type MemoryBrakeConfig struct {
 	MarkerPath                      string  `yaml:"markerPath"`
 	LegacyWindowSeconds             int     `yaml:"windowSeconds"` // ignored; warned about at startup
 	LegacyHoldMinutes               int     `yaml:"holdMinutes"`   // ignored; warned about at startup
+
+	// HoldStatePath persists the post-kill hold across a llama-swap restart: a
+	// restart used to clear the in-memory hold and send the next load straight
+	// into a file cache the brake had just judged unsafe (witnessed: restart
+	// 18:39:54, load, brake kill 3s after ready with file-backed +17 GB in 2s).
+	// Written on trip (one line: killed-at unix seconds), removed on release. A
+	// leading "~/" is expanded like MarkerPath. drainBelowGB: 0 disables this
+	// too: the file is ignored and deleted.
+	HoldStatePath string `yaml:"holdStatePath"`
+
+	// PurgeAfterMinutes, when > 0, runs PurgeCommand once the gate has been
+	// shut this long without draining, retried every PurgeAfterMinutes while
+	// still shut. 0 (default) is off: the purge valve never fires. Purging
+	// never opens the gate itself - only the drainBelowGB rule does.
+	PurgeAfterMinutes int `yaml:"purgeAfterMinutes"`
+	// PurgeCommand is the command run by the purge valve, e.g. the macOS
+	// `purge` tool via passwordless sudo. Required (non-empty) when
+	// PurgeAfterMinutes > 0.
+	PurgeCommand []string `yaml:"purgeCommand"`
 }
 
 // DebugHistoryConfig: a bounded ring of box-state samples (memory, resident
@@ -496,14 +515,17 @@ func DefaultLoopGuardConfig() LoopGuardConfig {
 // the block or a field. A leading "~/" in MarkerPath is expanded by the brake.
 func DefaultMemoryBrakeConfig() MemoryBrakeConfig {
 	return MemoryBrakeConfig{
-		Enabled:          true,
-		SampleIntervalMs: 1000,
-		WindowMinutes:    5,
-		GrowthGB:         3.5,
-		ArmAfterMinutes:  0,
-		ConfirmSamples:   2,
-		DrainBelowGB:     10,
-		MarkerPath:       "~/Library/Logs/llama-cm/LLAMA-SWAP-MEMORY-BRAKE",
+		Enabled:           true,
+		SampleIntervalMs:  1000,
+		WindowMinutes:     5,
+		GrowthGB:          3.5,
+		ArmAfterMinutes:   0,
+		ConfirmSamples:    2,
+		DrainBelowGB:      10,
+		MarkerPath:        "~/Library/Logs/llama-cm/LLAMA-SWAP-MEMORY-BRAKE",
+		HoldStatePath:     "~/Library/Application Support/llama-cm/membrake-hold",
+		PurgeAfterMinutes: 0,
+		PurgeCommand:      []string{"sudo", "-n", "/usr/sbin/purge"},
 	}
 }
 

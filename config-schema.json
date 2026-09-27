@@ -429,7 +429,10 @@
                 "confirmSamples": {"type": "integer", "default": 2, "description": "Consecutive breaching samples required before the kill."},
                 "drainBelowGB": {"type": "number", "default": 10, "description": "After a brake kill, the killed models' files are evicted from the file cache and local-model loads are parked (not failed) until file-backed memory has stayed below this many GB for 60 s. 0 disables the hold (the eviction still runs)."},
                 "holdMinutes": {"type": "integer", "deprecated": true, "description": "OBSOLETE (the fixed hold). Accepted and ignored with a startup warning; use drainBelowGB."},
-                "markerPath": {"type": "string", "default": "~/Library/Logs/llama-cm/LLAMA-SWAP-MEMORY-BRAKE", "description": "Crash-surviving marker file; one line appended per brake event."}
+                "markerPath": {"type": "string", "default": "~/Library/Logs/llama-cm/LLAMA-SWAP-MEMORY-BRAKE", "description": "Crash-surviving marker file; one line appended per brake event."},
+                "holdStatePath": {"type": "string", "default": "~/Library/Application Support/llama-cm/membrake-hold", "description": "Persists the post-kill hold across a llama-swap restart (a restart used to clear the in-memory hold and send the next load straight into a file cache the brake had just judged unsafe). Written on trip (one line: killed-at unix seconds), removed on release. drainBelowGB: 0 disables this too: the file is ignored and deleted."},
+                "purgeAfterMinutes": {"type": "integer", "minimum": 0, "default": 0, "description": "Purge valve: after the gate has been shut this many minutes without draining, run purgeCommand once, retried every purgeAfterMinutes while still shut. 0 (default) is off. Purging never opens the gate itself - only drainBelowGB does."},
+                "purgeCommand": {"type": "array", "items": {"type": "string"}, "default": ["sudo", "-n", "/usr/sbin/purge"], "description": "Command run by the purge valve. Required (non-empty) when purgeAfterMinutes > 0."}
             }
         },
         "tiers": {

@@ -1,6 +1,7 @@
 package config
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -12,7 +13,7 @@ func TestMemoryBrakeDefaultsOnWhenBlockAbsent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.MemoryBrake != DefaultMemoryBrakeConfig() {
+	if !reflect.DeepEqual(cfg.MemoryBrake, DefaultMemoryBrakeConfig()) {
 		t.Fatalf("absent block: got %+v, want defaults %+v", cfg.MemoryBrake, DefaultMemoryBrakeConfig())
 	}
 	if !cfg.MemoryBrake.Enabled {
@@ -27,7 +28,7 @@ func TestMemoryBrakePartialBlockKeepsOtherDefaults(t *testing.T) {
 	}
 	want := DefaultMemoryBrakeConfig()
 	want.DrainBelowGB = 8
-	if cfg.MemoryBrake != want {
+	if !reflect.DeepEqual(cfg.MemoryBrake, want) {
 		t.Fatalf("got %+v, want %+v", cfg.MemoryBrake, want)
 	}
 }
@@ -90,6 +91,37 @@ func TestMemoryBrakeLegacyWindowSecondsAcceptedAndIgnored(t *testing.T) {
 	}
 	if cfg.MemoryBrake.WindowMinutes != 5 {
 		t.Fatalf("legacy windowSeconds must not change the window: %+v", cfg.MemoryBrake)
+	}
+}
+
+// The post-kill hold survives a llama-swap restart via a file; the purge
+// valve is off unless configured. Both default such that an absent block is
+// byte-identical to before these fields existed.
+func TestMemoryBrakeHoldAndPurgeDefaults(t *testing.T) {
+	d := DefaultMemoryBrakeConfig()
+	if d.HoldStatePath != "~/Library/Application Support/llama-cm/membrake-hold" {
+		t.Fatalf("holdStatePath default = %q", d.HoldStatePath)
+	}
+	if d.PurgeAfterMinutes != 0 {
+		t.Fatalf("purgeAfterMinutes default = %d, want 0 (off)", d.PurgeAfterMinutes)
+	}
+	if !reflect.DeepEqual(d.PurgeCommand, []string{"sudo", "-n", "/usr/sbin/purge"}) {
+		t.Fatalf("purgeCommand default = %v", d.PurgeCommand)
+	}
+}
+
+func TestMemoryBrakePurgeAfterMinutesRejectsNegative(t *testing.T) {
+	if _, err := LoadConfigFromReader(strings.NewReader("memoryBrake:\n  purgeAfterMinutes: -1\n")); err == nil {
+		t.Fatal("expected error for negative purgeAfterMinutes")
+	}
+}
+
+func TestMemoryBrakePurgeCommandRequiredWhenPurgeAfterMinutesSet(t *testing.T) {
+	if _, err := LoadConfigFromReader(strings.NewReader("memoryBrake:\n  purgeAfterMinutes: 5\n  purgeCommand: []\n")); err == nil {
+		t.Fatal("expected error when purgeAfterMinutes > 0 but purgeCommand is empty")
+	}
+	if _, err := LoadConfigFromReader(strings.NewReader("memoryBrake:\n  purgeAfterMinutes: 5\n")); err != nil {
+		t.Fatalf("purgeAfterMinutes with the default purgeCommand must load: %v", err)
 	}
 }
 

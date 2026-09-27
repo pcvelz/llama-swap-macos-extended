@@ -68,10 +68,12 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -96,6 +98,10 @@ const (
 	drainSettle = 60 * time.Second
 	// holdLogEvery is how often a still-shut gate says so in the log.
 	holdLogEvery = 5 * time.Minute
+	// purgeTimeout bounds one purge attempt: PurgeCommand is typically
+	// `sudo -n purge`, which either returns fast or hangs forever asking for a
+	// password sudo -n cannot supply.
+	purgeTimeout = 120 * time.Second
 )
 
 // Reading is one memory sample, in bytes. Only FileBacked is the signal;
@@ -263,6 +269,17 @@ type Brake struct {
 	evict func(path string) error
 	alive func(pgid int) bool
 
+	// purge runs one attempt of the configured PurgeCommand. Tests replace it
+	// with a fake; the brake's own goroutine still bounds it to purgeTimeout.
+	purge func() error
+	// purging and lastPurgeAttempt are touched by drain() (the brake's own
+	// goroutine) and read/written by the purge goroutine it spawns, so both
+	// are atomic. purgeWG lets tests wait for an attempt to finish
+	// deterministically.
+	purging          atomic.Bool
+	lastPurgeAttempt atomic.Int64 // unix nanos; reset to killedAt on every trip
+	purgeWG          sync.WaitGroup
+
 	window     time.Duration
 	armAfter   time.Duration
 	threshold  int64
@@ -314,7 +331,7 @@ func New(cfg config.MemoryBrakeConfig, sampler Sampler, children ChildSource, ki
 	interval := time.Duration(cfg.SampleIntervalMs) * time.Millisecond
 	window := time.Duration(cfg.WindowMinutes) * time.Minute
 	capacity := int(window/interval) + 8
-	return &Brake{
+	b := &Brake{
 		cfg:        cfg,
 		sampler:    sampler,
 		children:   children,
@@ -323,6 +340,7 @@ func New(cfg config.MemoryBrakeConfig, sampler Sampler, children ChildSource, ki
 		hold:       hold,
 		evict:      evictFile,
 		alive:      groupAlive,
+		purge:      purgeCommand(cfg.PurgeCommand),
 		window:     window,
 		armAfter:   time.Duration(cfg.ArmAfterMinutes) * time.Minute,
 		threshold:  int64(cfg.GrowthGB * gib),
@@ -332,6 +350,83 @@ func New(cfg config.MemoryBrakeConfig, sampler Sampler, children ChildSource, ki
 		kids:       make([]process.LiveChild, 0, 16),
 		dqT:        make([]int64, capacity),
 		dqV:        make([]int64, capacity),
+	}
+	b.loadHoldState()
+	return b
+}
+
+// purgeCommand builds the default production purge func: run cmd, wrap its
+// stderr/stdout into the error on failure (e.g. sudo refusing without a
+// password). Empty cmd means the valve cannot run even if armed.
+func purgeCommand(cmd []string) func() error {
+	return func() error {
+		if len(cmd) == 0 {
+			return fmt.Errorf("memoryBrake.purgeCommand is empty")
+		}
+		c := exec.Command(cmd[0], cmd[1:]...)
+		out, err := c.CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("%v: %s", err, strings.TrimSpace(string(out)))
+		}
+		return nil
+	}
+}
+
+// loadHoldState restores a post-kill hold across a llama-swap restart: the
+// in-memory hold used to be lost on restart, sending the next load straight
+// into a file cache the brake had just judged unsafe (witnessed: restart
+// 18:39:54, load, brake kill 3s after ready with file-backed +17 GB in 2s).
+// drainBelowGB: 0 means the gate is never held at all, so any leftover file
+// is stale and is removed rather than honoured.
+func (b *Brake) loadHoldState() {
+	path := expandHome(b.cfg.HoldStatePath)
+	if path == "" {
+		return
+	}
+	if b.drainBelow <= 0 {
+		os.Remove(path)
+		return
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	killedAt, perr := strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64)
+	if perr != nil {
+		killedAt = time.Now().Unix()
+	}
+	killedAtNS := killedAt * int64(time.Second)
+	ev := &Event{At: time.Unix(killedAt, 0)}
+	b.hold.Set(ev, b.drainBelow)
+	b.post = postKill{active: true, killedAt: killedAtNS, evicted: true, pgids: b.post.pgids[:0]}
+	b.lastPurgeAttempt.Store(killedAtNS)
+	if b.log != nil {
+		b.log.Warnf("MEMORY BRAKE HOLD RESTORED: %s survived a restart (killed %s ago); loads stay parked until file-backed drains below %.2f GB",
+			b.cfg.HoldStatePath, time.Since(time.Unix(killedAt, 0)).Round(time.Second), b.cfg.DrainBelowGB)
+	}
+}
+
+// writeHoldState records the kill time so a restart can restore the hold.
+func (b *Brake) writeHoldState(now time.Time) {
+	path := expandHome(b.cfg.HoldStatePath)
+	if path == "" {
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		if b.log != nil {
+			b.log.Warnf("memory brake: could not write hold state %s: %v", b.cfg.HoldStatePath, err)
+		}
+		return
+	}
+	if err := os.WriteFile(path, []byte(strconv.FormatInt(now.Unix(), 10)+"\n"), 0o644); err != nil && b.log != nil {
+		b.log.Warnf("memory brake: could not write hold state %s: %v", b.cfg.HoldStatePath, err)
+	}
+}
+
+// removeHoldState clears the persisted hold on release.
+func (b *Brake) removeHoldState() {
+	if path := expandHome(b.cfg.HoldStatePath); path != "" {
+		os.Remove(path)
 	}
 }
 
@@ -446,6 +541,7 @@ func (b *Brake) trip(now time.Time, r Reading, growth, windowMin int64, span tim
 	}
 	if b.drainBelow > 0 {
 		b.hold.Set(ev, b.drainBelow)
+		b.writeHoldState(now)
 	} else {
 		b.hold.Record(ev)
 	}
@@ -453,6 +549,10 @@ func (b *Brake) trip(now time.Time, r Reading, growth, windowMin int64, span tim
 	for _, c := range b.kids {
 		b.post.pgids = append(b.post.pgids, c.Pgid)
 	}
+	// A fresh trip resets the purge clock: the first attempt is eligible
+	// purgeAfterMinutes after THIS kill, not the last one.
+	b.purging.Store(false)
+	b.lastPurgeAttempt.Store(now.UnixNano())
 
 	line := fmt.Sprintf("%s MEMORY-BRAKE killed=%s signal=filebacked growth_gb=%.2f window_min_gb=%.2f filebacked_gb=%.2f window_span_s=%d window_min=%d threshold_gb=%.2f arm_after_min=%d confirm=%d wired_gb=%.2f swap_used_gb=%.2f drain_below_gb=%.2f",
 		now.Format("2006-01-02 15:04:05"), strings.Join(killed, ","), ev.GrowthGB, ev.WindowMinGB, ev.FileGB, ev.WindowSpanS,
@@ -500,6 +600,7 @@ func (b *Brake) drain(now time.Time, r Reading) {
 		b.evictAll(now, r, false)
 		p.lastEvict = ts
 	}
+	b.maybePurge(now, r)
 	if ts-p.lastLog >= int64(holdLogEvery) {
 		p.lastLog = ts
 		if b.log != nil {
@@ -509,6 +610,62 @@ func (b *Brake) drain(now time.Time, r Reading) {
 	}
 }
 
+// maybePurge starts one purge attempt when the valve is armed
+// (PurgeAfterMinutes > 0), the gate has been shut without draining for at
+// least that long since the kill or the last attempt, and no attempt is
+// already in flight (single-flight). Purging never opens the gate itself -
+// only the ordinary drain rule in drain() does.
+func (b *Brake) maybePurge(now time.Time, r Reading) {
+	if b.cfg.PurgeAfterMinutes <= 0 || b.purging.Load() {
+		return
+	}
+	interval := int64(time.Duration(b.cfg.PurgeAfterMinutes) * time.Minute)
+	ts := now.UnixNano()
+	if ts-b.lastPurgeAttempt.Load() < interval {
+		return
+	}
+	b.startPurge(now, r)
+}
+
+// startPurge runs one attempt off the sampling goroutine, bounded to
+// purgeTimeout so a purge that hangs (e.g. sudo -n blocked on a password
+// prompt it cannot answer) cannot stall sampling.
+func (b *Brake) startPurge(now time.Time, r Reading) {
+	b.purging.Store(true)
+	b.lastPurgeAttempt.Store(now.UnixNano())
+	before := float64(r.FileBacked) / gib
+	b.purgeWG.Add(1)
+	go func() {
+		defer b.purgeWG.Done()
+		defer b.purging.Store(false)
+
+		done := make(chan error, 1)
+		go func() { done <- b.purge() }()
+		var err error
+		select {
+		case err = <-done:
+		case <-time.After(purgeTimeout):
+			err = fmt.Errorf("timed out after %s", purgeTimeout)
+		}
+		if err != nil {
+			if b.log != nil {
+				b.log.Warnf("MEMORY BRAKE PURGE FAILED: %v", err)
+			}
+			return
+		}
+		after := before
+		if b.sampler != nil {
+			var cur Reading
+			if b.sampler.Sample(&cur) == nil {
+				after = float64(cur.FileBacked) / gib
+			}
+		}
+		if b.log != nil {
+			b.log.Warnf("MEMORY BRAKE PURGE: file-backed %.2f -> %.2f GB", before, after)
+		}
+	}()
+}
+
 func (b *Brake) releaseAfterDrain(now time.Time, r Reading) {
 	held := time.Duration(now.UnixNano() - b.post.killedAt).Round(time.Second)
 	b.post.active = false
@@ -516,6 +673,7 @@ func (b *Brake) releaseAfterDrain(now time.Time, r Reading) {
 		return
 	}
 	b.hold.Release()
+	b.removeHoldState()
 	if b.log != nil {
 		b.log.Warnf("MEMORY BRAKE HOLD RELEASED: file-backed %.2f GB has stayed below %.2f GB for %s; local-model loads admitted again (held %s after the kill)",
 			float64(r.FileBacked)/gib, b.cfg.DrainBelowGB, drainSettle, held)

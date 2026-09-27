@@ -43,6 +43,9 @@ func (f *fakeKids) snap(dst []process.LiveChild) ([]process.LiveChild, bool) {
 func testCfg(t *testing.T) config.MemoryBrakeConfig {
 	c := config.DefaultMemoryBrakeConfig()
 	c.MarkerPath = filepath.Join(t.TempDir(), "sub", "MARKER")
+	// Isolated from the real default so a test run never reads or writes the
+	// operator's actual hold-state file.
+	c.HoldStatePath = filepath.Join(t.TempDir(), "hold")
 	return c
 }
 
