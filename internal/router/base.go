@@ -1505,10 +1505,11 @@ func (b *baseRouter) Cooldown() *swaputil.Cooldown {
 }
 
 // FinishCooldown implements LocalRouter. It manually ends the current
-// cooldown, letting the queued swap proceed at the next scheduling pass
-// instead of waiting out the resident's remaining grace. A no-op when the
-// configured scheduler does not support cooldown reporting, or when nothing
-// is currently held.
+// cooldown, with or without a waiter: a queued swap proceeds at the next
+// scheduling pass instead of waiting out the resident's remaining grace, and
+// a no-waiter cooldown's idle grace is expired. A no-op when the configured
+// scheduler does not support cooldown reporting, or when nothing is currently
+// held.
 func (b *baseRouter) FinishCooldown() {
 	if r, ok := b.schedule.(scheduler.CooldownReporter); ok {
 		r.FinishCooldown()

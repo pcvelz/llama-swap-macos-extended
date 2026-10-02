@@ -63,6 +63,28 @@ final class GraceFinishClickTests: XCTestCase {
         }, "expected POST /api/swap-grace/finish, got \(stub.recorded)")
     }
 
+    // A no-waiter cooldown (empty nextModel - nothing cross-model queued)
+    // must POST too: the click ends the resident's idle grace, it does not
+    // just finish a pending swap. The old view guard swallowed this click
+    // before any request left the menu (2026-10-02). The decision to POST is
+    // unconditional in the view, so this test pins BackendClient.finishCooldown
+    // itself: it must not second-guess the row and stay silent.
+    func testNoWaiterClickPostsFinish() {
+        stub.responder = { _, _ in (200, "{}") }
+        let client = makeClient()
+        let noWaiter = CooldownRow(evicteeModel: "cq35", nextModel: "",
+                                   waiting: 0, remainingSeconds: 27, slots: [])
+        client.menuState.cooldown = noWaiter
+
+        client.finishCooldown()
+
+        XCTAssertNil(client.menuState.cooldown,
+                     "a no-waiter cooldown must clear the row at once too")
+        XCTAssertTrue(waitUntil {
+            self.stub.recorded.contains(where: { $0.method == "POST" && $0.path == "/api/swap-grace/finish" })
+        }, "a no-waiter cooldown click must still POST /api/swap-grace/finish, got \(stub.recorded)")
+    }
+
     func testFailedClickRestoresRowAndSurfacesError() {
         stub.responder = { _, path in
             if path == "/api/swap-grace/finish" { return (500, "boom") }

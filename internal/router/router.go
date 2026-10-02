@@ -91,9 +91,10 @@ type LocalRouter interface {
 	// Safe to call from any goroutine.
 	Cooldown() *swaputil.Cooldown
 
-	// FinishCooldown manually ends the current cooldown, letting the queued
-	// swap proceed at the next scheduling pass instead of waiting out the
-	// resident's remaining grace. A no-op if nothing is held. Safe to call
-	// from any goroutine.
+	// FinishCooldown manually ends the current cooldown, with or without a
+	// waiter: a queued swap proceeds at the next scheduling pass instead of
+	// waiting out the resident's remaining grace, and a no-waiter cooldown's
+	// idle grace is expired. A no-op if nothing is held, one-shot either way.
+	// Safe to call from any goroutine.
 	FinishCooldown()
 }

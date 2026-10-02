@@ -20,10 +20,12 @@ type CooldownReporter interface {
 	// goroutine.
 	Cooldown() *swaputil.Cooldown
 
-	// FinishCooldown manually ends the current cooldown, letting the queued
-	// swap proceed at the next scheduling pass (normally the next OnTick,
-	// within ~1s) instead of waiting out the resident's remaining grace. A
-	// no-op if nothing is held. Safe to call from any goroutine.
+	// FinishCooldown manually ends the current cooldown, with or without a
+	// waiter: a queued swap proceeds at the next scheduling pass (normally
+	// the next OnTick, within ~1s) instead of waiting out the resident's
+	// remaining grace, and a no-waiter cooldown's idle grace is expired so
+	// the snapshot goes nil. A no-op if nothing is held, and one-shot either
+	// way. Safe to call from any goroutine.
 	FinishCooldown()
 }
 
@@ -127,8 +129,9 @@ func (s *FIFO) cooldownSnapshotWaiting(now time.Time) *swaputil.Cooldown {
 // inside its own grace with nothing cross-model queued behind it. This is
 // the resident's own state, not a wait - EvicteeModel/RemainingSeconds only,
 // NextModel/Waiting left at their zero values so the menu omits the
-// "then <next> · N waiting" suffix and a click has nothing to finish
-// (FinishCooldown is a documented no-op when nothing is queued, see OnTick).
+// "then <next> · N waiting" suffix. A click on that row still ends it:
+// FinishCooldown expires the idle grace (see expireForcedGrace), which is
+// what takes this snapshot to nil.
 //
 // A model an in-flight swap is already evicting is excluded even if it is
 // still nominally inside its own grace: that grace was just spent by

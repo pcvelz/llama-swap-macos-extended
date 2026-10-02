@@ -78,7 +78,7 @@ func (f *fakeEffects) ModelState(modelID string) (process.ProcessState, bool) {
 func (f *fakeEffects) RunningModels() map[string]process.ProcessState {
 	out := make(map[string]process.ProcessState)
 	for id, st := range f.states {
-		if st == process.StateStopped || st == process.StateShutdown {
+		if st == process.StateStopped || st == process.StateShutdown || st == process.StateStopping {
 			continue
 		}
 		out[id] = st

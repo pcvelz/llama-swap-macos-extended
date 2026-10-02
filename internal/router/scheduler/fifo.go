@@ -162,17 +162,26 @@ type FIFO struct {
 	// the resident, and every model queued behind it shares the same wait
 	// (2026-09-10). Cleared when a swap starts or the queue empties.
 	cooldownWaitSince time.Time
-	// cooldownForcedMu guards cooldownForced. Unlike every other field on
-	// FIFO, cooldownForced is written from arbitrary HTTP goroutines
-	// (FinishCooldown is the menu-bar helper's cooldown row click / POST
-	// /api/swap-grace/finish), not just the run loop, so it needs its own
-	// lock rather than the run-loop-only convention the rest of this struct
-	// follows.
+	// cooldownForcedMu guards cooldownForced and graceExpiredForced. Unlike
+	// every other field on FIFO, both are written from arbitrary HTTP
+	// goroutines (FinishCooldown is the menu-bar helper's cooldown row click
+	// / POST /api/swap-grace/finish), not just the run loop, so they need
+	// their own lock rather than the run-loop-only convention the rest of
+	// this struct follows.
 	cooldownForcedMu sync.Mutex
 	// cooldownForced is the one-shot "end the current cooldown now" flag.
 	// consumeForced clears it the instant it lets a swap proceed, so a
 	// finish never carries over to a later, unrelated cooldown.
 	cooldownForced bool
+	// graceExpiredForced is the one-shot companion for NO-WAITER cooldowns
+	// (2026-10-02): a resident idle inside its own grace with nothing queued
+	// has no deferred swap for consumeForced to unblock, so FinishCooldown
+	// also sets this and OnTick expires the resident's idle streak — which
+	// makes cooldownSnapshotIdle return nil and withinGrace stop deferring.
+	// Consumed on the tick that acts (or dropped when there is nothing to
+	// act on), keeping the one-shot property: a finish clicked while no
+	// cooldown exists cannot end a later, unrelated one.
+	graceExpiredForced bool
 	// now is the clock; overridable in tests.
 	now func() time.Time
 
@@ -731,6 +740,30 @@ func (s *FIFO) OnTick() {
 		// it here rather than let it sit armed against the NEXT cooldown,
 		// which would silently skip a grace the operator never saw.
 		s.consumeForced()
+		// Same one-shot discipline for the no-waiter half (2026-10-02): a
+		// resident idle inside its grace with nothing queued has no deferred
+		// swap for consumeForced to unblock, so expire its idle streak
+		// instead — cooldownSnapshotIdle returns nil and withinGrace stops
+		// deferring. A later served request restarts the cooldown normally
+		// (OnServeDone resets idleSince). If nothing is inside its grace the
+		// intent has no target and is dropped, never left armed against the
+		// NEXT cooldown.
+		s.expireForcedGrace()
+		// A finish clicked while a NO-WAITER cooldown was held must not leak
+		// into the waiter path: the click already acted on the idle grace
+		// above (or found nothing to act on), so drop any leftover forced
+		// flag here rather than let it bypass the NEXT queued swap's grace.
+		s.consumeForced()
+	} else {
+		// A finish clicked while a cross-model swap is parked behind the
+		// cooling resident: consumeForced lets that swap proceed in this
+		// tick's drainQueue, and the evicted resident's grace has been spent
+		// by exactly this decision (it moves into the active swap's evict
+		// set, which cooldownSnapshotIdle already excludes). The no-waiter
+		// intent is consumed alongside so it cannot outlive its cooldown.
+		if s.consumeGraceExpiredForced() {
+			s.logger.Infof("%s: swap-grace: finish expired the resident's idle grace (no waiter)", s.name)
+		}
 	}
 	s.drainQueue()
 	s.publishGrace()
@@ -844,21 +877,66 @@ func (s *FIFO) consumeForced() bool {
 	return forced
 }
 
-// FinishCooldown manually ends the current cooldown: the next scheduling
+// consumeGraceExpiredForced reports whether a no-waiter finish is pending,
+// clearing it if so. Same one-shot discipline as consumeForced: the intent
+// ends exactly ONE cooldown, never a later, unrelated one.
+func (s *FIFO) consumeGraceExpiredForced() bool {
+	s.cooldownForcedMu.Lock()
+	defer s.cooldownForcedMu.Unlock()
+	forced := s.graceExpiredForced
+	s.graceExpiredForced = false
+	return forced
+}
+
+// expireForcedGrace acts on a pending no-waiter finish: it expires the idle
+// streak of every model that is currently inside its own grace (idle, not
+// in flight, not already being evicted) — precisely the set
+// cooldownSnapshotIdle reports as a no-waiter cooldown. With the streak
+// expired, that snapshot returns nil and withinGrace stops deferring, so a
+// later cross-model request does not wait out the old grace. A model with
+// nothing to expire makes the intent a no-op (it is still consumed), which
+// is what keeps a stale click from pre-empting a future cooldown. Run loop
+// only; the flag it clears is guarded by cooldownForcedMu because
+// FinishCooldown sets it from HTTP goroutines.
+func (s *FIFO) expireForcedGrace() {
+	if !s.consumeGraceExpiredForced() {
+		return
+	}
+	now := s.now()
+	for id, since := range s.idleSince {
+		g := s.grace[id]
+		if g <= 0 || s.inFlight[id] > 0 || s.beingEvicted(id) {
+			continue
+		}
+		if now.Sub(since) < g {
+			delete(s.idleSince, id)
+			s.logger.Infof("%s: swap-grace: finish expired the idle grace of %s", s.name, id)
+		}
+	}
+}
+
+// FinishCooldown manually ends the current cooldown, with or without a
+// waiter (2026-10-02): for a queued swap it lets the next scheduling
 // decision (normally the next OnTick, armed at 1s while any swap-grace is
-// configured) bypasses withinGrace once, letting the queued swap proceed
-// immediately instead of waiting out the resident's remaining grace. A
-// no-op if nothing is deferred by grace when that next decision runs.
+// configured) bypass withinGrace once, so the swap proceeds immediately
+// instead of waiting out the resident's remaining grace; for a no-waiter
+// cooldown (resident idle inside its own grace, nothing queued) it expires
+// that idle grace on the next tick, so Cooldown() goes nil and a later
+// cross-model request does not wait out the old grace. A no-op if neither
+// kind of cooldown exists when the next decision runs — and in either case
+// strictly one-shot: a finish never stays armed against a later, unrelated
+// cooldown.
 //
 // Unlike every other FIFO method, this is safe to call from ANY goroutine —
 // it is the HTTP-handler entry point for POST /api/swap-grace/finish (the
 // menu-bar helper's cooldown row click), not a run-loop event. It only ever
-// touches cooldownForced, which cooldownForcedMu protects for exactly this
-// reason.
+// touches cooldownForced/graceExpiredForced, which cooldownForcedMu protects
+// for exactly this reason; the actual state change happens on the run loop.
 func (s *FIFO) FinishCooldown() {
 	s.cooldownForcedMu.Lock()
 	defer s.cooldownForcedMu.Unlock()
 	s.cooldownForced = true
+	s.graceExpiredForced = true
 }
 
 // OnUnload reconciles router-owned state with the impending Stop, performs the

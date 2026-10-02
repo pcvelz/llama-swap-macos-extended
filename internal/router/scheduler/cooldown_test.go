@@ -187,10 +187,12 @@ func TestFIFO_Cooldown_NilOnceGraceFullyElapsed(t *testing.T) {
 	}
 }
 
-// FinishCooldown on a no-waiter cooldown is harmless: there is no queued swap
-// to end, so the one-shot flag is simply dropped at the next tick and the
-// no-waiter row keeps counting down on its own.
-func TestFIFO_Cooldown_FinishOnNoWaiterIsHarmless(t *testing.T) {
+// FinishCooldown ends a NO-WAITER cooldown too (2026-10-02): the resident's
+// idle grace is expired immediately, so the next tick publishes nil and a
+// later cross-model request does not wait out the old grace. The one-shot
+// property survives: a finish clicked while nothing is held must not end a
+// LATER cooldown.
+func TestFIFO_Cooldown_FinishEndsNoWaiter(t *testing.T) {
 	s, eff, clk := cooldownFixture(t)
 	*clk = clk.Add(10 * time.Second)
 	s.OnTick()
@@ -201,10 +203,43 @@ func TestFIFO_Cooldown_FinishOnNoWaiterIsHarmless(t *testing.T) {
 	s.FinishCooldown()
 	s.OnTick()
 
-	if cd := s.Cooldown(); cd == nil || cd.EvicteeModel != "a" {
-		t.Fatalf("Cooldown()=%+v want the no-waiter cooldown to survive a no-op finish", cd)
+	if cd := s.Cooldown(); cd != nil {
+		t.Fatalf("Cooldown()=%+v want nil: finish must end the no-waiter cooldown", cd)
 	}
 	if got := eff.startsFor("b"); got != 0 {
-		t.Fatalf("no swap must start, StartSwap(b)=%d", got)
+		t.Fatalf("no swap may start (nothing queued), StartSwap(b)=%d", got)
+	}
+
+	// A request back to the resident restarts the cooldown from the next
+	// idle moment, exactly like any other served request.
+	s.OnRequest(req("a"))
+	s.OnServeDone(ServeDoneEvent{ModelID: "a"})
+	if cd := s.Cooldown(); cd == nil || cd.NextModel != "" {
+		t.Fatalf("Cooldown()=%+v want a fresh no-waiter cooldown after the resident serves again", cd)
+	}
+
+	// One-shot: a finish clicked while NOTHING is held must not end that
+	// later cooldown. Expire the grace (finish + tick, no waiter present),
+	// then click again with nothing held - the next tick drops the stale
+	// intent rather than leaving it armed against the NEXT cooldown, which
+	// the resident's fresh serve below starts.
+	s.FinishCooldown()
+	s.OnTick() // expires a's grace; nothing queued
+	if cd := s.Cooldown(); cd != nil {
+		t.Fatalf("Cooldown()=%+v want nil after the finish", cd)
+	}
+	s.FinishCooldown() // stale click: no cooldown held
+	s.OnTick()         // drops the stale intent (one-shot discipline)
+	s.OnRequest(req("a"))
+	s.OnServeDone(ServeDoneEvent{ModelID: "a"})
+	if cd := s.Cooldown(); cd == nil || cd.NextModel != "" {
+		t.Fatalf("Cooldown()=%+v want a fresh no-waiter cooldown after the resident serves again", cd)
+	}
+	s.OnRequest(reqCh("b"))
+	if got := eff.startsFor("b"); got != 0 {
+		t.Fatalf("StartSwap(b)=%d want 0: a stale finish must not pre-empt the later cooldown", got)
+	}
+	if cd := s.Cooldown(); cd == nil || cd.NextModel != "b" {
+		t.Fatalf("Cooldown()=%+v want evictee=a next=b still held", cd)
 	}
 }

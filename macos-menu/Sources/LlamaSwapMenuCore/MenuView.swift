@@ -120,15 +120,14 @@ public struct MenuView: View {
         // thing happening (2026-09-10).
         ForEach(state.models) { model in
             if let cd = state.cooldown, cd.evicteeModel == model.id {
-                // A no-waiter cooldown (empty nextModel) has no swap pending
-                // to finish - the click is a harmless no-op rather than a
-                // POST that would do nothing (server-side FinishCooldown is
-                // already a no-op here too, see grace.go OnTick/consumeForced,
-                // but skipping the request avoids a pointless round trip and
-                // an optimistic clear of a row that would just come right
-                // back on the next SSE tick).
+                // The click ends the cooldown WITH OR WITHOUT a waiter
+                // (2026-10-02): with a waiter it lets the queued swap
+                // proceed immediately; without one (empty nextModel) it
+                // expires the resident's idle grace, so the row goes away
+                // within ~1s instead of counting down to nothing. The old
+                // guard that swallowed no-waiter clicks made the row look
+                // dead - a click with zero effect and zero log line.
                 Button {
-                    guard !cd.nextModel.isEmpty else { return }
                     client.finishCooldown()
                 } label: {
                     Label {

@@ -438,6 +438,15 @@ func (s *Server) currentCooldown() *swaputil.Cooldown {
 // the cooldown is a singleton on the resident.
 func (s *Server) handleAPISwapGraceFinish(w http.ResponseWriter, r *http.Request) {
 	s.local.FinishCooldown()
+	// One greppable line per click so the menu's action is visible in
+	// llama-swap.log (the 2026-10-02 incident was diagnosable precisely
+	// because this line was absent). X-Action-Source names the caller; a
+	// bare API call has no header.
+	source := r.Header.Get("X-Action-Source")
+	if source == "" {
+		source = "API"
+	}
+	s.proxylog.Infof("swap-grace: finish via %s", source)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"msg": "cooldown finished"})
 }

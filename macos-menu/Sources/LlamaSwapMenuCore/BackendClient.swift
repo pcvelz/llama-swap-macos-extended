@@ -324,6 +324,7 @@ public final class BackendClient: ObservableObject {
 
         var request = URLRequest(url: baseURL.appendingPathComponent("/api/swap-grace/finish"))
         request.httpMethod = "POST"
+        request.setValue("menu-click", forHTTPHeaderField: "X-Action-Source")
         URLSession.shared.dataTask(with: request) { [weak self] _, response, error in
             let status = (response as? HTTPURLResponse)?.statusCode ?? 0
             let failed = error != nil || status < 200 || status >= 300
