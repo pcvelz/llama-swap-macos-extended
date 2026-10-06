@@ -40,6 +40,7 @@ const (
 	ParkRank          = "rank"           // a higher-rank request is queued ahead (rank barrier)
 	ParkSwapCollision = "swap-collision" // collides with another model's in-flight swap
 	ParkPenalized     = "penalized"      // its session is held by the loop guard's penalty
+	ParkKVWarm        = "kv-warm"        // granting it would purge another session's warm KV cache (kvwarm.go)
 )
 
 // ErrModelNotLoaded is granted to a ConcurrencyExempt (status read) request
@@ -155,6 +156,15 @@ type HandlerReq struct {
 	// either way it is inert unless KVPoolTokens > 0 for the model.
 	EstimatedTokens int
 
+	// Session is the slot lane this request belongs to: the Claude Code
+	// session id, plus "/<agent_id>" for a subagent's turns (the key the
+	// slot-affinity middleware pins a lane on). Read by the KV warm hold
+	// (kvwarm.go) to tell a session's own next turn - which reuses its
+	// resident cache - from another session's, which would purge it. "" when
+	// the request carries no session metadata: such a request never holds a
+	// cache warm, but is still held back from purging one.
+	Session string
+
 	// Tier is the entry-point tier this request arrived through (see
 	// swaputil.Tier). swaputil.DefaultTier for every request on the main
 	// listener / when no `tiers:` block is configured — see
@@ -268,6 +278,9 @@ type ServeDoneEvent struct {
 	// at grant time, echoed back so the scheduler can release exactly what it
 	// reserved. 0 when KV admission wasn't in play for this request.
 	EstimatedTokens int
+	// Session echoes HandlerReq.Session: the KV warm hold (kvwarm.go) marks
+	// this session's prompt resident when its large request completes.
+	Session string
 	// Holder identifies WHICH granted request this event is about: the same
 	// pointer as that request's HandlerReq.Preempted. The scheduler drops
 	// exactly that request's preemption entry, so a finished request never

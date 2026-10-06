@@ -196,6 +196,14 @@ func newBaseRouter(
 	if conf.LoopGuard.Enabled {
 		b.graceTick = time.Second
 	}
+	// And the KV warm hold (scheduler/kvwarm.go): a warm window that lapses
+	// because its session did not come back has no event of its own either.
+	for _, pool := range conf.Routing.Scheduler.Settings.Fifo.KVPoolTokens {
+		if pool > 0 {
+			b.graceTick = time.Second
+			break
+		}
+	}
 
 	sched, err := scheduler.New(conf, name, logger, planner, b)
 	if err != nil {
@@ -335,6 +343,21 @@ func armParkGiveUp(tier swaputil.Tier, responseCommitted bool, replayStart time.
 // promised": a session always gets a turn, waiting is normal, only zero
 // output is a real failure) — a session-carrying request must never be
 // bare-503'd just because it waited past parkGiveUpBudget.
+// laneKeyOf is the slot-lane key of a request: its Claude Code session id,
+// plus "/<agent_id>" for a subagent's turns - the same key the slot-affinity
+// middleware (internal/server affinityLaneKey) pins a lane on. "" without a
+// session id.
+func laneKeyOf(metadata map[string]string) string {
+	sessionID := metadata["session_id"]
+	if sessionID == "" {
+		return ""
+	}
+	if agentID := metadata["agent_id"]; agentID != "" {
+		return sessionID + "/" + agentID
+	}
+	return sessionID
+}
+
 func sessionExemptID8(data swaputil.ReqContextData) (string, bool) {
 	sessionID := data.Metadata["session_id"]
 	if sessionID == "" {
@@ -488,7 +511,7 @@ func (b *baseRouter) GrantError(req scheduler.HandlerReq, err error) {
 // the router would never again be willing to evict this model.
 func (b *baseRouter) GrantServe(req scheduler.HandlerReq, modelID string) bool {
 	p := b.processes[modelID]
-	return b.grant(req, scheduler.HandlerResp{HandleFunc: b.trackedServe(modelID, p, req.EstimatedTokens, req.StatusRead, req.Preempted, req.ReplayWanted)})
+	return b.grant(req, scheduler.HandlerResp{HandleFunc: b.trackedServe(modelID, p, req.EstimatedTokens, req.Session, req.StatusRead, req.Preempted, req.ReplayWanted)})
 }
 
 // StopProcesses implements scheduler.Effects, stopping the named processes in
@@ -532,7 +555,7 @@ func (b *baseRouter) StopProcesses(timeout time.Duration, ids []string) {
 // whatever the upstream reverse proxy would otherwise write. replayWanted,
 // when non-nil, is the same flag scheduler.HandlerReq.ReplayWanted carries —
 // see preemptResponseWriter's type doc for the v2 replay behavior it enables.
-func (b *baseRouter) trackedServe(modelID string, p process.Process, estimatedTokens int, statusRead bool, preempted *atomic.Bool, replayWanted *atomic.Bool) http.HandlerFunc {
+func (b *baseRouter) trackedServe(modelID string, p process.Process, estimatedTokens int, session string, statusRead bool, preempted *atomic.Bool, replayWanted *atomic.Bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// capReleased: the slot table declared this request a phantom and
 		// already gave its cap place back (see slotbind.go).
@@ -550,7 +573,7 @@ func (b *baseRouter) trackedServe(modelID string, p process.Process, estimatedTo
 			if verdict, ok := swaputil.LoopVerdictFromContext(r.Context()); ok && verdict != nil {
 				looping = verdict()
 			}
-			ev := scheduler.ServeDoneEvent{ModelID: modelID, EstimatedTokens: estimatedTokens, StatusRead: statusRead, Looping: looping,
+			ev := scheduler.ServeDoneEvent{ModelID: modelID, EstimatedTokens: estimatedTokens, Session: session, StatusRead: statusRead, Looping: looping,
 				Holder: preempted, CapReleased: capReleased.Load()}
 			if orphan == nil {
 				b.sendServeDone(ev)
@@ -1047,6 +1070,10 @@ func (b *baseRouter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	if setter, ok := swaputil.InflightMetadataSetterFromContext(arrivalCtx); ok && estimatedTokens > 0 {
 		setter("est_tokens", strconv.Itoa(estimatedTokens))
 	}
+	// The slot lane, read ONCE here, before any attempt reaches the scheduler
+	// (whose grant writes data.Metadata concurrently - see sessionExemptID8
+	// below). Feeds the KV warm hold (scheduler/kvwarm.go).
+	session := laneKeyOf(data.Metadata)
 
 	for {
 		attempt := replayCount + 1
@@ -1205,6 +1232,7 @@ func (b *baseRouter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 			// (see scheduler.FIFO.kvAdmit) — see swaputil.EstimateTokens for the
 			// estimation rule.
 			EstimatedTokens: estimatedTokens,
+			Session:         session,
 			// Tier is DefaultTier for every request on the main listener / when no
 			// `tiers:` block is configured (see swaputil.Tier).
 			Tier:         data.Tier,

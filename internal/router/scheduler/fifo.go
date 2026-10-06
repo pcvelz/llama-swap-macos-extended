@@ -126,6 +126,10 @@ type FIFO struct {
 	// releaseKV.
 	kvLargeInFlight map[string]int
 
+	// kvResidents is the KV warm hold's view of whose prompt sits in each
+	// model's pool (model -> session lane -> residency); see kvwarm.go.
+	kvResidents map[string]map[string]*kvResident
+
 	// maxLarge is the per-model large-request cap (config
 	// maxParallelLargePrefill) that kvAdmit compares kvLargeInFlight against;
 	// see maxLargeFor for models absent here. concurrencyLimit (limits) stays
@@ -242,6 +246,7 @@ func NewFIFO(name string, logger *logmon.Monitor, planner Swapper, cfg config.Fi
 		granted:         make(map[string][]*grantedReq),
 		kvInFlight:      make(map[string]int),
 		kvLargeInFlight: make(map[string]int),
+		kvResidents:     make(map[string]map[string]*kvResident),
 		maxLarge:        maxLarge,
 		grace:           grace,
 		idleSince:       make(map[string]time.Time),
@@ -409,6 +414,18 @@ func (s *FIFO) OnRequest(req HandlerReq) {
 			markKVParked(req)
 			markParked(&req, ParkKV)
 			s.enqueue(req)
+			s.kvWarmContention()
+			return
+		}
+		// KV warm hold (kvwarm.go): the pool has room for what is in
+		// flight, but not for this request beside another session's prompt
+		// that is still resident between two turns of its tool loop.
+		if r := s.kvWarmBlocker(req); r != nil {
+			s.logKVWarmHold(req, r)
+			markKVParked(req)
+			markParked(&req, ParkKVWarm)
+			s.enqueue(req)
+			s.kvWarmContention()
 			return
 		}
 		s.logger.Debugf("%s: fast-path serving model %s (already ready)", s.name, req.Model)
@@ -630,6 +647,9 @@ func (s *FIFO) OnServeDone(ev ServeDoneEvent) {
 	}
 
 	kvReleased := s.releaseKV(ev.ModelID, ev.EstimatedTokens)
+	// Before the drain below: the prompt this request leaves resident is what
+	// that drain must not purge (kvwarm.go).
+	s.kvWarmOnDone(ev)
 	s.publishCapacity()
 	s.publishGrace()
 
@@ -949,6 +969,7 @@ func (s *FIFO) OnUnload(targets []string, timeout time.Duration) {
 	for _, id := range targets {
 		targetSet[id] = true
 	}
+	s.kvWarmForget(targets...)
 
 	// Release waiters of any in-flight swap whose target is being unloaded.
 	// The swap goroutine itself is left to finish on its own; when its
@@ -1058,6 +1079,7 @@ func (s *FIFO) grantHandler(req HandlerReq, modelID string) {
 				s.kvLargeInFlight[modelID]++
 			}
 		}
+		s.kvWarmOnGrant(req, modelID)
 		// Track tier + preempt handle for the preemption branch. req.Preempt
 		// is nil for callers that don't wire tiered-queue support (e.g. tests
 		// against a bare fakeEffects) — harmless to skip tracking those; they
@@ -1336,6 +1358,9 @@ func (s *FIFO) startSwap(initial HandlerReq, evict, running []string) {
 	// The wait is over — drop the cooldown's starvation-valve reference so
 	// the NEXT cooldown measures a fresh wait of its own.
 	s.cooldownWaitSince = time.Time{}
+	// The target starts with empty slots and the evicted models lose theirs.
+	s.kvWarmForget(initial.Model)
+	s.kvWarmForget(evict...)
 	s.active[initial.Model] = &activeSwap{
 		modelID: initial.Model,
 		evict:   evict,
@@ -1470,9 +1495,20 @@ func (s *FIFO) drainQueue() {
 				if s.tryPreempt(req, []string{req.Model}, 1) {
 					s.logger.Debugf("%s: preempting same-model in-flight request(s) on %s for queued higher-rank request", s.name, req.Model)
 				}
-				s.logKVParked(req.Model, req.EstimatedTokens)
+				// Once per park, not on every once-a-second drain pass: the
+				// per-pass line was 3600 identical lines an hour per waiter.
+				if req.parkReason != ParkKV {
+					s.logKVParked(req.Model, req.EstimatedTokens)
+				}
 				markKVParked(req)
 				markParked(&req, ParkKV)
+				stick(req)
+				continue
+			}
+			if r := s.kvWarmBlocker(req); r != nil {
+				s.logKVWarmHold(req, r)
+				markKVParked(req)
+				markParked(&req, ParkKVWarm)
 				stick(req)
 				continue
 			}
@@ -1507,6 +1543,7 @@ func (s *FIFO) drainQueue() {
 		// Nothing held any more: the next cooldown measures its own wait.
 		s.cooldownWaitSince = time.Time{}
 	}
+	s.kvWarmContention()
 	broadcastQueuePositions(s.queued)
 	s.publishCapacity()
 	s.publishGrace()
