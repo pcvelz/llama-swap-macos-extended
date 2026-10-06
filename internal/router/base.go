@@ -573,7 +573,7 @@ func (b *baseRouter) trackedServe(modelID string, p process.Process, estimatedTo
 			if verdict, ok := swaputil.LoopVerdictFromContext(r.Context()); ok && verdict != nil {
 				looping = verdict()
 			}
-			ev := scheduler.ServeDoneEvent{ModelID: modelID, EstimatedTokens: estimatedTokens, Session: session, StatusRead: statusRead, Looping: looping,
+			ev := scheduler.ServeDoneEvent{ModelID: modelID, EstimatedTokens: estimatedTokens, Session: session, Cut: r.Context().Err() != nil, StatusRead: statusRead, Looping: looping,
 				Holder: preempted, CapReleased: capReleased.Load()}
 			if orphan == nil {
 				b.sendServeDone(ev)

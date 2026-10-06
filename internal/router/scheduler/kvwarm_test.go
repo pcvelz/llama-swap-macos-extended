@@ -156,6 +156,58 @@ func TestKVWarm_ColdPrefillDoesNotSpendTheQuantum(t *testing.T) {
 	r.wantServed(2, "A's first warm turn after a long cold prefill")
 }
 
+// A turn the client walked out on (a non-streaming request cut at its 6-min
+// wall, live 2026-10-06 20:14-20:21) leaves a partial prefill resident; the
+// retry resumes it. Those cut retries are still the cold prefill: they keep
+// the cache warm but must not spend the quantum, which starts at the first
+// turn that actually completes.
+func TestKVWarm_CutRetriesDoNotSpendTheQuantum(t *testing.T) {
+	r := newKVWarmRig(t, kvwPool)
+	r.req("A", kvwA)
+	r.req("B", kvwB)
+	for i := 0; i < 7; i++ { // 7 x 6 min of cut attempts = 42 min, past one quantum
+		r.s.OnServeDone(ServeDoneEvent{ModelID: "m", EstimatedTokens: kvwA, Session: "A", Cut: true})
+		r.advance(10 * time.Second)
+		r.req("A", kvwA)
+		if got := r.eff.lastServeReq.Session; got != "A" || r.eff.served("m") != 2+i {
+			t.Fatalf("cut attempt %d (%s into the hold): last grant %q served=%d, want A's retry resuming its partial prefill",
+				i+1, time.Duration(i)*(6*time.Minute+10*time.Second), got, r.eff.served("m"))
+		}
+		r.advance(6 * time.Minute)
+	}
+	r.done("A", kvwA) // the turn finally completes: NOW the quantum starts
+	r.advance(10 * time.Second)
+	r.req("A", kvwA)
+	if got := r.eff.lastServeReq.Session; got != "A" {
+		t.Fatalf("A's first warm turn after its cold prefill completed: last grant %q, want A", got)
+	}
+}
+
+// Cut retries cannot hold the pool forever: the hold ends at kvWarmCeiling
+// from the first warm hold, whatever the holder does.
+func TestKVWarm_CeilingBoundsCutRetries(t *testing.T) {
+	r := newKVWarmRig(t, kvwPool)
+	r.req("A", kvwA)
+	r.req("B", kvwB)
+	served := 1
+	for elapsed := time.Duration(0); elapsed < kvWarmCeiling+10*time.Minute; elapsed += 6 * time.Minute {
+		r.s.OnServeDone(ServeDoneEvent{ModelID: "m", EstimatedTokens: kvwA, Session: "A", Cut: true})
+		if r.eff.lastServeReq.Session == "B" {
+			return // B got the pool
+		}
+		r.advance(10 * time.Second)
+		r.req("A", kvwA)
+		if r.eff.served("m") == served {
+			break
+		}
+		served = r.eff.served("m")
+		r.advance(6 * time.Minute)
+	}
+	if r.eff.lastServeReq.Session != "B" {
+		t.Fatalf("B never granted while A's requests were cut for %s: the ceiling must end the hold", kvWarmCeiling+10*time.Minute)
+	}
+}
+
 // Two prompts that share the pool never wait on each other.
 func TestKVWarm_FitsTogetherNeverHolds(t *testing.T) {
 	r := newKVWarmRig(t, kvwPool)

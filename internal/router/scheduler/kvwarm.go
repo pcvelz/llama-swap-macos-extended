@@ -54,6 +54,10 @@ var kvWarmWindow = 120 * time.Second
 // on a 200k prompt, so the quantum must be long enough to amortise it.
 var kvWarmQuantum = 30 * time.Minute
 
+// kvWarmCeiling ends any hold this long after it first made another session
+// wait, cut retries of a cold prefill included: the waiter's worst case.
+var kvWarmCeiling = 90 * time.Minute
+
 // kvResidentForget drops an idle residency nobody displaced: its session has
 // not come back for this long, so the entry is only bookkeeping.
 const kvResidentForget = time.Hour
@@ -74,8 +78,13 @@ type kvResident struct {
 	lastEnd   time.Time
 	warmUntil time.Time
 	// contendedSince is when another session first waited on this residency
-	// (zero = nobody waiting). The quantum runs from here.
+	// (zero = nobody waiting); kvWarmCeiling runs from here. quantumSince is
+	// the first COMPLETED turn after that (a cut retry is still the cold
+	// prefill); kvWarmQuantum runs from there. lastCut: the last request ended
+	// cut.
 	contendedSince time.Time
+	quantumSince   time.Time
+	lastCut        bool
 }
 
 // sessionRoot strips a subagent suffix: "<session>/<agent>" -> "<session>".
@@ -93,17 +102,24 @@ func shortSession(session string) string {
 		return "(none)"
 	}
 	root := sessionRoot(session)
+	sub := root != session
 	if len(root) > 8 {
 		root = root[:8]
 	}
-	if root != session {
+	if sub {
 		return root + "/sub"
 	}
 	return root
 }
 
 func (s *FIFO) kvWarmQuantumSpent(r *kvResident, now time.Time) bool {
-	return !r.contendedSince.IsZero() && now.Sub(r.contendedSince) >= kvWarmQuantum
+	if r.contendedSince.IsZero() {
+		return false
+	}
+	if now.Sub(r.contendedSince) >= kvWarmCeiling {
+		return true
+	}
+	return !r.quantumSince.IsZero() && now.Sub(r.quantumSince) >= kvWarmQuantum
 }
 
 // kvWarmProtected: r is idle, inside its window and its quantum.
@@ -148,8 +164,8 @@ func (s *FIFO) logKVWarmHold(req HandlerReq, r *kvResident) {
 	}
 	now := s.now()
 	quantumLeft := kvWarmQuantum
-	if !r.contendedSince.IsZero() {
-		quantumLeft -= now.Sub(r.contendedSince)
+	if !r.quantumSince.IsZero() {
+		quantumLeft -= now.Sub(r.quantumSince)
 	}
 	s.logger.Infof("kv-warm: holding %s request of session %s est=%d: granting it would purge session %s's warm cache (%d tok, warm %s more, quantum %s left) inflight=%d pool=%d",
 		req.Model, shortSession(req.Session), req.EstimatedTokens, shortSession(r.session), r.tokens,
@@ -232,6 +248,10 @@ func (s *FIFO) kvWarmOnDone(ev ServeDoneEvent) {
 	now := s.now()
 	r.tokens = ev.EstimatedTokens
 	r.lastEnd = now
+	r.lastCut = ev.Cut
+	if !ev.Cut && !r.contendedSince.IsZero() && r.quantumSince.IsZero() {
+		r.quantumSince = now
+	}
 	if s.kvWarmQuantumSpent(r, now) {
 		r.warmUntil = time.Time{}
 		s.logger.Infof("kv-warm: %s session %s quantum spent (another session waiting %s): not holding its cache, the waiter goes next",
@@ -274,8 +294,12 @@ func (s *FIFO) kvWarmContention() {
 			switch {
 			case !waiting:
 				r.contendedSince = time.Time{}
+				r.quantumSince = time.Time{}
 			case heldWarm && r.contendedSince.IsZero() && s.kvWarmProtected(r, now):
 				r.contendedSince = now
+				if !r.lastCut {
+					r.quantumSince = now
+				}
 			}
 		}
 		if len(rs) == 0 {
