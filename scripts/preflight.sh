@@ -46,13 +46,11 @@
 # commit fast while still running every lane the change can actually break.
 # Pass --all to force every lane regardless of what changed.
 #
-# HONEST LIMITATION
-# This tests the WORKING TREE, not the staged index — matching what a developer
-# is about to commit in the common case, but diverging under partial staging
-# (`git add -p`, or a file staged and then edited again). That case is detected
-# and reported rather than silently ignored: see the partial-staging warning.
-# There is no stash-based isolation on purpose; stashing to run a check is how
-# uncommitted work gets lost.
+# WHICH TREE
+# The pre-commit hook runs this script from a `git checkout-index` export of the
+# index being committed (PREFLIGHT_GIT_REPO names the real repo for git reads),
+# so it tests exactly the commit - not another session's unstaged work in the
+# shared checkout. Run by hand it tests the working tree. No stash, ever.
 #
 # EXIT: 0 = every selected lane passed. 1 = at least one failed (details above).
 #       Skipped lanes (missing toolchain) are reported and never fail the run.
@@ -65,6 +63,7 @@ set -uo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO" || exit 1
+GIT_REPO="${PREFLIGHT_GIT_REPO:-$REPO}"
 
 # Workflows this fork keeps fully disabled on GitHub rather than fixing up to
 # run here (used by the "workflow hygiene" lane's remote-state check).
@@ -111,9 +110,11 @@ run() {
 # CI red, so untracked files must count.
 changed_files() {
     {
-        git diff --name-only --cached
-        git diff --name-only
-        git ls-files --others --exclude-standard
+        git -C "$GIT_REPO" diff --name-only --cached
+        if [[ "$GIT_REPO" == "$REPO" ]]; then  # snapshot mode: only the commit counts
+            git -C "$GIT_REPO" diff --name-only
+            git -C "$GIT_REPO" ls-files --others --exclude-standard
+        fi
     } | sort -u
 }
 
@@ -149,8 +150,8 @@ fi
 # ---------------------------------------------------------------------------
 # A file that is BOTH staged and modified means the tree being tested is not the
 # content being committed. Warn loudly; do not fail — the developer may know.
-BOTH=$(comm -12 <(git diff --name-only --cached | sort -u) <(git diff --name-only | sort -u))
-if [[ -n "$BOTH" ]]; then
+BOTH=$(comm -12 <(git -C "$GIT_REPO" diff --name-only --cached | sort -u) <(git -C "$GIT_REPO" diff --name-only | sort -u))
+if [[ -n "$BOTH" && "$GIT_REPO" == "$REPO" ]]; then
     printf '\n\033[33mWARNING\033[0m  these files are staged AND further modified —\n'
     printf '         preflight tests the working tree, so it is NOT checking\n'
     printf '         exactly what would be committed:\n'
@@ -280,9 +281,9 @@ if touched '^macos-menu/'; then
     # so this lane skips quietly when it is not found (e.g. CI, or a clone
     # without it) rather than failing the build over a missing neighbour.
     # LLAMA_CM_ROOT overrides the default sibling-directory guess.
-    _twg="${LLAMA_CM_ROOT:-$(dirname "$REPO")/llama-cm}/llama/tests/lib/test-weakening-guard.sh"
+    _twg="${LLAMA_CM_ROOT:-$(dirname "$GIT_REPO")/llama-cm}/llama/tests/lib/test-weakening-guard.sh"
     if [[ -r "$_twg" ]]; then
-        if TWG_TEST_PATH_RE='^macos-menu/Tests/.*\.swift$' bash "$_twg" "$REPO" >/tmp/preflight-twg.log 2>&1; then
+        if TWG_TEST_PATH_RE='^macos-menu/Tests/.*\.swift$' bash "$_twg" "$GIT_REPO" >/tmp/preflight-twg.log 2>&1; then
             pass "test-weakening guard (macos-menu/Tests)"
         else
             fail "test-weakening guard (macos-menu/Tests)"
@@ -359,7 +360,7 @@ if touched '^(\.github/workflows/|docker/)'; then
     elif ! command -v gh >/dev/null 2>&1; then
         skip "remote workflow state — gh not installed"
     else
-        FORK_REPO="$(git remote get-url origin 2>/dev/null \
+        FORK_REPO="$(git -C "$GIT_REPO" remote get-url origin 2>/dev/null \
             | sed -E 's#^git@github\.com:##; s#^https?://github\.com/##; s#\.git$##')"
         WF_JSON=""
         [[ -n "$FORK_REPO" ]] && WF_JSON="$(gh api "repos/${FORK_REPO}/actions/workflows" 2>/dev/null)"
@@ -430,7 +431,7 @@ if touched '^(\.github/workflows/|docker/)'; then
         elif ! docker info >/dev/null 2>&1; then
             skip "local vulkan assemble — Docker daemon not reachable"
         else
-            _fork_slug=$(git remote get-url origin 2>/dev/null | sed -E 's#^(https://github.com/|git@github.com:)##; s#\.git$##')
+            _fork_slug=$(git -C "$GIT_REPO" remote get-url origin 2>/dev/null | sed -E 's#^(https://github.com/|git@github.com:)##; s#\.git$##')
             _asm_log=$(mktemp -t preflight-assemble)
             # Pin the upstream refs to what the last GREEN CI run resolved, so
             # the published artifacts exist and the local build reproduces
