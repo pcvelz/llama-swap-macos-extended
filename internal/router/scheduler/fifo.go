@@ -582,6 +582,16 @@ func (s *FIFO) OnSwapDone(ev SwapDone) {
 			s.enqueue(w)
 			continue
 		}
+		// The KV pool and the large-prefill cap bind swap waiters too: without
+		// this, two large sessions that waited out a swap prefilled together
+		// past the pool (cq27 2026-10-06, 198k + 98k on 262144).
+		if !s.kvAdmit(w.Model, w.EstimatedTokens) {
+			s.logKVParked(w.Model, w.EstimatedTokens)
+			markKVParked(w)
+			markParked(&w, ParkKV)
+			s.enqueue(w)
+			continue
+		}
 		s.grantHandler(w, ev.ModelID)
 	}
 

@@ -4,6 +4,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mostlygeek/llama-swap/internal/config"
 	"github.com/mostlygeek/llama-swap/internal/process"
 )
 
@@ -199,6 +200,30 @@ func TestKVWarm_InertWithoutPool(t *testing.T) {
 	r.done("A", kvwA)
 	r.req("B", kvwA)
 	r.wantServed(2, "no kvPoolTokens: no hold")
+}
+
+// Requests that waited out a model swap are granted by OnSwapDone, which used
+// to check only the concurrency cap: after every swap to cq27 its two large
+// sessions (198k + 98k on a 262144 pool) prefilled together (live 2026-10-06
+// 19:44). The pool and the large-prefill cap apply to swap waiters too.
+func TestKVWarm_SwapWaitersRespectThePool(t *testing.T) {
+	withLargePrefillThreshold(t, 100)
+	eff := newFakeEffects()
+	eff.states["m"] = process.StateStopped
+	s := newFIFOKVModels(eff, map[string]int{"m": kvwPool},
+		map[string]config.ModelConfig{"m": {ConcurrencyLimit: 2, MaxParallelLargePrefill: 2}})
+
+	s.OnRequest(HandlerReq{Model: "m", EstimatedTokens: kvwA, Session: "A"}) // starts the swap
+	s.OnRequest(HandlerReq{Model: "m", EstimatedTokens: kvwB, Session: "B"}) // joins it
+	eff.states["m"] = process.StateReady
+	s.OnSwapDone(SwapDone{ModelID: "m"})
+
+	if got := eff.served("m"); got != 1 {
+		t.Fatalf("both swap waiters granted (served=%d want 1): %d + %d overflows pool %d", got, kvwA, kvwB, kvwPool)
+	}
+	if len(s.queued) != 1 || s.queued[0].parkReason != ParkKV {
+		t.Fatalf("the second waiter must wait in the queue parked on kv, queue=%d", len(s.queued))
+	}
 }
 
 // A reload starts with empty slots: an unload forgets every residency.
