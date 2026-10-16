@@ -34,13 +34,15 @@ public struct MenuState: Encodable {
     /// One row per session in the session-state contract's `sessions[]`
     /// (llama-cm docs/intent/session-state-contract.md), pushed by the
     /// "sessions" SSE event and decoded straight into `SessionRow` - see
-    /// SessionStateContract.swift. Sorted by the server (priority descending,
-    /// then elapsedMs descending); this menu renders that order as given,
-    /// never re-sorting it. The PARKED rows ARE the wait list: top to bottom is
-    /// the pick order (tier rank descending - priority, default, background -
-    /// then the order the scheduler will grant), so the top row is the next
-    /// request a slot takes. `queueSummary` below restates that same order as
-    /// one line (user ruling 2026-09-25: the summary line stays).
+    /// SessionStateContract.swift. Sorted by the server, active-first (DECODE,
+    /// then PREFILL/LOADING, then PARKED, then the rest; within a phase
+    /// priority descending, then elapsedMs descending); this menu renders that
+    /// order as given, never re-sorting it. The PARKED rows ARE the wait list:
+    /// their relative order is the pick order (tier rank descending - priority,
+    /// default, background - then the order the scheduler will grant), so the
+    /// first PARKED row is the next request a slot takes. `queueSummary` below
+    /// restates that order as one line (user ruling 2026-09-25: the summary
+    /// line stays).
     public var sessionRows: [SessionRow] = []
 
     /// The current swap-grace cooldown (llama-cm llama-swap.yaml
@@ -127,7 +129,8 @@ public struct MenuState: Encodable {
     /// already comes from. There is no second "scheduler queue" list to keep
     /// in sync with it: llama-swap's PARKED entries ARE the wait list, in the
     /// order it already sorted them (priority descending, then elapsedMs
-    /// descending - session-state-contract.md § "sessions"). Restored by
+    /// descending within the PARKED phase - session-state-contract.md
+    /// § "sessions"). Restored by
     /// user ruling 2026-09-25 after 40db173 removed it; do not remove again
     /// without the user.
     public static func queueSummary(_ rows: [SessionRow]) -> String {

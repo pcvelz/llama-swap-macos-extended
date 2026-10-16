@@ -484,3 +484,31 @@ func TestSessions_SSEEvent(t *testing.T) {
 		t.Fatalf("no sessions event in SSE stream: %q", body)
 	}
 }
+
+// Active-first order: a session the backend is serving (DECODE/PREFILL) is
+// listed above a PARKED one even when the parked request is older, because
+// the menu's Queue block reads top-down as "what is running now". Within a
+// phase the old order (priority desc, then elapsed desc) still holds.
+func TestSessions_ActiveFirstOrder(t *testing.T) {
+	b := newSessionsBuilder(sessionsTestConfig())
+	now := fixtureClock(t, "2026-10-16T12:00:00.000+02:00")
+	running := map[string]process.ProcessState{sessModel: process.StateReady}
+	parked := swaputil.InflightRequestEntry{
+		ID: "r-park", Model: sessModel, Timestamp: now.Add(-2787 * time.Second),
+		Metadata: map[string]string{"session_id": "97c5c88f-0000-0000-0000-000000000001", "park_reason": "busy", "tier": "default"},
+	}
+	decode := swaputil.InflightRequestEntry{
+		ID: "r-dec", Model: sessModel, Timestamp: now.Add(-55 * time.Second),
+		Metadata: map[string]string{"session_id": "9f562e73-0000-0000-0000-000000000002", "slot_granted": "1", "slot_id": "0", "tier": "default"},
+	}
+	slots := map[string][]childSlot{sessModel: {
+		{ID: 0, NCtx: 262144, IsProcessing: true, NPromptTokens: 92254, NPromptTokensCache: 92254, NPromptTokensProcessed: 0, NDecoded: 40},
+	}}
+	got := b.build(sessionsInput{Now: now, Running: running, Requests: []swaputil.InflightRequestEntry{parked, decode}, Slots: slots, MemoryBrake: enabledBrake()})
+	if len(got.Sessions) < 2 {
+		t.Fatalf("want 2 session rows, got %d", len(got.Sessions))
+	}
+	if got.Sessions[0].Phase != phaseDecode || got.Sessions[1].Phase != phaseParked {
+		t.Fatalf("want DECODE then PARKED, got %s then %s", got.Sessions[0].Phase, got.Sessions[1].Phase)
+	}
+}

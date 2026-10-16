@@ -484,8 +484,16 @@ func (b *sessionsBuilder) build(in sessionsInput) sessionsBody {
 			body.Queue.ByTier[row.Tier]++
 		}
 	}
+	// WHY ACTIVE-FIRST: the menus read this list top-down as "what is running
+	// now". A PARKED request older than a DECODING one used to sort above it
+	// on elapsed time alone, which hid the session actually being served.
+	// Phase rank comes BEFORE priority; within one rank the old key still
+	// applies, so the parked subset keeps the scheduler's pick order.
 	sort.SliceStable(body.Sessions, func(i, j int) bool {
 		a, c := body.Sessions[i], body.Sessions[j]
+		if ra, rc := phaseSortRank(a.Phase), phaseSortRank(c.Phase); ra != rc {
+			return ra < rc
+		}
 		if a.Priority != c.Priority {
 			return a.Priority > c.Priority
 		}
@@ -495,6 +503,29 @@ func (b *sessionsBuilder) build(in sessionsInput) sessionsBody {
 		return a.SessionShort < c.SessionShort
 	})
 	return body
+}
+
+// phaseSortRank orders rows for the menus: the backend is working on DECODE
+// and PREFILL/LOADING first, then the queue (PARKED), then the held and idle
+// rows. Unknown phases sort last so a new phase is visible but never jumps
+// ahead of live work by accident.
+func phaseSortRank(phase string) int {
+	switch phase {
+	case phaseDecode:
+		return 0
+	case phasePrefill, phaseLoading:
+		return 1
+	case phaseParked:
+		return 2
+	case phasePenalized:
+		return 3
+	case phaseHot:
+		return 4
+	case phaseIdle:
+		return 5
+	default:
+		return 6
+	}
 }
 
 // heldNow is the set of sessions the scheduler is ACTUALLY holding right now:
