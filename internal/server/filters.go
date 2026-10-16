@@ -115,8 +115,39 @@ func CreateFormFilterMiddleware(cfg config.Config) chain.Middleware {
 
 			useModelName, _, ok := resolveFilters(cfg, data.Model)
 			if !ok || useModelName == "" {
+				// WHY: even when the requested model has no filter config, a
+				// transcription request must still be rewritten if a dedicated
+				// transcription model is configured. Without this branch voice
+				// dictation on cq* sessions routes to the text-only chat model
+				// and silently fails (2026-10-04 incident).
+				if cfg.TranscriptionModel != "" && r.URL.Path == "/v1/audio/transcriptions" {
+					updated, err := swaputil.ReplaceRequestModel(r, data.Model, cfg.TranscriptionModel)
+					if err != nil {
+						swaputil.SendResponse(w, r, http.StatusBadRequest, err.Error())
+						return
+					}
+					// WHY: the dispatch reads data.ModelID from the context, not
+					// the request body. Rewriting only the form field leaves the
+					// context pointing at the original chat model, so the audio
+					// still lands on the text-only LLM. Update both.
+					data.Model = cfg.TranscriptionModel
+					data.ModelID = cfg.TranscriptionModel
+					newCtx := swaputil.SetContext(r.Context(), data)
+					updated = updated.WithContext(newCtx)
+					next.ServeHTTP(w, updated)
+					return
+				}
 				next.ServeHTTP(w, r)
 				return
+			}
+
+			// WHY: /v1/audio/transcriptions always routes to the dedicated
+			// transcription model (whisper), regardless of which chat model the
+			// session is using. Claude Code sends model=<current-chat-model> in
+			// the multipart form; without this rewrite the audio lands on a
+			// text-only llama-server that cannot transcribe.
+			if cfg.TranscriptionModel != "" && r.URL.Path == "/v1/audio/transcriptions" {
+				useModelName = cfg.TranscriptionModel
 			}
 
 			updated, err := swaputil.ReplaceRequestModel(r, data.Model, useModelName)
@@ -125,10 +156,23 @@ func CreateFormFilterMiddleware(cfg config.Config) chain.Middleware {
 				return
 			}
 
-			// UseModelName changes only the model name sent upstream. Keep the
-			// original request context so routing and metrics still identify
-			// the configured model.
-			updated = updated.WithContext(r.Context())
+			// WHY: for transcription requests the context MUST point at the
+			// whisper model, not the original chat model. The dispatch reads
+			// data.ModelID from the context to decide which child serves the
+			// request; leaving it on cq27 sends audio to a text-only LLM.
+			// For non-transcription rewrites we keep the original context so
+			// routing and metrics still identify the configured model.
+			if cfg.TranscriptionModel != "" && r.URL.Path == "/v1/audio/transcriptions" {
+				data.Model = useModelName
+				data.ModelID = useModelName
+				newCtx := swaputil.SetContext(r.Context(), data)
+				updated = updated.WithContext(newCtx)
+			} else {
+				// UseModelName changes only the model name sent upstream. Keep the
+				// original request context so routing and metrics still identify
+				// the configured model.
+				updated = updated.WithContext(r.Context())
+			}
 			next.ServeHTTP(w, updated)
 		})
 	}

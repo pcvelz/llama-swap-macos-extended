@@ -220,6 +220,15 @@ type Config struct {
 	Groups map[string]GroupConfig `yaml:"groups"` /* key is group ID */
 	Matrix *MatrixConfig          `yaml:"matrix"`
 
+	// TranscriptionModel is the model ID that handles /v1/audio/transcriptions
+	// requests. When set, the form filter middleware rewrites the model field
+	// on transcription requests to this value before dispatch, so voice
+	// dictation from any chat model (cq27, cq35, ck3) lands on a dedicated
+	// whisper backend rather than the text-only LLM the session is using.
+	// Empty (default) = no rewrite; transcription routes to whatever model
+	// the client names (upstream behaviour).
+	TranscriptionModel string `yaml:"transcriptionModel"`
+
 	// for key/value replacements in model's cmd, cmdStop, proxy, checkEndPoint
 	Macros MacroList `yaml:"macros"`
 
@@ -484,6 +493,12 @@ type LoopGuardConfig struct {
 	// at any of ef043b3f's last 16 completions. The hold bought nobody
 	// anything; it only idled the box.
 	HoldOnlyWhenContended bool `yaml:"holdOnlyWhenContended"`
+	// YieldFloorTokPerMin: output tokens per minute below which a glacial
+	// in-flight request is struck and cancelled. Default 10 tok/min (~1 tok/6s).
+	YieldFloorTokPerMin float64 `yaml:"yieldFloorTokPerMin"`
+	// YieldFloorMinutes: how many consecutive minutes the yield must stay
+	// below the floor before a strike fires. Default 15.
+	YieldFloorMinutes int `yaml:"yieldFloorMinutes"`
 }
 
 // DefaultLoopGuardConfig is ON, at the thresholds derived from the 2026-09-19
@@ -508,6 +523,8 @@ func DefaultLoopGuardConfig() LoopGuardConfig {
 		MaxLoopTokens:         256,
 		MaxPeriod:             3,
 		HoldOnlyWhenContended: true,
+		YieldFloorTokPerMin:   10,
+		YieldFloorMinutes:     15,
 	}
 }
 

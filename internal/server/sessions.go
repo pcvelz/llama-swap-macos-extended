@@ -946,6 +946,19 @@ func (h *sessionsHub) tick(now time.Time, poll bool) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	s := h.s
+
+	// Yield-floor check: cancel glacial in-flight requests and record yield
+	// strikes. Runs on every 1 Hz tick so a request that sits at ~2 tok/min
+	// for 15 minutes is struck and its slot freed without waiting for the
+	// next completion to discover it.
+	cancelled, events := s.inflight.CheckYieldFloor()
+	for _, ev := range events {
+		s.logPenaltyEvent(ev)
+	}
+	if len(cancelled) > 0 {
+		s.proxylog.Infof("yield: cancelled %d glacial request(s)", len(cancelled))
+	}
+
 	running := s.local.RunningModels()
 	if poll || h.lastPoll == nil {
 		if poll {

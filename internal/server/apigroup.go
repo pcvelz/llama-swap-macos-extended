@@ -451,16 +451,22 @@ func (s *Server) handleAPISwapGraceFinish(w http.ResponseWriter, r *http.Request
 	json.NewEncoder(w).Encode(map[string]string{"msg": "cooldown finished"})
 }
 
-// logPenaltyEvent is the loop tracker's observer: one greppable `loopguard:`
-// line per transition at INFO, plus the debug-history event when that is on.
-// Session ids are shortened to 8 chars, the form every other log line and the
-// menu use.
+// logPenaltyEvent is the loop tracker's observer: one greppable line per
+// transition at INFO, plus the debug-history event when that is on. Session
+// ids are shortened to 8 chars, the form every other log line and the menu
+// use. Loop strikes say "loopguard:", yield strikes say "yield:".
 func (s *Server) logPenaltyEvent(ev swaputil.LoopPenaltyEvent) {
 	session := shortOf(ev.SessionID)
 	switch ev.Kind {
 	case swaputil.PenaltyEventStrike:
-		s.proxylog.Infof("loopguard: %s reached strike %d/%d (run %d, ~%d tokens/response, hold %ds)",
-			session, ev.Strike, s.cfg.LoopGuard.Strikes, ev.UniformRun, ev.TypicalTokens, ev.HoldSeconds)
+		switch ev.Reason {
+		case swaputil.PenaltyReasonYield:
+			s.proxylog.Infof("yield: %s strike 1 (floor breached, ~%d tok/min, cancelled inflight)",
+				session, ev.TypicalTokens)
+		default:
+			s.proxylog.Infof("loopguard: %s reached strike %d/%d (run %d, ~%d tokens/response, hold %ds)",
+				session, ev.Strike, s.cfg.LoopGuard.Strikes, ev.UniformRun, ev.TypicalTokens, ev.HoldSeconds)
+		}
 	case swaputil.PenaltyEventHoldStart:
 		if ev.HoldSeconds < 0 {
 			s.proxylog.Infof("loopguard: %s held until un-penalized (strike %d)", session, ev.Strike)

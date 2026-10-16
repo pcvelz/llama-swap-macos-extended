@@ -88,6 +88,25 @@ const (
 	// the published state so a later reason (say, a byte-budget breach) is an
 	// added value rather than a schema change.
 	PenaltyReasonLoop = "loop"
+
+	// PenaltyReasonYield is the second penalty reason: a session whose
+	// in-flight request yield (output tokens per wall-clock minute) stays
+	// below YieldFloorTokPerMin for YieldFloorMinutes of consecutive minutes
+	// earns a yield strike and its CURRENT inflight request is cancelled so
+	// the slot frees. Repeated yield strikes escalate into the same hold
+	// ladder that loop strikes produce.
+	PenaltyReasonYield = "yield"
+
+	// DefaultYieldFloorTokPerMin is the output-token floor per minute below
+	// which a glacial in-flight request is struck and cancelled. 10 tok/min
+	// is ~1 tok/6s — well above any healthy decode rate, but generous enough
+	// to catch sessions stuck in a 2-5 tok/min prefill or tool-call loop.
+	DefaultYieldFloorTokPerMin = 10
+
+	// DefaultYieldFloorMinutes is how many consecutive minutes the yield must
+	// stay below the floor before a strike fires. 15 minutes lets a genuinely
+	// slow prefill (e.g. context-heavy prompt) complete without penalty.
+	DefaultYieldFloorMinutes = 15
 )
 
 // Loop penalty event kinds, emitted to the observer (SetPenaltyObserver) for
@@ -121,19 +140,30 @@ type LoopGuard struct {
 	// MaxPeriod is the longest cycle of response sizes counted as a run (see
 	// runLocked). 0 falls back to DefaultLoopMaxPeriod.
 	MaxPeriod int
+	// YieldFloorTokPerMin: output tokens per wall-clock minute below which a
+	// glacial in-flight request is struck and cancelled. 0 falls back to
+	// DefaultYieldFloorTokPerMin. A yield strike records reason "yield" and
+	// escalates into the same penalty ladder as loop strikes.
+	YieldFloorTokPerMin float64
+	// YieldFloorMinutes: how many consecutive minutes a request's yield must
+	// stay below the floor before a strike fires. 0 falls back to
+	// DefaultYieldFloorMinutes.
+	YieldFloorMinutes int
 }
 
 // DefaultLoopGuard mirrors config.DefaultLoopGuardConfig for callers that
 // have no config in scope (tests, bare trackers).
 func DefaultLoopGuard() LoopGuard {
 	return LoopGuard{
-		RunBar:          DefaultLoopRunBar,
-		ToleranceTokens: DefaultLoopTolerance,
-		Strikes:         3,
-		PenaltySeconds:  []int{0, 900, 3600},
-		ClearRequests:   10,
-		MaxLoopTokens:   DefaultMaxLoopTokens,
-		MaxPeriod:       DefaultLoopMaxPeriod,
+		RunBar:              DefaultLoopRunBar,
+		ToleranceTokens:     DefaultLoopTolerance,
+		Strikes:             3,
+		PenaltySeconds:      []int{0, 900, 3600},
+		ClearRequests:       10,
+		MaxLoopTokens:       DefaultMaxLoopTokens,
+		MaxPeriod:           DefaultLoopMaxPeriod,
+		YieldFloorTokPerMin: DefaultYieldFloorTokPerMin,
+		YieldFloorMinutes:   DefaultYieldFloorMinutes,
 	}
 }
 
@@ -210,8 +240,19 @@ type LoopTracker struct {
 	now func() time.Time
 }
 
+// yieldRecord is one data point for the per-session yield floor: wall-clock
+// time and output tokens at the moment a request completed. Stored in a ring
+// so old samples drop off and only the window worth of history is retained.
+type yieldRecord struct {
+	at      time.Time
+	tokens  int64
+	session string
+}
+
+const yieldRingMax = 128 // enough for hours at 20s cadence; far more than the window needs
+
 // loopHistory is one session's per-request memory: the response sizes, the
-// strike ladder position, and any active hold.
+// strike ladder position, any active hold, and the yield floor history.
 type loopHistory struct {
 	tokens []int64
 	last   time.Time
@@ -224,6 +265,13 @@ type loopHistory struct {
 	// clearStreak counts consecutive recorded requests whose trailing run was
 	// below the run bar. At ClearRequests the session is forgiven.
 	clearStreak int
+	// yieldRing holds yieldRecord samples for the per-session yield floor.
+	yieldRing        [yieldRingMax]yieldRecord
+	yieldHead        int       // next write index (ring buffer head)
+	yieldCount       int       // total samples written (used to compute ring offset)
+	yieldBreachStart time.Time // when yield first dropped below floor; zero = not breaching
+	// yieldLastStrike prevents duplicate strikes for the same glacial request.
+	yieldLastStrike time.Time
 }
 
 // NewLoopTracker builds a tracker from g. Fields left at zero fall back to
@@ -271,6 +319,143 @@ func NewLoopTrackerWithClock(g LoopGuard, now func() time.Time) *LoopTracker {
 		t.now = now
 	}
 	return t
+}
+
+// YieldFloorConfig returns the tracker's yield floor settings. Zero-value
+// fields fall back to the package defaults.
+func (t *LoopTracker) YieldFloorTokPerMin() float64 {
+	if t == nil {
+		return 0
+	}
+	v := t.guard.YieldFloorTokPerMin
+	if v <= 0 {
+		v = DefaultYieldFloorTokPerMin
+	}
+	return v
+}
+
+// YieldFloorMinutes returns the tracker's yield-floor duration in minutes.
+// Zero falls back to DefaultYieldFloorMinutes.
+func (t *LoopTracker) YieldFloorMinutes() int {
+	if t == nil {
+		return 0
+	}
+	v := t.guard.YieldFloorMinutes
+	if v <= 0 {
+		v = DefaultYieldFloorMinutes
+	}
+	return v
+}
+
+// InflightYield computes the running yield (tokens per minute) for a session's
+// in-flight request. elapsed is the time since the request started; produced
+// is its current RespTokens counter. Returns 0 when there is no meaningful
+// yield to report (no tokens yet, or zero elapsed). A yield below the floor
+// means the request is glacial and should be considered for cancellation.
+//
+// The floor is read from t.guard.YieldFloorTokPerMin (default 10 tok/min).
+func (t *LoopTracker) InflightYield(elapsed time.Duration, produced int64) float64 {
+	if t == nil || elapsed <= 0 || produced <= 0 {
+		return 0
+	}
+	minutes := elapsed.Minutes()
+	return float64(produced) / minutes
+}
+
+// yieldFloorMinutes returns the effective yield-floor duration in minutes.
+func (t *LoopTracker) yieldFloorMinutes() int {
+	v := t.guard.YieldFloorMinutes
+	if v <= 0 {
+		v = DefaultYieldFloorMinutes
+	}
+	return v
+}
+
+// yieldFloorTokPerMin returns the effective yield floor in tokens per minute.
+func (t *LoopTracker) yieldFloorTokPerMin() float64 {
+	v := t.guard.YieldFloorTokPerMin
+	if v <= 0 {
+		v = DefaultYieldFloorTokPerMin
+	}
+	return v
+}
+
+// CheckYieldFloor checks one in-flight request's running yield against the
+// floor. elapsed is time since the request started, produced is its current
+// RespTokens. The method updates the session's breach tracking and returns:
+//   - strike bool: true when a yield strike should fire (floor breached for
+//     yieldFloorMinutes consecutive minutes)
+//   - event LoopPenaltyEvent: the strike event to emit (only when strike=true)
+//
+// When yield recovers above floor, any breach timer is reset. A session can
+// earn at most one yield strike per yieldFloorMinutes window — a second
+// glacial request after the first was already struck does not escalate.
+func (t *LoopTracker) CheckYieldFloor(sessionID string, elapsed time.Duration, produced int64) (strike bool, event LoopPenaltyEvent) {
+	if t == nil || sessionID == "" {
+		return false, LoopPenaltyEvent{}
+	}
+	floor := t.yieldFloorMinutes()
+	if floor <= 0 {
+		return false, LoopPenaltyEvent{}
+	}
+
+	now := t.now()
+	yield := t.InflightYield(elapsed, produced)
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	h := t.sessions[sessionID]
+	if h == nil {
+		h = &loopHistory{}
+		t.sessions[sessionID] = h
+	}
+
+	// Yield recovered: reset the breach timer.
+	if yield >= t.yieldFloorTokPerMin() || produced <= 0 {
+		h.yieldBreachStart = time.Time{}
+		return false, LoopPenaltyEvent{}
+	}
+
+	// Below floor: start or extend the breach timer.
+	if h.yieldBreachStart.IsZero() {
+		// First time below floor for this request. Assume yield has been
+		// glacial since the request started (conservative: worst case).
+		h.yieldBreachStart = now.Add(-elapsed)
+		// If the request has already been running longer than the window,
+		// fire immediately — a 21-minute glacial request needs no extra wait.
+		if elapsed >= time.Duration(floor)*time.Minute {
+			h.yieldLastStrike = now
+			typical := yield * float64(floor)
+			event = LoopPenaltyEvent{
+				SessionID: sessionID, Kind: PenaltyEventStrike,
+				Reason: PenaltyReasonYield, Strike: 1, HoldSeconds: 0,
+				UniformRun: 0, TypicalTokens: int64(typical),
+			}
+			return true, event
+		}
+		return false, LoopPenaltyEvent{}
+	}
+
+	breachedFor := now.Sub(h.yieldBreachStart)
+	if breachedFor < time.Duration(floor)*time.Minute {
+		return false, LoopPenaltyEvent{}
+	}
+
+	// Already struck for this glacial episode: do not double-strike.
+	if !h.yieldLastStrike.IsZero() && now.Sub(h.yieldLastStrike) < time.Duration(floor)*time.Minute {
+		return false, LoopPenaltyEvent{}
+	}
+
+	h.yieldLastStrike = now
+	typical := yield * float64(floor) // rough estimate of what the request will emit
+
+	event = LoopPenaltyEvent{
+		SessionID: sessionID, Kind: PenaltyEventStrike,
+		Reason: PenaltyReasonYield, Strike: 1, HoldSeconds: 0,
+		UniformRun: 0, TypicalTokens: int64(typical),
+	}
+	return true, event
 }
 
 // SetPenaltyObserver installs the sink for LoopPenaltyEvents (the debug
@@ -327,6 +512,14 @@ func (t *LoopTracker) Record(sessionID string, respTokens int64) {
 		h.tokens = h.tokens[len(h.tokens)-t.historyMax:]
 	}
 	h.last = now
+
+	// Record this completion in the yield ring so the server-side yield floor
+	// checker has recent data. The ring is a bounded FIFO; oldest entries drop
+	// off automatically.
+	idx := h.yieldHead % yieldRingMax
+	h.yieldRing[idx] = yieldRecord{at: now, tokens: respTokens, session: sessionID}
+	h.yieldHead++
+	h.yieldCount++
 
 	events := t.advanceLocked(sessionID, h, now)
 	t.pruneLocked(now)

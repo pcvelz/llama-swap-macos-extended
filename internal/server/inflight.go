@@ -127,13 +127,15 @@ func (t *inflightTracker) setLoopGuard(cfg config.LoopGuardConfig) {
 		return
 	}
 	t.loops = swaputil.NewLoopTracker(swaputil.LoopGuard{
-		RunBar:          cfg.RunBar,
-		ToleranceTokens: int64(cfg.ToleranceTokens),
-		Strikes:         cfg.Strikes,
-		PenaltySeconds:  cfg.PenaltySeconds,
-		ClearRequests:   cfg.ClearRequests,
-		MaxLoopTokens:   int64(cfg.MaxLoopTokens),
-		MaxPeriod:       cfg.MaxPeriod,
+		RunBar:              cfg.RunBar,
+		ToleranceTokens:     int64(cfg.ToleranceTokens),
+		Strikes:             cfg.Strikes,
+		PenaltySeconds:      cfg.PenaltySeconds,
+		ClearRequests:       cfg.ClearRequests,
+		MaxLoopTokens:       int64(cfg.MaxLoopTokens),
+		MaxPeriod:           cfg.MaxPeriod,
+		YieldFloorTokPerMin: cfg.YieldFloorTokPerMin,
+		YieldFloorMinutes:   cfg.YieldFloorMinutes,
 	})
 }
 
@@ -582,6 +584,56 @@ func (t *inflightTracker) CancelWithSource(id, source, userAgent string) bool {
 
 func (t *inflightTracker) Cancel(id string) bool {
 	return t.CancelWithSource(id, "", "")
+}
+
+// CheckYieldFloor scans every in-flight request for yield-floor violations.
+// For each session whose running yield has stayed below the configured floor
+// for yieldFloorMinutes consecutive minutes, it cancels that inflight request
+// and records a yield strike (penalty reason "yield"). Returns the list of
+// cancelled request ids and any yield-strike events to emit (so the caller
+// can log them via proxylog and push to debug history).
+//
+// Called from the server's 1 Hz tick (sessionsHub.tick) so checks run once
+// per second against live traffic. The tracker's lock is held for the whole
+// scan to keep the in-flight set stable during iteration.
+func (t *inflightTracker) CheckYieldFloor() ([]string, []swaputil.LoopPenaltyEvent) {
+	if t == nil || t.loops == nil {
+		return nil, nil
+	}
+
+	t.mu.Lock()
+	type candidate struct {
+		id       string
+		session  string
+		elapsed  time.Duration
+		produced int64
+	}
+	var candidates []candidate
+	now := time.Now()
+	for id, req := range t.requests {
+		sid := req.entry.Metadata["session_id"]
+		if sid == "" || req.entry.RespTokens <= 0 {
+			continue
+		}
+		elapsed := now.Sub(req.entry.Timestamp)
+		candidates = append(candidates, candidate{id: id, session: sid, elapsed: elapsed, produced: req.entry.RespTokens})
+	}
+	t.mu.Unlock()
+
+	var cancelled []string
+	var events []swaputil.LoopPenaltyEvent
+	for _, c := range candidates {
+		strike, ev := t.loops.CheckYieldFloor(c.session, c.elapsed, c.produced)
+		if !strike {
+			continue
+		}
+		// Cancel the inflight request. Source "yield" so it is greppable.
+		if t.CancelWithSource(c.id, "yield", "") {
+			cancelled = append(cancelled, c.id)
+		}
+		events = append(events, ev)
+	}
+	return cancelled, events
 }
 
 func (t *inflightTracker) Current() swaputil.InFlightRequestsEvent {

@@ -5,8 +5,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/mostlygeek/llama-swap/internal/config"
+	"github.com/mostlygeek/llama-swap/internal/swaputil"
 )
 
 // track adds one request with the given method/path and session id, gives it
@@ -146,5 +148,80 @@ func TestInflightTracker_LoopVerdictThroughContext(t *testing.T) {
 	tracker.Remove(id)
 	if verdict() {
 		t.Fatalf("a finished request has no live entry, so no session and no verdict")
+	}
+}
+
+// CheckYieldFloor scans in-flight requests and cancels glacial ones.
+func TestInflightTracker_YieldFloorCanclesGlacial(t *testing.T) {
+	tracker := newInflightTracker()
+	tracker.setLoopGuard(config.LoopGuardConfig{
+		Enabled:             true,
+		RunBar:              999, // disable loop detection
+		YieldFloorTokPerMin: 10,
+		YieldFloorMinutes:   2, // short window for the test
+	})
+
+	// Add an in-flight request with a session id.
+	_, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+	id := tracker.Add(req, cancel)
+	tracker.SetMetadata(id, "session_id", "yield-test")
+
+	// Simulate a glacial request that has been running for 30 minutes with
+	// only 2 tokens = 0.067 tok/min — far below the 10 tok/min floor.
+	// We fake this by backdating the entry's Timestamp and capping RespTokens.
+	tracker.mu.Lock()
+	tracker.requests[id].entry.Timestamp = time.Now().Add(-30 * time.Minute)
+	tracker.requests[id].entry.RespTokens = 2
+	tracker.mu.Unlock()
+
+	cancelled, events := tracker.CheckYieldFloor()
+	if len(cancelled) != 1 {
+		t.Fatalf("cancelled=%v want [id], got %d events", cancelled, len(events))
+	}
+	if len(events) != 1 || events[0].Reason != swaputil.PenaltyReasonYield {
+		t.Fatalf("events[0].Reason=%q want %q", events[0].Reason, swaputil.PenaltyReasonYield)
+	}
+
+	// A healthy request should NOT be cancelled.
+	_, cancel2 := context.WithCancel(context.Background())
+	defer cancel2()
+	req2 := httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+	id2 := tracker.Add(req2, cancel2)
+	tracker.SetMetadata(id2, "session_id", "healthy-test")
+	tracker.mu.Lock()
+	tracker.requests[id2].entry.RespTokens = 300 // healthy rate
+	tracker.mu.Unlock()
+
+	cancelled2, _ := tracker.CheckYieldFloor()
+	if len(cancelled2) != 0 {
+		t.Fatalf("healthy request should not be cancelled, got %v", cancelled2)
+	}
+}
+
+// CheckYieldFloor with zero tokens (prefill) does not cancel.
+func TestInflightTracker_YieldFloorSkipsPrefill(t *testing.T) {
+	tracker := newInflightTracker()
+	tracker.setLoopGuard(config.LoopGuardConfig{
+		Enabled:             true,
+		RunBar:              999,
+		YieldFloorTokPerMin: 10,
+		YieldFloorMinutes:   2,
+	})
+
+	_, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+	id := tracker.Add(req, cancel)
+	tracker.SetMetadata(id, "session_id", "prefill-test")
+	// Zero tokens: still in prefill.
+	tracker.mu.Lock()
+	tracker.requests[id].entry.RespTokens = 0
+	tracker.mu.Unlock()
+
+	cancelled, _ := tracker.CheckYieldFloor()
+	if len(cancelled) != 0 {
+		t.Fatalf("prefill (zero tokens) should not be cancelled, got %v", cancelled)
 	}
 }
