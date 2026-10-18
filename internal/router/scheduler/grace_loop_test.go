@@ -19,7 +19,6 @@ func loopFixture(t *testing.T) (*FIFO, *fakeEffects, *time.Time) {
 	clk := time.Unix(1000, 0)
 	grace := map[string]time.Duration{"a": 300 * time.Second}
 	s := newFIFOGrace(&runningFilterPlanner{evict: map[string][]string{"b": {"a"}}}, eff, grace, &clk)
-	s.SetSwapStarvationSeconds(-1) // valve OFF, as in production
 	s.OnRequest(req("a"))
 	s.OnServeDone(ServeDoneEvent{ModelID: "a"})
 	return s, eff, &clk
@@ -129,7 +128,6 @@ func TestFIFO_LoopingCompletionStillSeedsIdleSince(t *testing.T) {
 	clk := time.Unix(1000, 0)
 	grace := map[string]time.Duration{"a": 300 * time.Second}
 	s := newFIFOGrace(&runningFilterPlanner{evict: map[string][]string{"b": {"a"}}}, eff, grace, &clk)
-	s.SetSwapStarvationSeconds(-1)
 
 	// No OnSwapDone and no earlier serve: a has never been marked idle.
 	delete(s.idleSince, "a")

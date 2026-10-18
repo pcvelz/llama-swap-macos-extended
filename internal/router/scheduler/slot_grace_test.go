@@ -11,8 +11,18 @@ import (
 	"github.com/mostlygeek/llama-swap/internal/swaputil"
 )
 
-// slotGraceRig sets up a FIFO with a controllable clock and per-model
-// slotGraceSeconds, for deterministic slot-grace tests.
+// Slot cooldown tests at production-sized token counts (10000 per large turn,
+// the default 8192 large-prefill threshold). The slot cooldown IS the model's
+// swapGraceSeconds (slotGraceSeconds was removed 2026-10-18, see
+// cooldown_unified_test.go and llama-cm docs/intent/cooldown.md): a session
+// that finished a turn keeps its slot for that long, and another session's
+// request is held only if granting it would displace that slot - here by
+// pool tokens: 10000 + 10000 overflows slotPool, 10000 + 4000 does not.
+
+const slotPool = 15000
+
+// slotGraceRig sets up a FIFO with a controllable clock and a per-model
+// swapGraceSeconds, for deterministic slot-cooldown tests.
 type slotGraceRig struct {
 	t     *testing.T
 	eff   *fakeEffects
@@ -25,10 +35,11 @@ func newSlotGraceRig(t *testing.T, graceSec int) *slotGraceRig {
 	eff := newFakeEffects()
 	eff.states["m"] = process.StateReady
 	models := map[string]config.ModelConfig{
-		"m": {ConcurrencyLimit: 2, SlotGraceSeconds: graceSec},
+		"m": {ConcurrencyLimit: 2, SwapGraceSeconds: graceSec},
 	}
+	cfg := config.FifoConfig{KVPoolTokens: map[string]int{"m": slotPool}}
 	r := &slotGraceRig{t: t, eff: eff, clock: time.Unix(1_000_000, 0)}
-	s := NewFIFO("test", logmon.NewWriter(io.Discard), &stubPlanner{}, config.FifoConfig{}, models, eff)
+	s := NewFIFO("test", logmon.NewWriter(io.Discard), &stubPlanner{}, cfg, models, eff)
 	r.s = s
 	s.now = func() time.Time { return r.clock }
 	return r
@@ -70,32 +81,28 @@ func (r *slotGraceRig) wantQueuedCount(want int, why string) {
 	}
 }
 
-// --- Test: cold request parks while another session is slot-warm ---
+// --- Test: a request that would displace the cooling slot parks ---
 
 func TestSlotGrace_ColdParksWhileWarm(t *testing.T) {
-	r := newSlotGraceRig(t, 60) // 60s grace
+	r := newSlotGraceRig(t, 60) // 60s cooldown
 
 	// Session A makes a large turn and finishes.
 	r.coldReq("A", 10000)
 	r.wantServed(1, "A's first request")
 	r.warmDone("A", 10000)
 
-	// Session B sends a cold large request while A is still warm (10s elapsed).
+	// Session B sends a request that overflows the pool beside A's cooling
+	// prompt (10s elapsed).
 	r.advance(10 * time.Second)
 	r.coldReq("B", 10000)
-	r.wantServed(1, "B must park: A is slot-warm")
+	r.wantServed(1, "B must park: granting it would displace A's cooling slot")
 	r.wantQueuedCount(1, "one request queued")
-	if len(r.s.queued) > 0 && r.s.queued[0].parkReason != ParkKVWarm {
-		t.Fatalf("park_reason=%q want %q", func() string {
-			if len(r.s.queued) > 0 {
-				return r.s.queued[0].parkReason
-			}
-			return ""
-		}(), ParkKVWarm)
+	if r.s.queued[0].parkReason != ParkKVWarm {
+		t.Fatalf("park_reason=%q want %q", r.s.queued[0].parkReason, ParkKVWarm)
 	}
 }
 
-// --- Test: warm continuation admitted inside window ---
+// --- Test: warm continuation admitted inside the cooldown ---
 
 func TestSlotGrace_WarmContinuationAdmitted(t *testing.T) {
 	r := newSlotGraceRig(t, 60)
@@ -107,14 +114,14 @@ func TestSlotGrace_WarmContinuationAdmitted(t *testing.T) {
 	// B parks.
 	r.advance(10 * time.Second)
 	r.coldReq("B", 10000)
-	r.wantQueuedCount(1, "B parked behind A's warm window")
+	r.wantQueuedCount(1, "B parked behind A's cooldown")
 
 	// A's own continuation arrives: must be admitted despite B queued.
 	r.coldReq("A", 5000)
 	r.wantServed(2, "A's warm continuation is admitted")
 }
 
-// --- Test: request admitted after window expiry ---
+// --- Test: request admitted after the cooldown ends ---
 
 func TestSlotGrace_WindowExpiryReleasesQueue(t *testing.T) {
 	r := newSlotGraceRig(t, 60)
@@ -127,60 +134,25 @@ func TestSlotGrace_WindowExpiryReleasesQueue(t *testing.T) {
 	r.coldReq("B", 10000)
 	r.wantQueuedCount(1, "B parked")
 
-	// Advance past the grace window.
+	// Advance past the cooldown.
 	r.advance(55 * time.Second)
-	r.wantServed(2, "B admitted after A's slot-warm window expired")
+	r.wantServed(2, "B admitted after A's cooldown ended")
 	r.wantQueuedCount(0, "queue drained")
 }
 
-// --- Test: warm cache not displaced inside window ---
+// --- Test: a request that fits beside the cooling slot is not held ---
 
-func TestSlotGrace_KVCacheProtectedInsideWindow(t *testing.T) {
-	// This test asserts that the KV displacement logic does not purge a cache
-	// whose owning session is inside its slot-grace window. Inside the window
-	// the newcomer parks instead.
-	eff := newFakeEffects()
-	eff.states["m"] = process.StateReady
-	models := map[string]config.ModelConfig{
-		"m": {ConcurrencyLimit: 2, SlotGraceSeconds: 60},
-	}
-	cfg := config.FifoConfig{KVPoolTokens: map[string]int{"m": 25000}}
-	s := NewFIFO("test", logmon.NewWriter(io.Discard), &stubPlanner{}, cfg, models, eff)
-	clock := time.Unix(1_000_000, 0)
-	s.now = func() time.Time { return clock }
+func TestSlotGrace_FittingRequestNotHeld(t *testing.T) {
+	r := newSlotGraceRig(t, 60)
 
-	// A makes a large turn and finishes.
-	s.OnRequest(HandlerReq{Model: "m", Session: "A", EstimatedTokens: 10000, Tier: swaputil.DefaultTier})
-	if got := eff.served("m"); got != 1 {
-		t.Fatalf("served=%d want 1 (A's first request)", got)
-	}
-	s.OnServeDone(ServeDoneEvent{ModelID: "m", EstimatedTokens: 10000, Session: "A", Tier: swaputil.DefaultTier})
+	r.coldReq("A", 10000)
+	r.warmDone("A", 10000)
 
-	// B arrives while A is warm (10s elapsed < 60s grace): must park.
-	clock = clock.Add(10 * time.Second)
-	s.OnRequest(HandlerReq{Model: "m", Session: "B", EstimatedTokens: 10000, Tier: swaputil.DefaultTier})
-	if got := eff.served("m"); got != 1 {
-		t.Fatalf("served=%d want 1 (B parked behind A's warm window)", got)
-	}
-	if len(s.queued) != 1 || s.queued[0].parkReason != ParkKVWarm {
-		t.Fatalf("B must park: served=%d, queue=%d reason=%q", eff.served("m"), len(s.queued), func() string {
-			if len(s.queued) > 0 {
-				return s.queued[0].parkReason
-			}
-			return ""
-		}())
-	}
-
-	// Advance past the grace window: B is admitted.
-	clock = clock.Add(60 * time.Second)
-	s.OnTick()
-	if got := eff.served("m"); got != 2 {
-		t.Fatalf("served=%d want 2 (B admitted after window)", got)
-	}
-
-	// A's residency should still exist (was protected during the hold).
-	if _, ok := s.kvResidents["m"]["A"]; !ok {
-		t.Fatal("A's KV cache was displaced while A was inside its slot-grace window")
+	r.advance(10 * time.Second)
+	r.coldReq("B", 4000)
+	r.wantServed(2, "10000 cooling + 4000 fits the 15000 pool: B runs beside A")
+	if _, ok := r.s.kvResidents["m"]["A"]; !ok {
+		t.Fatal("A's cooling slot was displaced by a request that fits beside it")
 	}
 }
 
@@ -195,9 +167,9 @@ func TestSlotGrace_HigherRankBypassesHold(t *testing.T) {
 
 	r.advance(10 * time.Second)
 	r.coldReq("B", 10000)
-	r.wantQueuedCount(1, "B parked behind A's warm window")
+	r.wantQueuedCount(1, "B parked behind A's cooldown")
 
-	// C arrives on a higher-rank tier: must bypass the slot-grace hold.
+	// C arrives on a higher-rank tier: must bypass the cooldown.
 	priorityTier := swaputil.Tier{Name: "priority", Rank: 10, Preempts: true}
 	cReq := HandlerReq{
 		Model:           "m",
@@ -209,24 +181,24 @@ func TestSlotGrace_HigherRankBypassesHold(t *testing.T) {
 
 	// C is served (bypasses the hold). B stays queued.
 	if got := r.eff.served("m"); got != 2 {
-		t.Fatalf("served=%d want 2 (C bypasses slot-grace hold)", got)
+		t.Fatalf("served=%d want 2 (C bypasses the cooldown)", got)
 	}
 	r.wantQueuedCount(1, "B still queued behind C")
 }
 
-// --- Test: feature inert at 0 ---
+// --- Test: no swap grace, no cooldown ---
 
 func TestSlotGrace_InertAtZero(t *testing.T) {
-	r := newSlotGraceRig(t, 0) // grace off
+	r := newSlotGraceRig(t, 0) // no swapGraceSeconds: no cooldown at either level
 
 	r.coldReq("A", 10000)
 	r.wantServed(1, "A's first request")
 	r.warmDone("A", 10000)
 
-	// B is admitted normally — no slot-grace hold.
+	// B is admitted normally - nothing is cooling.
 	r.advance(1 * time.Second)
 	r.coldReq("B", 10000)
-	r.wantServed(2, "B admitted: slotGraceSeconds=0 means plain FIFO")
+	r.wantServed(2, "B admitted: no swapGraceSeconds means plain FIFO")
 	r.wantQueuedCount(0, "nothing parked")
 }
 
@@ -245,8 +217,29 @@ func TestSlotGrace_WarmSessionNotBlockedByItself(t *testing.T) {
 	r.wantServed(2, "A's second warm turn")
 	r.warmDone("A", 8000)
 
-	// B arrives: A is still warm (10s total < 60s grace).
+	// B arrives: A is still cooling (10s total < 60s) and 8000 + 10000
+	// overflows the pool.
 	r.advance(5 * time.Second)
 	r.coldReq("B", 10000)
-	r.wantQueuedCount(1, "B parked: A's window not yet expired")
+	r.wantQueuedCount(1, "B parked: A's cooldown not yet over")
+}
+
+// --- Test: the sessions API reads the unified cooling record ---
+
+func TestSlotGrace_SlotWarmUntilReportsCoolingSessions(t *testing.T) {
+	r := newSlotGraceRig(t, 60)
+
+	r.coldReq("A", 10000)
+	if got := r.s.SlotWarmUntil(); len(got) != 0 {
+		t.Fatalf("a session in flight is not cooling: %v", got)
+	}
+	r.warmDone("A", 10000)
+	want := r.clock.Add(60 * time.Second).Format(time.RFC3339)
+	if got := r.s.SlotWarmUntil()["A"]; got != want {
+		t.Fatalf("SlotWarmUntil[A]=%q want %q (last completion + swap grace)", got, want)
+	}
+	r.advance(61 * time.Second)
+	if got := r.s.SlotWarmUntil(); len(got) != 0 {
+		t.Fatalf("an expired cooldown must not be reported: %v", got)
+	}
 }

@@ -12,6 +12,10 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// cooldownRemovedReason names why swapStarvationSeconds and slotGraceSeconds
+// are rejected above zero.
+const cooldownRemovedReason = "removed 2026-10-18: a cooldown ends only by the menu finish or a higher-rank arrival, see llama-cm docs/intent/cooldown.md"
+
 func LoadConfigFromReader(r io.Reader) (Config, error) {
 	data, err := io.ReadAll(r)
 	if err != nil {
@@ -118,9 +122,15 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 		return Config{}, fmt.Errorf("residentAliasGraceSeconds must be >= 0")
 	}
 
-	// -1 is the documented "valve off" sentinel; anything below it is a typo.
+	// WHY reject > 0: the valve is gone, so a positive value would silently
+	// promise a timeout exit the scheduler no longer has. 0 and -1 (the old
+	// "off" settings, what every deployed yaml carries) stay valid and are
+	// ignored; below -1 was always a typo.
+	if config.SwapStarvationSeconds > 0 {
+		return Config{}, fmt.Errorf("swapStarvationSeconds %d: %s", config.SwapStarvationSeconds, cooldownRemovedReason)
+	}
 	if config.SwapStarvationSeconds < -1 {
-		return Config{}, fmt.Errorf("swapStarvationSeconds must be >= -1 (-1 disables the starvation valve)")
+		return Config{}, fmt.Errorf("swapStarvationSeconds must be >= -1 (ignored, the starvation valve was removed)")
 	}
 
 	if mb := config.MemoryBrake; mb.SampleIntervalMs <= 0 || mb.WindowMinutes <= 0 ||
@@ -309,6 +319,11 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 		}
 		if modelConfig.SlotGraceSeconds < 0 {
 			return Config{}, fmt.Errorf("model %s: invalid slotGraceSeconds value %d", modelId, modelConfig.SlotGraceSeconds)
+		}
+		// WHY reject > 0: the slot cooldown is the model's swapGraceSeconds
+		// now; a positive slotGraceSeconds would promise a second duration.
+		if modelConfig.SlotGraceSeconds > 0 {
+			return Config{}, fmt.Errorf("model %s: slotGraceSeconds %d: %s", modelId, modelConfig.SlotGraceSeconds, cooldownRemovedReason)
 		}
 
 		if err := modelConfig.Capabilities.Validate(); err != nil {

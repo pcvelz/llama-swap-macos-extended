@@ -8,14 +8,17 @@ import (
 	"github.com/mostlygeek/llama-swap/internal/process"
 )
 
-// The KV warm hold (kvwarm.go), on the geometry of the 2026-10-06 cq27 thrash
+// The slot cooldown (kvwarm.go), on the geometry of the 2026-10-06 cq27 thrash
 // scaled to a pool of 1000: session A's prompt 198k and session B's 97k of a
 // 262144 pool become 750 and 370 - together 1120, so the two cannot share the
-// pool and every grant of one purges the other.
+// pool and every grant of one purges the other. The cooldown is the model's
+// swapGraceSeconds (kvwGrace); the contract tests for exits, looping and slot
+// count are in cooldown_unified_test.go.
 const (
-	kvwPool = 1000
-	kvwA    = 750
-	kvwB    = 370
+	kvwPool  = 1000
+	kvwA     = 750
+	kvwB     = 370
+	kvwGrace = 600
 )
 
 type kvWarmRig struct {
@@ -35,7 +38,9 @@ func newKVWarmRig(t *testing.T, pool int) *kvWarmRig {
 	if pool > 0 {
 		pools["m"] = pool
 	}
-	r.s = newFIFOKV(eff, pools)
+	// WHY a swap grace: the slot cooldown IS swapGraceSeconds, and a model
+	// without one has no cooldown at all.
+	r.s = newFIFOKVModels(eff, pools, map[string]config.ModelConfig{"m": {SwapGraceSeconds: kvwGrace}})
 	r.s.now = func() time.Time { return r.clock }
 	return r
 }
@@ -81,7 +86,7 @@ func TestKVWarm_ToolLoopTurnKeepsItsCache(t *testing.T) {
 	r.wantParked(ParkKV)
 
 	r.done("A", kvwA)
-	r.wantServed(1, "B granted on A's turn boundary would purge A's warm cache")
+	r.wantServed(1, "B granted on A's turn boundary would purge A's cooling cache")
 	r.wantParked(ParkKVWarm)
 
 	r.advance(5 * time.Second) // the client runs a Bash tool
@@ -91,120 +96,21 @@ func TestKVWarm_ToolLoopTurnKeepsItsCache(t *testing.T) {
 	r.wantParked(ParkKV) // B now waits on A in flight
 }
 
-// A paused session does not keep the pool: once the window lapses with no
-// turn from A, B goes on the next tick, and A's cache is gone.
-func TestKVWarm_WindowLapseHandsOver(t *testing.T) {
+// A paused session does not keep the pool past its cooldown: once the grace
+// lapses with no turn from A, B goes on the next tick, and A's cache is gone.
+func TestKVWarm_CooldownLapseHandsOver(t *testing.T) {
 	r := newKVWarmRig(t, kvwPool)
 	r.req("A", kvwA)
 	r.req("B", kvwB)
 	r.done("A", kvwA)
 	r.wantParked(ParkKVWarm)
 
-	r.advance(kvWarmWindow - time.Second)
-	r.wantServed(1, "still inside A's window")
+	r.advance(kvwGrace*time.Second - time.Second)
+	r.wantServed(1, "still inside A's cooldown")
 	r.advance(2 * time.Second)
-	r.wantServed(2, "A's window lapsed: B must be granted")
+	r.wantServed(2, "A's cooldown lapsed: B must be granted")
 	if _, ok := r.s.kvResidents["m"]["A"]; ok {
 		t.Fatal("B's grant purges A's cache in the child; A must no longer be tracked as resident")
-	}
-}
-
-// Nobody waits forever: once B has been held a quantum, the hold ends at A's
-// next turn boundary - after A got a quantum of warm turns.
-func TestKVWarm_QuantumBoundsTheHold(t *testing.T) {
-	r := newKVWarmRig(t, kvwPool)
-	r.req("A", kvwA)
-	r.req("B", kvwB)
-	r.done("A", kvwA) // the quantum starts at this first warm hold
-
-	turns := 0
-	for i := 0; i < 100 && r.eff.served("m") == 1+turns; i++ {
-		r.advance(10 * time.Second) // tool runs
-		r.req("A", kvwA)
-		if r.eff.served("m") != 1+turns+1 {
-			break // A's turn was not granted: the hold is over
-		}
-		turns++
-		r.advance(110 * time.Second) // A's warm turn
-		r.done("A", kvwA)
-	}
-	if got, want := r.eff.served("m"), 1+turns+1; got != want {
-		t.Fatalf("after a quantum of A turns B must be granted: served=%d want %d (A turns %d)", got, want, turns)
-	}
-	if b := r.eff.lastServeReq.Session; b != "B" {
-		t.Fatalf("the grant that ended the hold must be B's, got session %q", b)
-	}
-	if wantMin := int(kvWarmQuantum / (2 * time.Minute)); turns < wantMin {
-		t.Fatalf("A must get a quantum of warm turns before handing over: got %d want >= %d", turns, wantMin)
-	}
-	if wantMax := int(kvWarmQuantum/(2*time.Minute)) + 1; turns > wantMax {
-		t.Fatalf("the hold must end once the quantum is spent: A got %d turns, want <= %d", turns, wantMax)
-	}
-}
-
-// The quantum clock starts at the first WARM hold: B parked behind A's long
-// cold prefill must not spend A's quantum before A's first warm turn.
-func TestKVWarm_ColdPrefillDoesNotSpendTheQuantum(t *testing.T) {
-	r := newKVWarmRig(t, kvwPool)
-	r.req("A", kvwA)
-	r.req("B", kvwB)
-	r.advance(67 * time.Minute) // A's cold re-prefill of a 198k prompt
-	r.done("A", kvwA)
-	r.wantParked(ParkKVWarm)
-	r.advance(10 * time.Second)
-	r.req("A", kvwA+5)
-	r.wantServed(2, "A's first warm turn after a long cold prefill")
-}
-
-// A turn the client walked out on (a non-streaming request cut at its 6-min
-// wall, live 2026-10-06 20:14-20:21) leaves a partial prefill resident; the
-// retry resumes it. Those cut retries are still the cold prefill: they keep
-// the cache warm but must not spend the quantum, which starts at the first
-// turn that actually completes.
-func TestKVWarm_CutRetriesDoNotSpendTheQuantum(t *testing.T) {
-	r := newKVWarmRig(t, kvwPool)
-	r.req("A", kvwA)
-	r.req("B", kvwB)
-	for i := 0; i < 7; i++ { // 7 x 6 min of cut attempts = 42 min, past one quantum
-		r.s.OnServeDone(ServeDoneEvent{ModelID: "m", EstimatedTokens: kvwA, Session: "A", Cut: true})
-		r.advance(10 * time.Second)
-		r.req("A", kvwA)
-		if got := r.eff.lastServeReq.Session; got != "A" || r.eff.served("m") != 2+i {
-			t.Fatalf("cut attempt %d (%s into the hold): last grant %q served=%d, want A's retry resuming its partial prefill",
-				i+1, time.Duration(i)*(6*time.Minute+10*time.Second), got, r.eff.served("m"))
-		}
-		r.advance(6 * time.Minute)
-	}
-	r.done("A", kvwA) // the turn finally completes: NOW the quantum starts
-	r.advance(10 * time.Second)
-	r.req("A", kvwA)
-	if got := r.eff.lastServeReq.Session; got != "A" {
-		t.Fatalf("A's first warm turn after its cold prefill completed: last grant %q, want A", got)
-	}
-}
-
-// Cut retries cannot hold the pool forever: the hold ends at kvWarmCeiling
-// from the first warm hold, whatever the holder does.
-func TestKVWarm_CeilingBoundsCutRetries(t *testing.T) {
-	r := newKVWarmRig(t, kvwPool)
-	r.req("A", kvwA)
-	r.req("B", kvwB)
-	served := 1
-	for elapsed := time.Duration(0); elapsed < kvWarmCeiling+10*time.Minute; elapsed += 6 * time.Minute {
-		r.s.OnServeDone(ServeDoneEvent{ModelID: "m", EstimatedTokens: kvwA, Session: "A", Cut: true})
-		if r.eff.lastServeReq.Session == "B" {
-			return // B got the pool
-		}
-		r.advance(10 * time.Second)
-		r.req("A", kvwA)
-		if r.eff.served("m") == served {
-			break
-		}
-		served = r.eff.served("m")
-		r.advance(6 * time.Minute)
-	}
-	if r.eff.lastServeReq.Session != "B" {
-		t.Fatalf("B never granted while A's requests were cut for %s: the ceiling must end the hold", kvWarmCeiling+10*time.Minute)
 	}
 }
 
@@ -241,17 +147,33 @@ func TestKVWarm_SessionlessRequest(t *testing.T) {
 
 	r.done("B", kvwA)
 	r.req("", kvwB)
-	r.wantServed(2, "a sessionless request must not purge B's warm cache")
+	r.wantServed(2, "a sessionless request must not purge B's cooling cache")
 	r.wantParked(ParkKVWarm)
 }
 
-// Inert without a KV budget for the model.
+// Inert without a KV budget for the model (and without an explicit
+// concurrencyLimit there is no slot count to displace either).
 func TestKVWarm_InertWithoutPool(t *testing.T) {
 	r := newKVWarmRig(t, 0)
 	r.req("A", kvwA)
 	r.done("A", kvwA)
 	r.req("B", kvwA)
 	r.wantServed(2, "no kvPoolTokens: no hold")
+}
+
+// A model with no swapGraceSeconds has no cooldown at either level: the
+// session's slot is not protected after its turn, whatever the pool says.
+func TestKVWarm_NoGraceNoCooldown(t *testing.T) {
+	withLargePrefillThreshold(t, 100)
+	eff := newFakeEffects()
+	eff.states["m"] = process.StateReady
+	s := newFIFOKVModels(eff, map[string]int{"m": kvwPool}, map[string]config.ModelConfig{"m": {}})
+	s.OnRequest(HandlerReq{Model: "m", EstimatedTokens: kvwA, Session: "A"})
+	s.OnServeDone(ServeDoneEvent{ModelID: "m", EstimatedTokens: kvwA, Session: "A"})
+	s.OnRequest(HandlerReq{Model: "m", EstimatedTokens: kvwB, Session: "B"})
+	if got := eff.served("m"); got != 2 {
+		t.Fatalf("no swapGraceSeconds: B must not be held for A's slot, served=%d want 2", got)
+	}
 }
 
 // Requests that waited out a model swap are granted by OnSwapDone, which used

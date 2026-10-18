@@ -216,20 +216,15 @@ unloadTimeout: 10
 #   rides out gaps shorter than this value instead
 # - can be overridden per model with model.swapGraceSeconds (-1 inherits this
 #   value, 0 disables the grace for that model only)
+# - the SAME duration is the slot cooldown: a session that finished a request
+#   keeps its slot and KV cache for this long, and another session's request is
+#   held only if granting it would displace that slot (pool tokens or slot
+#   count); anything that fits beside it runs at once
+# - the cooldown ends early only by the menu-bar "finish" click or a
+#   higher-rank (preempts) arrival; there is no timeout valve
+#   (swapStarvationSeconds and slotGraceSeconds were removed 2026-10-18; old
+#   yaml with 0 or -1 still loads, a positive value is an error)
 swapGraceSeconds: 60
-
-# swapStarvationSeconds: the starvation valve on swapGraceSeconds
-# - optional, default: 0 (the valve opens after the evictee's own grace)
-# - -1 disables the valve: a resident inside its grace is never evicted while
-#   it keeps serving, however long the parked request has waited
-# - N > 0 opens the valve once the parked request has waited N seconds
-# - why it exists: a consumer with a request cadence shorter than the grace
-#   resets the resident's idle clock forever, so the parked request would
-#   starve; the valve caps that wait. But the valve at exactly the grace also
-#   evicts a hot interactive session the instant its turn ends once a parked
-#   request is older than the grace, and that costs the session its whole KV
-#   cache. Pick the side you need per deployment.
-swapStarvationSeconds: 0
 
 # peerStall: reclaim a serving slot from a client that has STOPPED READING its
 # response, e.g. a session the OS has suspended (SIGSTOP) mid-stream.
@@ -606,18 +601,6 @@ models:
     # - concurrencyLimit stays the outer cap on all requests, and the
     #   kvPoolTokens budget check still applies at any value
     maxParallelLargePrefill: 1
-
-    # slotGraceSeconds: slot-level cooldown, the analogue of swapGraceSeconds one level down
-    # - optional, default: 0 (off, plain FIFO)
-    # - a session that finished a turn on this model less than this many seconds
-    #   ago is slot-warm: its slot, large-prefill permit and KV are held for its
-    #   continuation. A cold large request parks instead of being admitted over
-    #   it, and the warm cache cannot be displaced inside the window
-    # - admission only: a running prefill is never preempted for a warm session
-    # - enable where large prefills are serialized anyway (cap 1 above);
-    #   leave 0 where large sessions truly run in parallel - there a hold
-    #   would only add a wait
-    slotGraceSeconds: 300
 
     # unloadTimeout: graceful timeout in seconds when unloading this model (manual, API, or ttl expiry)
     # - optional, default: global unloadTimeout

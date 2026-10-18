@@ -165,13 +165,10 @@ type ModelConfig struct {
 	// with a kvPoolTokens budget.
 	MaxParallelLargePrefill int `yaml:"maxParallelLargePrefill"`
 
-	// SlotGraceSeconds is a per-model slot-level cooldown: when positive, a
-	// session that finished a turn on this model less than this many seconds
-	// ago is "slot-warm" — its slot, large-prefill permit and KV cache are
-	// held for its continuation. A cold large request (estimated tokens >=
-	// 8192) for the same model parks instead of being admitted over the warm
-	// session, and the warm session's own cache is protected from purge inside
-	// the window. 0 (default) = feature off, plain FIFO.
+	// SlotGraceSeconds is REMOVED (2026-10-18). The slot cooldown has ONE
+	// duration, the model's swapGraceSeconds, at model and slot level alike
+	// (llama-cm docs/intent/cooldown.md). The field is kept ONLY so an old yaml
+	// still decodes: 0 is accepted and ignored, any value > 0 is a load error.
 	SlotGraceSeconds int `yaml:"slotGraceSeconds"`
 
 	// Copy of HealthCheckTimeout from global config

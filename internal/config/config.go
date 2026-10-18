@@ -174,21 +174,13 @@ type Config struct {
 	// the resident drains (upstream behaviour).
 	SwapGraceSeconds int `yaml:"swapGraceSeconds"`
 
-	// SwapStarvationSeconds sets the swap-grace starvation valve: how long a
-	// request parked behind a resident's swapGraceSeconds may wait before the
-	// grace is deemed served and the resident is evicted at the next drain gap
-	// even though it has NOT been idle for its grace. Without the valve a
-	// consumer whose request cadence is shorter than the grace defers every
-	// cross-model request forever (witnessed 2026-07-15). Without a knob the
-	// valve evicts a hot interactive session the instant its turn ends once a
-	// parked request has aged past the grace (witnessed 2026-09-08: a pinned
-	// cq35h lost its 116k-token KV to a background request that then failed).
-	//   0 (default) = the valve opens after the evictee's own grace (historic)
-	//  -1           = the valve never opens: a resident inside its grace is
-	//                 never evicted while it keeps serving
-	//   N > 0       = the valve opens once the parked request has waited N s
-	// Global only, on purpose: a per-model asymmetry is exactly what made
-	// swapGraceSeconds bite (llama-cm llama-swap.yaml, swapGraceSeconds note).
+	// SwapStarvationSeconds is REMOVED (2026-10-18). The swap-grace starvation
+	// valve ended a cooldown after a timeout, a third exit nobody had asked
+	// for (it evicted a live cq35h on 2026-09-08, production ran it at -1).
+	// A cooldown now ends only by the menu finish or a higher-rank arrival, and
+	// a never-quiet session is bounded by the loop guard (llama-cm
+	// docs/intent/cooldown.md). The field is kept ONLY so an old yaml still
+	// decodes: 0 and -1 are accepted and ignored, any value > 0 is a load error.
 	SwapStarvationSeconds int `yaml:"swapStarvationSeconds"`
 
 	// MemoryBrake is the memory emergency brake; see MemoryBrakeConfig.
@@ -443,8 +435,8 @@ func DefaultDebugHistoryConfig() DebugHistoryConfig {
 // 792 consecutive tool calls at 46-49 output tokens each, one request every
 // ~20s. Swap-grace is an idle-STREAK requirement, so that cadence pinned the
 // resident forever and two sessions parked for another model starved for
-// hours. The blunt valve (SwapStarvationSeconds) stays off because it cannot
-// tell a productive session from that one.
+// hours. The timeout valve (SwapStarvationSeconds, since removed) could not
+// tell a productive session from that one; this detector judges behaviour.
 //
 // RunBar and ToleranceTokens are UNPROVEN: they were read off that ONE
 // captured loop and have never been measured against healthy traffic, which

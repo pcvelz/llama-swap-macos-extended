@@ -40,7 +40,7 @@ const (
 	ParkRank          = "rank"           // a higher-rank request is queued ahead (rank barrier)
 	ParkSwapCollision = "swap-collision" // collides with another model's in-flight swap
 	ParkPenalized     = "penalized"      // its session is held by the loop guard's penalty
-	ParkKVWarm        = "kv-warm"        // granting it would purge another session's warm KV cache (kvwarm.go)
+	ParkKVWarm        = "kv-warm"        // granting it would displace another session's COOLING slot (kvwarm.go); the UI says "cooling"
 )
 
 // ErrModelNotLoaded is granted to a ConcurrencyExempt (status read) request
@@ -130,7 +130,6 @@ func New(conf config.Config, name string, logger *logmon.Monitor, planner Swappe
 	switch use {
 	case "fifo":
 		s := NewFIFO(name, logger, planner, conf.Routing.Scheduler.Settings.Fifo, conf.Models, eff)
-		s.SetSwapStarvationSeconds(conf.SwapStarvationSeconds)
 		s.SetHoldOnlyWhenContended(conf.LoopGuard.HoldOnlyWhenContended)
 		return s, nil
 	default:

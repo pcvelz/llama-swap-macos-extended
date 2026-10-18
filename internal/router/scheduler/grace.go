@@ -93,23 +93,6 @@ func (s *FIFO) cooldownSnapshotWaiting(now time.Time) *swaputil.Cooldown {
 				continue
 			}
 			if out == nil {
-				// Starvation valve: report the earlier of the resident's own
-				// grace elapsing and the valve threshold opening, mirroring
-				// the two ways withinGrace can let the hold end. starvationOff
-				// means the valve never opens, so the resident's own grace is
-				// the only deadline that matters.
-				if !s.starvationOff && !s.cooldownWaitSince.IsZero() {
-					threshold := g
-					if s.starvation > 0 {
-						threshold = s.starvation
-					}
-					if valveRemaining := threshold - now.Sub(s.cooldownWaitSince); valveRemaining < remaining {
-						remaining = valveRemaining
-					}
-				}
-				if remaining < 0 {
-					remaining = 0
-				}
 				out = &swaputil.Cooldown{
 					EvicteeModel:     ev,
 					NextModel:        q.Model,
@@ -200,23 +183,4 @@ func (s *FIFO) Cooldown() *swaputil.Cooldown {
 		return &c
 	}
 	return nil
-}
-
-// SlotWarmUntil implements SlotWarmReporter. Returns per-session slot-grace
-// warm-until timestamps, keyed by session ID and rendered as RFC3339 strings.
-func (s *FIFO) SlotWarmUntil() map[string]string {
-	out := make(map[string]string)
-	for model, sessions := range s.slotWarm {
-		g := s.slotGrace[model]
-		if g <= 0 {
-			continue
-		}
-		now := s.now()
-		for sess, until := range sessions {
-			if now.Before(until) {
-				out[sess] = until.Format(time.RFC3339)
-			}
-		}
-	}
-	return out
 }

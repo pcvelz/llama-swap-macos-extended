@@ -49,7 +49,6 @@ func penaltyFixture(t *testing.T) (*FIFO, *fakeEffects, *time.Time) {
 	clk := time.Unix(1000, 0)
 	grace := map[string]time.Duration{"a": 60 * time.Second}
 	s := newFIFOGrace(&runningFilterPlanner{evict: map[string][]string{"b": {"a"}}}, eff, grace, &clk)
-	s.SetSwapStarvationSeconds(-1)
 	return s, eff, &clk
 }
 

@@ -87,7 +87,7 @@ type FIFO struct {
 	// park reason inside it: a penalized request must not block, outrank or
 	// delay anyone. Living in s.queued it would arm the rank barrier against
 	// lower-rank arrivals (blockedByRankBarrier / drainQueue's barrierRank),
-	// count as a queue position, keep cooldownWaitSince alive and be eligible
+	// count as a queue position, be eligible
 	// to NAME the cooldown's NextModel - all of which are exactly the
 	// "rebounding on the box" the penalty exists to stop. Out here it is
 	// inert: it starts no swap, reserves no KV, holds no slot and appears in
@@ -136,16 +136,11 @@ type FIFO struct {
 	// the outer cap on all requests.
 	maxLarge map[string]int
 
-	// slotGrace maps a model ID to its per-model slot-grace duration (seconds).
-	// When positive, a session whose last completed turn was less than this
-	// many seconds ago is "slot-warm" — cold large requests for the same model
-	// park instead of being admitted over it. 0 = feature off.
-	slotGrace map[string]time.Duration
-
-	// slotWarm tracks, per model+session, when each session's slot-grace
-	// window expires (zero = not warm). Populated on ServeDone; read at
-	// admission to gate cold large requests behind a warm session.
-	slotWarm map[string]map[string]time.Time
+	// slotCount maps a model ID to its slot count (config concurrencyLimit,
+	// which must equal the child's --parallel). Present ONLY for a model whose
+	// concurrencyLimit is explicitly set: the slot-displacement rule in
+	// kvWarmBlocker counts slots, and a defaulted limit is not a slot count.
+	slotCount map[string]int
 
 	// grace maps a model ID to its swap-grace duration: a request for a
 	// different model is held in the queue until this model has been idle
@@ -153,35 +148,15 @@ type FIFO struct {
 	// <= 0 means no grace for that model.
 	grace map[string]time.Duration
 
-	// slotWarmTier tracks, per model+session, the tier rank of each warm
-	// session — used by slotGraceBypass to decide whether a higher-rank
-	// cold request outranks the hold. nil when not needed (grace <= 0).
-	slotWarmTier map[string]map[string]int
-	// starvation is the valve threshold applied in withinGrace: how long a
-	// deferred request may wait (from its first deferral, see graceWait)
-	// before the evictee's grace is deemed served. 0 = use the evictee's own
-	// grace (historic behaviour); starvationOff = never open the valve. Set
-	// once from the global swapStarvationSeconds; see config.Config.
-	starvation    time.Duration
-	starvationOff bool
 	// idleSince records when each model last became idle — its in-flight dropped
 	// to 0, or it just became ready. Grace is measured from this. A busy model
 	// (in-flight > 0) is already deferred by the in-flight check before the grace
 	// check runs, so a stale idleSince on a busy model is harmless.
 	idleSince map[string]time.Time
-	// cooldownWaitSince records when the CURRENT cooldown first held a
-	// cross-model request (zero when nothing is held). It powers the
-	// starvation valve in withinGrace: grace is an idle-STREAK requirement,
-	// so a continuous consumer of the resident (cadence < grace) resets
-	// idleSince forever and a parked cross-model request would starve
-	// (witnessed 2026-07-15: a ~20s-cadence client pinned a 600s-grace model;
-	// the parked request waited 13+ min until manually flushed). Once the
-	// cooldown has held requests for >= the threshold, the resident has had
-	// its full protection window and the swap proceeds at the next drain gap.
-	// ONE timestamp, not one per requested model: the cooldown is a state of
-	// the resident, and every model queued behind it shares the same wait
-	// (2026-09-10). Cleared when a swap starts or the queue empties.
-	cooldownWaitSince time.Time
+	// There is deliberately NO starvation valve (removed 2026-10-18): the
+	// idle-streak cooldown ends only by FinishCooldown or a higher-rank
+	// arrival (llama-cm docs/intent/cooldown.md). A session that never goes
+	// quiet is bounded by the loop guard, not by a clock.
 	// cooldownForcedMu guards cooldownForced and graceExpiredForced. Unlike
 	// every other field on FIFO, both are written from arbitrary HTTP
 	// goroutines (FinishCooldown is the menu-bar helper's cooldown row click
@@ -237,7 +212,7 @@ type FIFO struct {
 func NewFIFO(name string, logger *logmon.Monitor, planner Swapper, cfg config.FifoConfig, models map[string]config.ModelConfig, eff Effects) *FIFO {
 	limits := make(map[string]int, len(models))
 	grace := make(map[string]time.Duration, len(models))
-	slotGrace := make(map[string]time.Duration, len(models))
+	slotCount := make(map[string]int, len(models))
 	maxLarge := make(map[string]int, len(models))
 	for id, mc := range models {
 		maxLarge[id] = mc.MaxParallelLargePrefill
@@ -249,8 +224,10 @@ func NewFIFO(name string, logger *logmon.Monitor, planner Swapper, cfg config.Fi
 		if mc.SwapGraceSeconds > 0 {
 			grace[id] = time.Duration(mc.SwapGraceSeconds) * time.Second
 		}
-		if mc.SlotGraceSeconds > 0 {
-			slotGrace[id] = time.Duration(mc.SlotGraceSeconds) * time.Second
+		if mc.ConcurrencyLimit > 0 {
+			// WHY: only an explicit concurrencyLimit is a slot count (it must
+			// equal the child's --parallel); the defaulted 10 is not.
+			slotCount[id] = mc.ConcurrencyLimit
 		}
 	}
 
@@ -268,9 +245,7 @@ func NewFIFO(name string, logger *logmon.Monitor, planner Swapper, cfg config.Fi
 		kvLargeInFlight: make(map[string]int),
 		kvResidents:     make(map[string]map[string]*kvResident),
 		maxLarge:        maxLarge,
-		slotGrace:       slotGrace,
-		slotWarm:        make(map[string]map[string]time.Time),
-		slotWarmTier:    make(map[string]map[string]int),
+		slotCount:       slotCount,
 		grace:           grace,
 		idleSince:       make(map[string]time.Time),
 		now:             time.Now,
@@ -286,16 +261,6 @@ func NewFIFO(name string, logger *logmon.Monitor, planner Swapper, cfg config.Fi
 // (config.LoopGuardConfig.HoldOnlyWhenContended). Called once at
 // construction, before the run loop starts, so no locking is needed.
 func (s *FIFO) SetHoldOnlyWhenContended(on bool) { s.holdOnlyWhenContended = on }
-
-// SetSwapStarvationSeconds installs the global swapStarvationSeconds valve
-// (config.Config.SwapStarvationSeconds): -1 is the "valve off" sentinel
-// (validated in config.load), 0 keeps the per-evictee grace as the threshold,
-// N > 0 is an explicit threshold. Called once at construction, before the run
-// loop starts, so no locking is needed.
-func (s *FIFO) SetSwapStarvationSeconds(n int) {
-	s.starvationOff = n < 0
-	s.starvation = time.Duration(max(n, 0)) * time.Second
-}
 
 // OnRequest decides what to do with one incoming ServeHTTP request. It never
 // blocks indefinitely: any work that has to wait (starting a process, stopping
@@ -437,28 +402,17 @@ func (s *FIFO) OnRequest(req HandlerReq) {
 			markKVParked(req)
 			markParked(&req, ParkKV)
 			s.enqueue(req)
-			s.kvWarmContention()
 			return
 		}
-		// Slot-grace hold: a cold large request parks while another session
-		// is slot-warm on this model. Warm continuations (same session) and
-		// small requests pass through unaffected. Higher-rank arrivals that
-		// outrank the warm session bypass the hold.
-		if s.slotGraceHold(req) {
-			s.logger.Debugf("%s: queuing request for model %s (slot-grace hold: another session is slot-warm)", s.name, req.Model)
-			markParked(&req, ParkKVWarm)
-			s.enqueue(req)
-			return
-		}
-		// KV warm hold (kvwarm.go): the pool has room for what is in
-		// flight, but not for this request beside another session's prompt
-		// that is still resident between two turns of its tool loop.
+		// Slot cooldown (kvwarm.go): the pool and the slots have room for what
+		// is in flight, but granting req would displace another session's
+		// cooling KV (pool tokens or slot count). Anything that fits beside
+		// the cooling slots is granted.
 		if r := s.kvWarmBlocker(req); r != nil {
 			s.logKVWarmHold(req, r)
 			markKVParked(req)
 			markParked(&req, ParkKVWarm)
 			s.enqueue(req)
-			s.kvWarmContention()
 			return
 		}
 		s.logger.Debugf("%s: fast-path serving model %s (already ready)", s.name, req.Model)
@@ -569,13 +523,6 @@ func (s *FIFO) OnCancel(req HandlerReq) {
 	}
 
 	if removed {
-		// If that was the LAST queued request, drop the cooldown's
-		// starvation-valve reference: a stale timestamp would let a future,
-		// unrelated request bypass the resident's grace instantly (the valve
-		// must measure THAT cooldown's own wait).
-		if len(s.queued) == 0 {
-			s.cooldownWaitSince = time.Time{}
-		}
 		s.logger.Debugf("%s: cancelled request for model %s pruned from scheduler", s.name, req.Model)
 		broadcastQueuePositions(s.queued)
 	}
@@ -673,8 +620,8 @@ func (s *FIFO) OnServeDone(ev ServeDoneEvent) {
 		// and everything queued for another model starves - witnessed
 		// 2026-09-19: session 934159af made 792 consecutive tool calls in one
 		// turn, 86 of 86 responses at 46-49 output tokens, and two cq35
-		// sessions waited hours. The blunt valve (swapStarvationSeconds)
-		// stays OFF (-1): it cannot tell this from a productive session and
+		// sessions waited hours. A timeout valve (swapStarvationSeconds,
+		// removed 2026-10-18) could not tell this from a productive session and
 		// evicted a live one on 2026-09-08. So a looping session keeps being
 		// served in full, it simply stops earning the resident FRESH grace -
 		// the existing idle reference is left alone and runs down. Productive
@@ -694,21 +641,6 @@ func (s *FIFO) OnServeDone(ev ServeDoneEvent) {
 	// that drain must not purge (kvwarm.go).
 	s.kvWarmOnDone(ev)
 
-	// Slot-grace warm tracking: mark the session as slot-warm for its model.
-	// The warm-until timestamp gates cold large requests behind a recently
-	// active session's turn.
-	if g := s.slotGrace[ev.ModelID]; g > 0 && ev.Session != "" {
-		if s.slotWarm[ev.ModelID] == nil {
-			s.slotWarm[ev.ModelID] = make(map[string]time.Time)
-		}
-		now := s.now()
-		s.slotWarm[ev.ModelID][ev.Session] = now.Add(g)
-		// Record the tier so slotGraceHold can check rank overrides.
-		if s.slotWarmTier[ev.ModelID] == nil {
-			s.slotWarmTier[ev.ModelID] = make(map[string]int)
-		}
-		s.slotWarmTier[ev.ModelID][ev.Session] = ev.Tier.Rank
-	}
 	s.publishCapacity()
 	s.publishGrace()
 
@@ -842,6 +774,10 @@ func (s *FIFO) OnTick() {
 		// intent is consumed alongside so it cannot outlive its cooldown.
 		if s.consumeGraceExpiredForced() {
 			s.logger.Infof("%s: swap-grace: finish expired the resident's idle grace (no waiter)", s.name)
+			// WHY: the finish is "end the cooldown", at slot level too - a
+			// request parked on a cooling slot is released by this same
+			// drain. Same consumption as the model finish, so it is one-shot.
+			s.kvWarmEndCooldowns()
 		}
 	}
 	s.drainQueue()
@@ -854,13 +790,11 @@ func (s *FIFO) OnTick() {
 // grace. A model with no recorded idle time (ready but never served under this
 // scheduler) is treated as evictable. grace <= 0 means no grace for that model.
 //
-// Starvation valve: the idle-streak requirement alone lets a continuous
-// consumer of the evictee (request cadence < grace) defer the swap FOREVER —
-// idleSince resets on every completion. So a deferral is honoured only until
-// the cooldown has held requests for the threshold (measured from its first
-// deferral, cooldownWaitSince): at that point the evictee has had every bit
-// of protection the grace promises, and the swap proceeds at the next drain
-// gap. Callers record cooldownWaitSince on a true return.
+// There is NO timeout valve (removed 2026-10-18): a continuous consumer of the
+// evictee (cadence < grace) keeps the cooldown, because a cooldown ends only by
+// FinishCooldown or a higher-rank arrival (llama-cm docs/intent/cooldown.md).
+// A degenerate loop is bounded by the loop guard (OnServeDone ev.Looping), not
+// by a clock.
 func (s *FIFO) withinGrace(evict []string) bool {
 	now := s.now()
 	for _, m := range evict {
@@ -873,38 +807,16 @@ func (s *FIFO) withinGrace(evict []string) bool {
 			continue
 		}
 		if now.Sub(since) < g {
-			// Valve threshold: the evictee's own grace unless the operator set
-			// swapStarvationSeconds. starvationOff means an interactive session
-			// inside its grace is never swapped out mid-cadence, whatever the
-			// parked request's age (2026-09-08 cq35h eviction).
-			if !s.starvationOff {
-				threshold := g
-				if s.starvation > 0 {
-					threshold = s.starvation
-				}
-				if !s.cooldownWaitSince.IsZero() && now.Sub(s.cooldownWaitSince) >= threshold {
-					continue // valve open: the cooldown already held for the threshold
-				}
-			}
 			return true
 		}
 	}
 	return false
 }
 
-// noteGraceDeferral records the FIRST time the current cooldown deferred a
-// request, so the starvation valve has a fixed reference point.
-func (s *FIFO) noteGraceDeferral() {
-	if s.cooldownWaitSince.IsZero() {
-		s.cooldownWaitSince = s.now()
-	}
-}
-
 // deferredByGrace is the single call site both OnRequest and drainQueue use
 // to decide whether a cross-model swap must still wait: it drains a manual
 // finish (FinishCooldown / POST /api/swap-grace/finish) before falling back
-// to the normal idle-streak + starvation-valve check in withinGrace, and
-// records the deferral for the valve on a true return.
+// to the idle-streak check in withinGrace.
 //
 // Rank-aware grace-break (2026-09-14): if lastServedTier[m] exists for an
 // evictee m and its tier rank is STRICTLY LOWER than req's AND req's tier
@@ -915,8 +827,8 @@ func (s *FIFO) noteGraceDeferral() {
 //
 // Deliberately does NOT use swaputil.CanPreempt: its victim.Preemptible clause
 // would let DEFAULT-rank arrivals break BACKGROUND (interactive cq*) sessions'
-// grace, re-opening the 2026-09-08 cq35h incident that swapStarvationSeconds:-1
-// exists to prevent. Only a tier whose contract is "boots lower-rank work"
+// grace, re-opening the 2026-09-08 cq35h incident (a live interactive session
+// evicted mid-cadence). Only a tier whose contract is "boots lower-rank work"
 // (preempts:true) breaks a grace. Same-rank or lower-rank arrivals keep the hold.
 func (s *FIFO) deferredByGrace(req HandlerReq, evict []string) bool {
 	if !s.withinGrace(evict) {
@@ -938,68 +850,7 @@ func (s *FIFO) deferredByGrace(req HandlerReq, evict []string) bool {
 			return false
 		}
 	}
-	s.noteGraceDeferral()
 	return true
-}
-
-// slotGraceWarmUntil returns the RFC3339 timestamp when session becomes
-// non-warm for model, or an empty string when the session is not warm on that
-// model (grace off, window expired, or no record). The caller renders this
-// verbatim into the sessions API; zero values are omitted by omitempty.
-func (s *FIFO) slotGraceWarmUntil(model, session string) string {
-	g := s.slotGrace[model]
-	if g <= 0 {
-		return ""
-	}
-	warmMap := s.slotWarm[model]
-	if warmMap == nil {
-		return ""
-	}
-	until, ok := warmMap[session]
-	if !ok || until.IsZero() {
-		return ""
-	}
-	return until.Format(time.RFC3339)
-}
-
-// slotGraceHold reports whether req must be parked because another session is
-// slot-warm on req's model. A warm continuation (same session) passes through;
-// small requests pass through; cold large requests park. Higher-rank arrivals
-// that outrank the warm session bypass the hold.
-func (s *FIFO) slotGraceHold(req HandlerReq) bool {
-	g := s.slotGrace[req.Model]
-	if g <= 0 {
-		return false
-	}
-	root := sessionRoot(req.Session)
-
-	now := s.now()
-	for sess, until := range s.slotWarm[req.Model] {
-		if sess == root || now.After(until) {
-			continue
-		}
-		// Another session is slot-warm. Warm continuations pass through.
-		warmRoot := sessionRoot(sess)
-		if warmRoot == root {
-			return false
-		}
-		// Small requests are not gated by the hold.
-		if req.EstimatedTokens < largePrefillThreshold {
-			return false
-		}
-		// Higher-rank bypass: if this arrival outranks the warm session and
-		// its tier contract preempts, let it through — same pattern as
-		// deferredByGrace's rank-aware grace-break.
-		if req.Tier.Rank > 0 && s.slotWarmTier != nil {
-			if tierRank, ok := s.slotWarmTier[req.Model][sess]; ok {
-				if req.Tier.Rank > tierRank && req.Tier.Preempts {
-					return false
-				}
-			}
-		}
-		return true // cold large request behind a warm session
-	}
-	return false
 }
 
 // consumeForced reports whether a FinishCooldown is pending, clearing it if
@@ -1041,6 +892,9 @@ func (s *FIFO) expireForcedGrace() {
 	if !s.consumeGraceExpiredForced() {
 		return
 	}
+	// WHY: the finish also ends every slot cooldown (same one-shot
+	// consumption as the model-level expiry below).
+	s.kvWarmEndCooldowns()
 	now := s.now()
 	for id, since := range s.idleSince {
 		g := s.grace[id]
@@ -1089,7 +943,6 @@ func (s *FIFO) OnUnload(targets []string, timeout time.Duration) {
 		targetSet[id] = true
 	}
 	s.kvWarmForget(targets...)
-	s.slotWarmForget(targets...)
 
 	// Release waiters of any in-flight swap whose target is being unloaded.
 	// The swap goroutine itself is left to finish on its own; when its
@@ -1475,14 +1328,9 @@ func (s *FIFO) logKVParked(model string, estimate int) {
 // the set EvictionFor saw, forwarded to OnSwapStart so the planner logs against
 // the same picture it decided on.
 func (s *FIFO) startSwap(initial HandlerReq, evict, running []string) {
-	// The wait is over — drop the cooldown's starvation-valve reference so
-	// the NEXT cooldown measures a fresh wait of its own.
-	s.cooldownWaitSince = time.Time{}
 	// The target starts with empty slots and the evicted models lose theirs.
 	s.kvWarmForget(initial.Model)
 	s.kvWarmForget(evict...)
-	s.slotWarmForget(initial.Model)
-	s.slotWarmForget(evict...)
 	s.active[initial.Model] = &activeSwap{
 		modelID: initial.Model,
 		evict:   evict,
@@ -1627,11 +1475,6 @@ func (s *FIFO) drainQueue() {
 				stick(req)
 				continue
 			}
-			if s.slotGraceHold(req) {
-				markParked(&req, ParkKVWarm)
-				stick(req)
-				continue
-			}
 			if r := s.kvWarmBlocker(req); r != nil {
 				s.logKVWarmHold(req, r)
 				markKVParked(req)
@@ -1666,11 +1509,7 @@ func (s *FIFO) drainQueue() {
 		s.startSwap(req, evict, running)
 	}
 	s.queued = remaining
-	if len(s.queued) == 0 {
-		// Nothing held any more: the next cooldown measures its own wait.
-		s.cooldownWaitSince = time.Time{}
-	}
-	s.kvWarmContention()
+	s.kvWarmPrune()
 	broadcastQueuePositions(s.queued)
 	s.publishCapacity()
 	s.publishGrace()

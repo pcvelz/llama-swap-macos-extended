@@ -6,8 +6,8 @@ import (
 	"time"
 )
 
-// KV warm hold (llama-cm incident 2026-10-06-kv-pool-purge-pingpong-every-turn-
-// re-prefills).
+// The slot cooldown (llama-cm docs/intent/cooldown.md; incident 2026-10-06-kv-
+// pool-purge-pingpong-every-turn-re-prefills).
 //
 // THE GAP. kvAdmit counts only requests IN FLIGHT. A child served with
 // --kv-unified keeps every idle slot's prompt in the same pool, so when session
@@ -19,72 +19,54 @@ import (
 // cq27 2026-10-05/06: 34 of 34 turns were full re-prefills (198k at ~50 tok/s =
 // 67 min, 97k = 22 min) and each session got one turn per ~90 minutes.
 //
-// THE HOLD. When a session finishes a LARGE request its prompt is resident, and
-// for kvWarmWindow - the gap a Claude Code tool loop leaves while the client
-// runs a tool - it is WARM. While a session is warm, another session's request
-// whose grant would push in-flight + warm tokens over the pool is parked
-// (ParkKVWarm): granting it would purge the warm cache. The warm session's own
-// next turn is admitted without counting its own residency (it reuses that
-// cache) and costs only the delta prefill.
+// THE COOLDOWN. When a session completes a request its prompt stays in its
+// slot, and for the model's swapGraceSeconds - the SAME duration as the model
+// cooldown, there is one - that slot is COOLING: another session's request is
+// held only if granting it would DISPLACE a cooling slot, either by tokens
+// (in-flight KV + cooling prompts + the request > kvPoolTokens) or by slot
+// count (in-flight requests + cooling sessions >= concurrencyLimit, the
+// child's --parallel). A request that fits beside the cooling slots - tokens
+// AND a free slot - is granted at once, so parallel sessions keep working.
+// Every completion with a session restarts that session's cooldown, except a
+// looping one (ServeDoneEvent.Looping: the loop guard's verdict), which lets it
+// run down - the same rule the model level applies in OnServeDone.
 //
-// FAIRNESS. The hold is bounded by kvWarmQuantum, measured from the moment the
-// residency first made another session wait (in flight or warm). Once spent,
-// the warm session's next completion does not renew it and a hold already
-// running ends at once, so the waiter is granted at the next turn boundary. A
-// waiter waits at most one quantum plus one turn ("a session is always
-// promised a turn"). The roles then swap, and the new holder earns its own
-// quantum: amortising one cold prefill over a quantum of warm turns instead of
-// paying it on every turn.
+// THE EXITS. Only two, and no clock: FinishCooldown (the menu click) ends every
+// slot cooldown once (kvWarmEndCooldowns, on the same run-loop consumption as
+// the model finish), and a request whose tier Preempts and strictly outranks
+// the cooling session's recorded tier is not held by that session. There is no
+// quantum and no ceiling: a session that never goes quiet keeps its slot, and
+// abuse is bounded by the loop guard / yield floor / penalty hold instead.
 //
-// INERT unless the model has a kvPoolTokens budget and the two prompts cannot
-// share the pool: sessions that fit together never wait on each other. A
-// session's own subagent lanes ("<session>/<agent>") are never held behind it:
-// the parent cannot return while its subagent runs, so holding the subagent
-// would only delay the same purge by a window.
-
-// kvWarmWindow is how long after a large turn a session's prompt counts as
-// warm. Same reasoning as the slot-affinity live window (internal/server
-// slot_affinity.go slotAffinityLiveWindow): a tool loop is silent on the proxy
-// for seconds on a Read/Bash call and a couple of minutes on a build or a test
-// run; longer than that the session is paused and a waiter gets the pool.
-var kvWarmWindow = 120 * time.Second
-
-// kvWarmQuantum bounds how long one session's residency may keep another
-// waiting. A switch costs the incoming session a cold prefill of up to an hour
-// on a 200k prompt, so the quantum must be long enough to amortise it.
-var kvWarmQuantum = 30 * time.Minute
-
-// kvWarmCeiling ends any hold this long after it first made another session
-// wait, cut retries of a cold prefill included: the waiter's worst case.
-var kvWarmCeiling = 90 * time.Minute
+// A model without swapGraceSeconds has no cooldown at either level. A session's
+// own subagent lanes ("<session>/<agent>") are never held behind it: the parent
+// cannot return while its subagent runs, so holding the subagent would only
+// delay the same purge by a window.
 
 // kvResidentForget drops an idle residency nobody displaced: its session has
 // not come back for this long, so the entry is only bookkeeping.
 const kvResidentForget = time.Hour
 
-// kvResident is one session's prompt in a model's KV pool, as the scheduler
-// believes it: created at the grant of the session's first large request,
-// dropped when another grant displaces it or its model is (re)loaded.
+// kvResident is one session lane's slot in a model, as the scheduler believes
+// it: created at the first grant of a request carrying a session, dropped when
+// another grant displaces it or its model is (re)loaded.
 type kvResident struct {
 	session string
-	// tokens is the estimate of the session's last large request - what it
-	// leaves resident once that request ends.
+	// tokens is the estimate of the session's last request - the footprint it
+	// leaves in the pool once that request ends.
 	tokens int
-	// busy counts the session's large requests currently granted. A busy
-	// residency is already counted in kvInFlight, never twice.
+	// busy counts the session's requests currently granted. A busy residency
+	// is already counted in inFlight/kvInFlight, never twice.
 	busy int
-	// lastEnd is when the last large request ended; warmUntil is when the
-	// hold lapses (zero = not protected, e.g. quantum spent).
-	lastEnd   time.Time
+	// lastEnd is when the last request ended.
+	lastEnd time.Time
+	// warmUntil is when the cooldown ends: the last NON-looping completion
+	// plus the model's swap grace. Zero = not cooling (never completed, a
+	// finish ended it, or only looping completions so far).
 	warmUntil time.Time
-	// contendedSince is when another session first waited on this residency
-	// (zero = nobody waiting); kvWarmCeiling runs from here. quantumSince is
-	// the first COMPLETED turn after that (a cut retry is still the cold
-	// prefill); kvWarmQuantum runs from there. lastCut: the last request ended
-	// cut.
-	contendedSince time.Time
-	quantumSince   time.Time
-	lastCut        bool
+	// tierRank is the rank of the tier the session last ran under, for the
+	// strictly-outranks bypass.
+	tierRank int
 }
 
 // sessionRoot strips a subagent suffix: "<session>/<agent>" -> "<session>".
@@ -112,48 +94,78 @@ func shortSession(session string) string {
 	return root
 }
 
-func (s *FIFO) kvWarmQuantumSpent(r *kvResident, now time.Time) bool {
-	if r.contendedSince.IsZero() {
-		return false
-	}
-	if now.Sub(r.contendedSince) >= kvWarmCeiling {
-		return true
-	}
-	return !r.quantumSince.IsZero() && now.Sub(r.quantumSince) >= kvWarmQuantum
+// kvWarmCooling: r is idle and inside its cooldown.
+func kvWarmCooling(r *kvResident, now time.Time) bool {
+	return r.busy == 0 && now.Before(r.warmUntil)
 }
 
-// kvWarmProtected: r is idle, inside its window and its quantum.
-func (s *FIFO) kvWarmProtected(r *kvResident, now time.Time) bool {
-	return r.busy == 0 && now.Before(r.warmUntil) && !s.kvWarmQuantumSpent(r, now)
+// kvWarmSorted returns model's residencies in a deterministic order (oldest
+// completion first, session id as the tie-break), so every decision and every
+// API read is independent of map iteration order.
+func (s *FIFO) kvWarmSorted(model string) []*kvResident {
+	rs := make([]*kvResident, 0, len(s.kvResidents[model]))
+	for _, r := range s.kvResidents[model] {
+		rs = append(rs, r)
+	}
+	sort.Slice(rs, func(i, j int) bool {
+		if !rs[i].lastEnd.Equal(rs[j].lastEnd) {
+			return rs[i].lastEnd.Before(rs[j].lastEnd)
+		}
+		return rs[i].session < rs[j].session
+	})
+	return rs
 }
 
-// kvWarmBlocker returns the warm residency that granting req now would purge,
-// or nil when req may go. Called only after kvAdmit has admitted req.
+// kvWarmBlocker returns the cooling residency that granting req now would
+// displace, or nil when req may go. Called only after kvAdmit has admitted req.
 func (s *FIFO) kvWarmBlocker(req HandlerReq) *kvResident {
 	if req.StatusRead || req.ConcurrencyExempt {
 		return nil
 	}
-	pool := s.cfg.KVPoolTokens[req.Model]
-	if pool <= 0 {
+	if len(s.kvResidents[req.Model]) == 0 {
 		return nil
 	}
 	now := s.now()
 	root := sessionRoot(req.Session)
+	cooling := 0
 	warm := 0
 	var blocker *kvResident
-	for _, r := range s.kvResidents[req.Model] {
-		if (req.Session != "" && sessionRoot(r.session) == root) || !s.kvWarmProtected(r, now) {
+	for _, r := range s.kvWarmSorted(req.Model) {
+		// WHY: a session's own lanes reuse its own slot - nothing of theirs is
+		// displaced.
+		if req.Session != "" && sessionRoot(r.session) == root {
 			continue
 		}
+		if !kvWarmCooling(r, now) {
+			continue
+		}
+		// WHY: a Preempts tier that strictly outranks the cooling session may
+		// take its slot (the one early exit besides the menu finish); same
+		// contract as the model level's rank-aware grace break.
+		if req.Tier.Preempts && req.Tier.Rank > r.tierRank {
+			continue
+		}
+		cooling++
 		warm += r.tokens
 		if blocker == nil || r.tokens > blocker.tokens {
 			blocker = r
 		}
 	}
-	if blocker == nil || s.kvInFlight[req.Model]+warm+req.EstimatedTokens <= pool {
+	if blocker == nil {
 		return nil
 	}
-	return blocker
+	// WHY pool: the request would not fit beside the cooling prompts; the
+	// child would purge one to make room.
+	if pool := s.cfg.KVPoolTokens[req.Model]; pool > 0 && s.kvInFlight[req.Model]+warm+req.EstimatedTokens > pool {
+		return blocker
+	}
+	// WHY slots: tokens fit, but every slot is in flight or cooling, so the
+	// request would land on a cooling slot and overwrite its KV. Only when
+	// concurrencyLimit is set explicitly (it is the --parallel slot count).
+	if slots := s.slotCount[req.Model]; slots > 0 && s.inFlight[req.Model]+cooling >= slots {
+		return blocker
+	}
+	return nil
 }
 
 // logKVWarmHold logs a hold once per request (on the park-reason change, not
@@ -163,25 +175,22 @@ func (s *FIFO) logKVWarmHold(req HandlerReq, r *kvResident) {
 		return
 	}
 	now := s.now()
-	quantumLeft := kvWarmQuantum
-	if !r.quantumSince.IsZero() {
-		quantumLeft -= now.Sub(r.quantumSince)
-	}
-	s.logger.Infof("kv-warm: holding %s request of session %s est=%d: granting it would purge session %s's warm cache (%d tok, warm %s more, quantum %s left) inflight=%d pool=%d",
+	s.logger.Infof("cooldown: holding %s request of session %s est=%d: granting it would displace session %s's cooling slot (%d tok, cooling %s more) inflight=%d pool=%d",
 		req.Model, shortSession(req.Session), req.EstimatedTokens, shortSession(r.session), r.tokens,
-		r.warmUntil.Sub(now).Round(time.Second), quantumLeft.Round(time.Second),
+		r.warmUntil.Sub(now).Round(time.Second),
 		s.kvInFlight[req.Model], s.cfg.KVPoolTokens[req.Model])
 }
 
-// kvWarmOnGrant records a granted request: a large one with a session makes
-// (or keeps) its session resident and busy; then every idle residency of
-// another session that can no longer share the pool with what is now in
-// flight is dropped - llama-server will purge it to make room.
+// kvWarmOnGrant records a granted request: one with a session makes (or keeps)
+// its session resident and busy; then every idle residency that can no longer
+// share the pool and the slots with what is now in flight is dropped -
+// llama-server will purge it to make room.
 func (s *FIFO) kvWarmOnGrant(req HandlerReq, modelID string) {
-	if s.cfg.KVPoolTokens[modelID] <= 0 || req.StatusRead || req.ConcurrencyExempt {
+	// WHY: no swap grace = no cooldown at either level, nothing to track.
+	if s.grace[modelID] <= 0 || req.StatusRead || req.ConcurrencyExempt {
 		return
 	}
-	if req.Session != "" && req.EstimatedTokens >= largePrefillThreshold {
+	if req.Session != "" {
 		if s.kvResidents[modelID] == nil {
 			s.kvResidents[modelID] = map[string]*kvResident{}
 		}
@@ -192,63 +201,58 @@ func (s *FIFO) kvWarmOnGrant(req HandlerReq, modelID string) {
 		}
 		r.busy++
 		r.tokens = req.EstimatedTokens
-		r.warmUntil = time.Time{}
+		r.tierRank = req.Tier.Rank
+		// warmUntil is deliberately kept: a looping completion must leave the
+		// cooldown running down from the last productive one.
 	}
 	s.kvWarmDisplace(modelID, req.Session)
 }
 
 // kvWarmDisplace drops idle residencies, oldest first, until in-flight plus
-// what stays resident fits the pool. Residencies whose session is inside its
-// slot-grace window are protected and never dropped — the newcomer parks
-// instead of displacing them.
+// what stays resident fits the pool and the slots. A grant that reaches here
+// either fit beside every cooling slot (so only expired entries go) or was
+// allowed past the hold by a Preempts outrank (so the outranked slot goes).
 func (s *FIFO) kvWarmDisplace(modelID, by string) {
 	pool := s.cfg.KVPoolTokens[modelID]
+	slots := s.slotCount[modelID]
 	var idle []*kvResident
-	total := s.kvInFlight[modelID]
-	for _, r := range s.kvResidents[modelID] {
+	tokens := s.kvInFlight[modelID]
+	for _, r := range s.kvWarmSorted(modelID) {
 		if r.busy == 0 {
 			idle = append(idle, r)
-			total += r.tokens
+			tokens += r.tokens
 		}
 	}
-	sort.Slice(idle, func(i, j int) bool { return idle[i].lastEnd.Before(idle[j].lastEnd) })
+	count := s.inFlight[modelID] + len(idle)
 	for _, r := range idle {
-		if total <= pool {
+		overPool := pool > 0 && tokens > pool
+		overSlots := slots > 0 && count > slots
+		if !overPool && !overSlots {
 			break
 		}
-		// Protected by slot-grace: the session's turn ended recently enough
-		// that its cache must not be purged. The newcomer parks instead.
-		g := s.slotGrace[modelID]
-		if g > 0 && !r.lastEnd.IsZero() {
-			now := s.now()
-			if now.Sub(r.lastEnd) < g {
-				continue
-			}
-		}
-		total -= r.tokens
+		tokens -= r.tokens
+		count--
 		delete(s.kvResidents[modelID], r.session)
-		s.logger.Infof("kv-warm: %s session %s cache (%d tok) displaced by session %s: in-flight %d does not fit beside it in pool %d",
-			modelID, shortSession(r.session), r.tokens, shortSession(by), s.kvInFlight[modelID], pool)
+		s.logger.Infof("cooldown: %s session %s slot (%d tok) displaced by session %s: in-flight %d does not fit beside it (pool %d, slots %d)",
+			modelID, shortSession(r.session), r.tokens, shortSession(by), s.kvInFlight[modelID], pool, slots)
 	}
 }
 
-// kvWarmOnDone marks the session's prompt resident and warm when its large
-// request ends - unless its quantum is spent, then the pool is handed over.
-// Must run before the drain that follows the completion.
+// kvWarmOnDone starts (or, for a non-looping completion, restarts) the
+// session's cooldown when its request ends. Must run before the drain that
+// follows the completion.
 func (s *FIFO) kvWarmOnDone(ev ServeDoneEvent) {
-	if ev.Session == "" || ev.EstimatedTokens < largePrefillThreshold || s.cfg.KVPoolTokens[ev.ModelID] <= 0 {
+	g := s.grace[ev.ModelID]
+	if ev.Session == "" || g <= 0 {
 		return
 	}
 	r := s.kvResidents[ev.ModelID][ev.Session]
 	if r == nil {
-		// Displaced while busy cannot happen (only idle entries are dropped);
-		// reached after a reload cleared the table mid-request. Its prompt
-		// is in the fresh child now.
-		if s.kvResidents[ev.ModelID] == nil {
-			s.kvResidents[ev.ModelID] = map[string]*kvResident{}
-		}
-		r = &kvResident{session: ev.Session, busy: 1}
-		s.kvResidents[ev.ModelID][ev.Session] = r
+		// WHY nothing is created here: every tracked grant made a record, so a
+		// missing one means a reload (kvWarmForget) or an exempt request. A
+		// reloaded child has empty slots, and the session's next grant
+		// recreates the record.
+		return
 	}
 	if r.busy > 0 {
 		r.busy--
@@ -259,58 +263,36 @@ func (s *FIFO) kvWarmOnDone(ev ServeDoneEvent) {
 	now := s.now()
 	r.tokens = ev.EstimatedTokens
 	r.lastEnd = now
-	r.lastCut = ev.Cut
-	if !ev.Cut && !r.contendedSince.IsZero() && r.quantumSince.IsZero() {
-		r.quantumSince = now
+	r.tierRank = ev.Tier.Rank
+	// WHY not for a looping completion: a degenerate loop must not earn fresh
+	// protection by repeating itself (same rule as the model level), so its
+	// cooldown runs down from the last productive completion.
+	if !ev.Looping {
+		r.warmUntil = now.Add(g)
 	}
-	if s.kvWarmQuantumSpent(r, now) {
-		r.warmUntil = time.Time{}
-		s.logger.Infof("kv-warm: %s session %s quantum spent (another session waiting %s): not holding its cache, the waiter goes next",
-			ev.ModelID, shortSession(ev.Session), now.Sub(r.contendedSince).Round(time.Second))
-		return
-	}
-	r.warmUntil = now.Add(kvWarmWindow)
 }
 
-// kvWarmContention re-reads, from the queue, who is waiting on which
-// residency. The quantum clock starts at the first WARM hold (ParkKVWarm) - not
-// at a plain in-flight park, or a 67-minute cold prefill would spend the whole
-// quantum before the session got a single warm turn - keeps running while
-// another session waits for any KV reason, and resets once nobody does. Also
-// forgets residencies idle past kvResidentForget.
-func (s *FIFO) kvWarmContention() {
+// kvWarmEndCooldowns ends every slot cooldown (FinishCooldown). The residencies
+// stay as bookkeeping - they are still displaceable KV - but nothing is cooling.
+func (s *FIFO) kvWarmEndCooldowns() {
+	for _, rs := range s.kvResidents {
+		for _, r := range rs {
+			r.warmUntil = time.Time{}
+		}
+	}
+}
+
+// kvWarmPrune forgets residencies idle past kvResidentForget whose cooldown is
+// over: the session has not come back, so the entry is only bookkeeping.
+func (s *FIFO) kvWarmPrune() {
 	if len(s.kvResidents) == 0 {
 		return
 	}
 	now := s.now()
 	for model, rs := range s.kvResidents {
 		for sess, r := range rs {
-			if r.busy == 0 && !r.lastEnd.IsZero() && now.Sub(r.lastEnd) > kvResidentForget {
+			if r.busy == 0 && !kvWarmCooling(r, now) && !r.lastEnd.IsZero() && now.Sub(r.lastEnd) > kvResidentForget {
 				delete(rs, sess)
-				continue
-			}
-			heldWarm, waiting := false, false
-			for _, q := range s.queued {
-				if q.Model != model || (q.parkReason != ParkKV && q.parkReason != ParkKVWarm) {
-					continue
-				}
-				if q.Session != "" && sessionRoot(q.Session) == sessionRoot(r.session) {
-					continue
-				}
-				waiting = true
-				if q.parkReason == ParkKVWarm {
-					heldWarm = true
-				}
-			}
-			switch {
-			case !waiting:
-				r.contendedSince = time.Time{}
-				r.quantumSince = time.Time{}
-			case heldWarm && r.contendedSince.IsZero() && s.kvWarmProtected(r, now):
-				r.contendedSince = now
-				if !r.lastCut {
-					r.quantumSince = now
-				}
 			}
 		}
 		if len(rs) == 0 {
@@ -327,11 +309,28 @@ func (s *FIFO) kvWarmForget(models ...string) {
 	}
 }
 
-// slotWarmForget drops a model's slot-warm state: its process is being
-// (re)started or stopped, and a fresh child has empty slots.
-func (s *FIFO) slotWarmForget(models ...string) {
-	for _, m := range models {
-		delete(s.slotWarm, m)
-		delete(s.slotWarmTier, m)
+// SlotWarmUntil implements SlotWarmReporter: per session lane, when its slot
+// cooldown ends (last non-looping completion + swap grace), as RFC3339, for
+// sessions cooling now. Deterministic: models are walked in name order and a
+// lane cooling on several models reports the latest end.
+func (s *FIFO) SlotWarmUntil() map[string]string {
+	out := make(map[string]string)
+	latest := make(map[string]time.Time)
+	now := s.now()
+	models := make([]string, 0, len(s.kvResidents))
+	for m := range s.kvResidents {
+		models = append(models, m)
 	}
+	sort.Strings(models)
+	for _, m := range models {
+		for _, r := range s.kvWarmSorted(m) {
+			if kvWarmCooling(r, now) && r.warmUntil.After(latest[r.session]) {
+				latest[r.session] = r.warmUntil
+			}
+		}
+	}
+	for sess, until := range latest {
+		out[sess] = until.Format(time.RFC3339)
+	}
+	return out
 }
