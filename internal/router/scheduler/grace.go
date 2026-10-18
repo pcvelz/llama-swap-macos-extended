@@ -201,3 +201,22 @@ func (s *FIFO) Cooldown() *swaputil.Cooldown {
 	}
 	return nil
 }
+
+// SlotWarmUntil implements SlotWarmReporter. Returns per-session slot-grace
+// warm-until timestamps, keyed by session ID and rendered as RFC3339 strings.
+func (s *FIFO) SlotWarmUntil() map[string]string {
+	out := make(map[string]string)
+	for model, sessions := range s.slotWarm {
+		g := s.slotGrace[model]
+		if g <= 0 {
+			continue
+		}
+		now := s.now()
+		for sess, until := range sessions {
+			if now.Before(until) {
+				out[sess] = until.Format(time.RFC3339)
+			}
+		}
+	}
+	return out
+}

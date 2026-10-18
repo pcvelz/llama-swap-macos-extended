@@ -136,11 +136,27 @@ type FIFO struct {
 	// the outer cap on all requests.
 	maxLarge map[string]int
 
+	// slotGrace maps a model ID to its per-model slot-grace duration (seconds).
+	// When positive, a session whose last completed turn was less than this
+	// many seconds ago is "slot-warm" — cold large requests for the same model
+	// park instead of being admitted over it. 0 = feature off.
+	slotGrace map[string]time.Duration
+
+	// slotWarm tracks, per model+session, when each session's slot-grace
+	// window expires (zero = not warm). Populated on ServeDone; read at
+	// admission to gate cold large requests behind a warm session.
+	slotWarm map[string]map[string]time.Time
+
 	// grace maps a model ID to its swap-grace duration: a request for a
 	// different model is held in the queue until this model has been idle
 	// (in-flight 0) for at least this long before it may be evicted. Absent or
 	// <= 0 means no grace for that model.
 	grace map[string]time.Duration
+
+	// slotWarmTier tracks, per model+session, the tier rank of each warm
+	// session — used by slotGraceBypass to decide whether a higher-rank
+	// cold request outranks the hold. nil when not needed (grace <= 0).
+	slotWarmTier map[string]map[string]int
 	// starvation is the valve threshold applied in withinGrace: how long a
 	// deferred request may wait (from its first deferral, see graceWait)
 	// before the evictee's grace is deemed served. 0 = use the evictee's own
@@ -221,6 +237,7 @@ type FIFO struct {
 func NewFIFO(name string, logger *logmon.Monitor, planner Swapper, cfg config.FifoConfig, models map[string]config.ModelConfig, eff Effects) *FIFO {
 	limits := make(map[string]int, len(models))
 	grace := make(map[string]time.Duration, len(models))
+	slotGrace := make(map[string]time.Duration, len(models))
 	maxLarge := make(map[string]int, len(models))
 	for id, mc := range models {
 		maxLarge[id] = mc.MaxParallelLargePrefill
@@ -231,6 +248,9 @@ func NewFIFO(name string, logger *logmon.Monitor, planner Swapper, cfg config.Fi
 		limits[id] = limit
 		if mc.SwapGraceSeconds > 0 {
 			grace[id] = time.Duration(mc.SwapGraceSeconds) * time.Second
+		}
+		if mc.SlotGraceSeconds > 0 {
+			slotGrace[id] = time.Duration(mc.SlotGraceSeconds) * time.Second
 		}
 	}
 
@@ -248,6 +268,9 @@ func NewFIFO(name string, logger *logmon.Monitor, planner Swapper, cfg config.Fi
 		kvLargeInFlight: make(map[string]int),
 		kvResidents:     make(map[string]map[string]*kvResident),
 		maxLarge:        maxLarge,
+		slotGrace:       slotGrace,
+		slotWarm:        make(map[string]map[string]time.Time),
+		slotWarmTier:    make(map[string]map[string]int),
 		grace:           grace,
 		idleSince:       make(map[string]time.Time),
 		now:             time.Now,
@@ -415,6 +438,16 @@ func (s *FIFO) OnRequest(req HandlerReq) {
 			markParked(&req, ParkKV)
 			s.enqueue(req)
 			s.kvWarmContention()
+			return
+		}
+		// Slot-grace hold: a cold large request parks while another session
+		// is slot-warm on this model. Warm continuations (same session) and
+		// small requests pass through unaffected. Higher-rank arrivals that
+		// outrank the warm session bypass the hold.
+		if s.slotGraceHold(req) {
+			s.logger.Debugf("%s: queuing request for model %s (slot-grace hold: another session is slot-warm)", s.name, req.Model)
+			markParked(&req, ParkKVWarm)
+			s.enqueue(req)
 			return
 		}
 		// KV warm hold (kvwarm.go): the pool has room for what is in
@@ -660,6 +693,22 @@ func (s *FIFO) OnServeDone(ev ServeDoneEvent) {
 	// Before the drain below: the prompt this request leaves resident is what
 	// that drain must not purge (kvwarm.go).
 	s.kvWarmOnDone(ev)
+
+	// Slot-grace warm tracking: mark the session as slot-warm for its model.
+	// The warm-until timestamp gates cold large requests behind a recently
+	// active session's turn.
+	if g := s.slotGrace[ev.ModelID]; g > 0 && ev.Session != "" {
+		if s.slotWarm[ev.ModelID] == nil {
+			s.slotWarm[ev.ModelID] = make(map[string]time.Time)
+		}
+		now := s.now()
+		s.slotWarm[ev.ModelID][ev.Session] = now.Add(g)
+		// Record the tier so slotGraceHold can check rank overrides.
+		if s.slotWarmTier[ev.ModelID] == nil {
+			s.slotWarmTier[ev.ModelID] = make(map[string]int)
+		}
+		s.slotWarmTier[ev.ModelID][ev.Session] = ev.Tier.Rank
+	}
 	s.publishCapacity()
 	s.publishGrace()
 
@@ -893,6 +942,66 @@ func (s *FIFO) deferredByGrace(req HandlerReq, evict []string) bool {
 	return true
 }
 
+// slotGraceWarmUntil returns the RFC3339 timestamp when session becomes
+// non-warm for model, or an empty string when the session is not warm on that
+// model (grace off, window expired, or no record). The caller renders this
+// verbatim into the sessions API; zero values are omitted by omitempty.
+func (s *FIFO) slotGraceWarmUntil(model, session string) string {
+	g := s.slotGrace[model]
+	if g <= 0 {
+		return ""
+	}
+	warmMap := s.slotWarm[model]
+	if warmMap == nil {
+		return ""
+	}
+	until, ok := warmMap[session]
+	if !ok || until.IsZero() {
+		return ""
+	}
+	return until.Format(time.RFC3339)
+}
+
+// slotGraceHold reports whether req must be parked because another session is
+// slot-warm on req's model. A warm continuation (same session) passes through;
+// small requests pass through; cold large requests park. Higher-rank arrivals
+// that outrank the warm session bypass the hold.
+func (s *FIFO) slotGraceHold(req HandlerReq) bool {
+	g := s.slotGrace[req.Model]
+	if g <= 0 {
+		return false
+	}
+	root := sessionRoot(req.Session)
+
+	now := s.now()
+	for sess, until := range s.slotWarm[req.Model] {
+		if sess == root || now.After(until) {
+			continue
+		}
+		// Another session is slot-warm. Warm continuations pass through.
+		warmRoot := sessionRoot(sess)
+		if warmRoot == root {
+			return false
+		}
+		// Small requests are not gated by the hold.
+		if req.EstimatedTokens < largePrefillThreshold {
+			return false
+		}
+		// Higher-rank bypass: if this arrival outranks the warm session and
+		// its tier contract preempts, let it through — same pattern as
+		// deferredByGrace's rank-aware grace-break.
+		if req.Tier.Rank > 0 && s.slotWarmTier != nil {
+			if tierRank, ok := s.slotWarmTier[req.Model][sess]; ok {
+				if req.Tier.Rank > tierRank && req.Tier.Preempts {
+					return false
+				}
+			}
+		}
+		return true // cold large request behind a warm session
+	}
+	return false
+}
+
 // consumeForced reports whether a FinishCooldown is pending, clearing it if
 // so. Clearing on read makes the finish one-shot: it only ever ends the ONE
 // cooldown it was meant for, never a later, unrelated one. It is consulted
@@ -980,6 +1089,7 @@ func (s *FIFO) OnUnload(targets []string, timeout time.Duration) {
 		targetSet[id] = true
 	}
 	s.kvWarmForget(targets...)
+	s.slotWarmForget(targets...)
 
 	// Release waiters of any in-flight swap whose target is being unloaded.
 	// The swap goroutine itself is left to finish on its own; when its
@@ -1371,6 +1481,8 @@ func (s *FIFO) startSwap(initial HandlerReq, evict, running []string) {
 	// The target starts with empty slots and the evicted models lose theirs.
 	s.kvWarmForget(initial.Model)
 	s.kvWarmForget(evict...)
+	s.slotWarmForget(initial.Model)
+	s.slotWarmForget(evict...)
 	s.active[initial.Model] = &activeSwap{
 		modelID: initial.Model,
 		evict:   evict,
@@ -1512,6 +1624,11 @@ func (s *FIFO) drainQueue() {
 				}
 				markKVParked(req)
 				markParked(&req, ParkKV)
+				stick(req)
+				continue
+			}
+			if s.slotGraceHold(req) {
+				markParked(&req, ParkKVWarm)
 				stick(req)
 				continue
 			}

@@ -97,4 +97,10 @@ type LocalRouter interface {
 	// idle grace is expired. A no-op if nothing is held, one-shot either way.
 	// Safe to call from any goroutine.
 	FinishCooldown()
+
+	// SlotWarmUntil returns per-session slot-grace warm-until timestamps,
+	// keyed by session ID and rendered as RFC3339 strings. Omitted when the
+	// model has no slot-grace configured or the session is not warm. Safe to
+	// call from any goroutine.
+	SlotWarmUntil() map[string]string
 }

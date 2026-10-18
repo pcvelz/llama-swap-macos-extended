@@ -198,7 +198,9 @@ func (s *FIFO) kvWarmOnGrant(req HandlerReq, modelID string) {
 }
 
 // kvWarmDisplace drops idle residencies, oldest first, until in-flight plus
-// what stays resident fits the pool.
+// what stays resident fits the pool. Residencies whose session is inside its
+// slot-grace window are protected and never dropped — the newcomer parks
+// instead of displacing them.
 func (s *FIFO) kvWarmDisplace(modelID, by string) {
 	pool := s.cfg.KVPoolTokens[modelID]
 	var idle []*kvResident
@@ -213,6 +215,15 @@ func (s *FIFO) kvWarmDisplace(modelID, by string) {
 	for _, r := range idle {
 		if total <= pool {
 			break
+		}
+		// Protected by slot-grace: the session's turn ended recently enough
+		// that its cache must not be purged. The newcomer parks instead.
+		g := s.slotGrace[modelID]
+		if g > 0 && !r.lastEnd.IsZero() {
+			now := s.now()
+			if now.Sub(r.lastEnd) < g {
+				continue
+			}
 		}
 		total -= r.tokens
 		delete(s.kvResidents[modelID], r.session)
@@ -313,5 +324,14 @@ func (s *FIFO) kvWarmContention() {
 func (s *FIFO) kvWarmForget(models ...string) {
 	for _, m := range models {
 		delete(s.kvResidents, m)
+	}
+}
+
+// slotWarmForget drops a model's slot-warm state: its process is being
+// (re)started or stopped, and a fresh child has empty slots.
+func (s *FIFO) slotWarmForget(models ...string) {
+	for _, m := range models {
+		delete(s.slotWarm, m)
+		delete(s.slotWarmTier, m)
 	}
 }

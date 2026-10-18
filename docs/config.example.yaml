@@ -607,6 +607,18 @@ models:
     #   kvPoolTokens budget check still applies at any value
     maxParallelLargePrefill: 1
 
+    # slotGraceSeconds: slot-level cooldown, the analogue of swapGraceSeconds one level down
+    # - optional, default: 0 (off, plain FIFO)
+    # - a session that finished a turn on this model less than this many seconds
+    #   ago is slot-warm: its slot, large-prefill permit and KV are held for its
+    #   continuation. A cold large request parks instead of being admitted over
+    #   it, and the warm cache cannot be displaced inside the window
+    # - admission only: a running prefill is never preempted for a warm session
+    # - enable where large prefills are serialized anyway (cap 1 above);
+    #   leave 0 where large sessions truly run in parallel - there a hold
+    #   would only add a wait
+    slotGraceSeconds: 300
+
     # unloadTimeout: graceful timeout in seconds when unloading this model (manual, API, or ttl expiry)
     # - optional, default: global unloadTimeout
     # - a value of 0 uses the global unloadTimeout

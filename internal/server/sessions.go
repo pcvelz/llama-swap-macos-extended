@@ -121,6 +121,10 @@ type sessionEntry struct {
 	ElapsedMs    int64          `json:"elapsedMs"`
 	PhaseSinceMs int64          `json:"phaseSinceMs"`
 	RespTokens   int64          `json:"respTokens"`
+	// SlotWarmUntil is the RFC3339 timestamp when this session's slot-grace
+	// window expires. Omitted when the model has no slot-grace configured or
+	// the session is not currently warm. Part of llama-swap.sessions/v1.
+	SlotWarmUntil string `json:"slotWarmUntil,omitempty"`
 	// ParentSessionId / ParentSessionShort carry the dispatching session's id
 	// from X-Claude-Code-Parent-Session-Id. When present, a renderer can show
 	// which interactive Claude Code session fired a headless dispatch row;
@@ -229,6 +233,10 @@ type sessionsInput struct {
 	Hot         map[string][]swaputil.HotSlot
 	Cooldown    *swaputil.Cooldown
 	MemoryBrake membrake.Status
+	// SlotWarmUntil is keyed by session ID, value is RFC3339. Populated by the
+	// hub from the scheduler's SlotWarmUntil; nil in tests that drive the fold
+	// directly, which then leaves the field at its zero value (omitted).
+	SlotWarmUntil map[string]string
 	// Loops is the box's loop tracker, read (never written) to stamp the
 	// looping/uniformRun fields onto every row that has a session id. nil in
 	// tests that drive the fold directly, which then leaves both fields at
@@ -258,20 +266,22 @@ type idleMark struct {
 // when each row entered its phase, the rate samples, and the known sessions
 // for IDLE retention. Not safe for concurrent use; sessionsHub serializes.
 type sessionsBuilder struct {
-	cfg    config.Config
-	phases map[string]phaseMark
-	rates  map[string][]rateSample
-	known  map[string]sessionEntry
-	idle   map[string]idleMark
+	cfg           config.Config
+	phases        map[string]phaseMark
+	rates         map[string][]rateSample
+	known         map[string]sessionEntry
+	idle          map[string]idleMark
+	slotWarmUntil map[string]string // keyed by session ID, RFC3339
 }
 
 func newSessionsBuilder(cfg config.Config) *sessionsBuilder {
 	return &sessionsBuilder{
-		cfg:    cfg,
-		phases: map[string]phaseMark{},
-		rates:  map[string][]rateSample{},
-		known:  map[string]sessionEntry{},
-		idle:   map[string]idleMark{},
+		cfg:           cfg,
+		phases:        map[string]phaseMark{},
+		rates:         map[string][]rateSample{},
+		known:         map[string]sessionEntry{},
+		idle:          map[string]idleMark{},
+		slotWarmUntil: map[string]string{},
 	}
 }
 
@@ -287,6 +297,14 @@ func (b *sessionsBuilder) tierRank(tier string) int {
 		return tc.Rank
 	}
 	return 0
+}
+
+// stampSlotWarmUntil sets row.SlotWarmUntil from the builder's slot-warm map
+// when the session is currently warm on its model. Omitted (zero value) otherwise.
+func (b *sessionsBuilder) stampSlotWarmUntil(row *sessionEntry) {
+	if v, ok := b.slotWarmUntil[row.SessionID]; ok && v != "" {
+		row.SlotWarmUntil = v
+	}
 }
 
 func shortOf(s string) string {
@@ -361,6 +379,14 @@ func requestRank(m map[string]string) int {
 
 func (b *sessionsBuilder) build(in sessionsInput) sessionsBody {
 	now := in.Now
+	// Copy slot-warm state into the builder for stamping on each row.
+	if len(in.SlotWarmUntil) > 0 {
+		b.slotWarmUntil = in.SlotWarmUntil
+	} else {
+		for k := range b.slotWarmUntil {
+			delete(b.slotWarmUntil, k)
+		}
+	}
 	body := sessionsBody{
 		Schema:      sessionsSchema,
 		GeneratedAt: now.Format("2006-01-02T15:04:05.000Z07:00"),
@@ -412,6 +438,7 @@ func (b *sessionsBuilder) build(in sessionsInput) sessionsBody {
 		b.applyLoopState(in, &row, held)
 		b.stampPhaseSince(key, &row, now, r.Timestamp)
 		b.stampRate(key, &row, now, in, r)
+		b.stampSlotWarmUntil(&row)
 		present[key] = true
 		body.Sessions = append(body.Sessions, row)
 	}
@@ -427,6 +454,7 @@ func (b *sessionsBuilder) build(in sessionsInput) sessionsBody {
 			present[h.SessionID] = true
 			delete(b.phases, h.SessionID)
 			delete(b.rates, h.SessionID)
+			b.stampSlotWarmUntil(&row)
 			body.Sessions = append(body.Sessions, row)
 		}
 	}
@@ -459,6 +487,7 @@ func (b *sessionsBuilder) build(in sessionsInput) sessionsBody {
 		}
 		row := b.idleRow(in, m, now)
 		b.applyLoopState(in, &row, held)
+		b.stampSlotWarmUntil(&row)
 		body.Sessions = append(body.Sessions, row)
 	}
 
@@ -973,6 +1002,15 @@ func fetchChildSlots(base string) ([]childSlot, error) {
 }
 
 // tick builds one snapshot. poll=false reuses the last poll (no child read).
+// slotWarmUntil delegates to the local router's SlotWarmUntil. Nil when the
+// router does not support it.
+func (h *sessionsHub) slotWarmUntil() map[string]string {
+	if h.s.local == nil {
+		return nil
+	}
+	return h.s.local.SlotWarmUntil()
+}
+
 func (h *sessionsHub) tick(now time.Time, poll bool) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -1007,14 +1045,15 @@ func (h *sessionsHub) tick(now time.Time, poll bool) {
 		}
 	}
 	body := h.builder.build(sessionsInput{
-		Now:         now,
-		Running:     running,
-		Requests:    s.inflight.Current().Requests,
-		Slots:       h.lastPoll,
-		Hot:         hot,
-		Cooldown:    s.currentCooldown(),
-		MemoryBrake: membrake.CurrentStatus(),
-		Loops:       s.inflight.loops,
+		Now:           now,
+		Running:       running,
+		Requests:      s.inflight.Current().Requests,
+		Slots:         h.lastPoll,
+		Hot:           hot,
+		Cooldown:      s.currentCooldown(),
+		MemoryBrake:   membrake.CurrentStatus(),
+		SlotWarmUntil: h.slotWarmUntil(),
+		Loops:         s.inflight.loops,
 	})
 	h.cur.Store(&body)
 	if s.debugHistory != nil {

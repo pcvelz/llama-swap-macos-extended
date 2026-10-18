@@ -132,6 +132,9 @@ func (s *stubRouter) Cooldown() *swaputil.Cooldown {
 // FinishCooldown just counts the call so tests can assert on it.
 func (s *stubRouter) FinishCooldown() { s.finishCalls++ }
 
+// SlotWarmUntil returns nil by default — stubs don't track slot-grace state.
+func (s *stubRouter) SlotWarmUntil() map[string]string { return nil }
+
 // newTestServer wires a Server with stub routers and a built mux.
 func newTestServer(local router.LocalRouter, peer router.Router) *Server {
 	return newTestServerWithConfig(config.Config{}, local, peer)

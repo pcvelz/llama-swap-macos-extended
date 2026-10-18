@@ -281,6 +281,10 @@ type ServeDoneEvent struct {
 	// Session echoes HandlerReq.Session: the KV warm hold (kvwarm.go) marks
 	// this session's prompt resident when its large request completes.
 	Session string
+	// Tier echoes HandlerReq.Tier: the entry-point tier rank of the session
+	// that just completed, used by slot-grace to track per-session tier ranks
+	// for the rank-bypass check.
+	Tier swaputil.Tier
 	// Cut: the request ended because its client went away or it was
 	// cancelled, not because the turn completed. Its partial prefill stays
 	// resident for the retry; the KV warm hold does not count it as a turn.

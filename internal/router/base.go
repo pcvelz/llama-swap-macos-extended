@@ -511,7 +511,7 @@ func (b *baseRouter) GrantError(req scheduler.HandlerReq, err error) {
 // the router would never again be willing to evict this model.
 func (b *baseRouter) GrantServe(req scheduler.HandlerReq, modelID string) bool {
 	p := b.processes[modelID]
-	return b.grant(req, scheduler.HandlerResp{HandleFunc: b.trackedServe(modelID, p, req.EstimatedTokens, req.Session, req.StatusRead, req.Preempted, req.ReplayWanted)})
+	return b.grant(req, scheduler.HandlerResp{HandleFunc: b.trackedServe(modelID, p, req.EstimatedTokens, req.Session, req.Tier, req.StatusRead, req.Preempted, req.ReplayWanted)})
 }
 
 // StopProcesses implements scheduler.Effects, stopping the named processes in
@@ -555,7 +555,7 @@ func (b *baseRouter) StopProcesses(timeout time.Duration, ids []string) {
 // whatever the upstream reverse proxy would otherwise write. replayWanted,
 // when non-nil, is the same flag scheduler.HandlerReq.ReplayWanted carries —
 // see preemptResponseWriter's type doc for the v2 replay behavior it enables.
-func (b *baseRouter) trackedServe(modelID string, p process.Process, estimatedTokens int, session string, statusRead bool, preempted *atomic.Bool, replayWanted *atomic.Bool) http.HandlerFunc {
+func (b *baseRouter) trackedServe(modelID string, p process.Process, estimatedTokens int, session string, tier swaputil.Tier, statusRead bool, preempted *atomic.Bool, replayWanted *atomic.Bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// capReleased: the slot table declared this request a phantom and
 		// already gave its cap place back (see slotbind.go).
@@ -573,7 +573,7 @@ func (b *baseRouter) trackedServe(modelID string, p process.Process, estimatedTo
 			if verdict, ok := swaputil.LoopVerdictFromContext(r.Context()); ok && verdict != nil {
 				looping = verdict()
 			}
-			ev := scheduler.ServeDoneEvent{ModelID: modelID, EstimatedTokens: estimatedTokens, Session: session, Cut: r.Context().Err() != nil, StatusRead: statusRead, Looping: looping,
+			ev := scheduler.ServeDoneEvent{ModelID: modelID, EstimatedTokens: estimatedTokens, Session: session, Tier: tier, Cut: r.Context().Err() != nil, StatusRead: statusRead, Looping: looping,
 				Holder: preempted, CapReleased: capReleased.Load()}
 			if orphan == nil {
 				b.sendServeDone(ev)
@@ -1542,4 +1542,14 @@ func (b *baseRouter) FinishCooldown() {
 	if r, ok := b.schedule.(scheduler.CooldownReporter); ok {
 		r.FinishCooldown()
 	}
+}
+
+// SlotWarmUntil implements LocalRouter. Returns per-session slot-grace warm-until
+// timestamps from the scheduler. Nil when the configured scheduler does not
+// support it.
+func (b *baseRouter) SlotWarmUntil() map[string]string {
+	if r, ok := b.schedule.(scheduler.SlotWarmReporter); ok {
+		return r.SlotWarmUntil()
+	}
+	return nil
 }
