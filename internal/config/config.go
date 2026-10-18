@@ -220,13 +220,22 @@ type Config struct {
 	Groups map[string]GroupConfig `yaml:"groups"` /* key is group ID */
 	Matrix *MatrixConfig          `yaml:"matrix"`
 
+	// TranscriptionEndpoint is the full URL of a standalone speech-to-text
+	// service (e.g. whisper-server) that handles /v1/audio/transcriptions
+	// requests. When set, the form filter middleware reverse-proxies the
+	// request directly to this endpoint, bypassing the model dispatch chain
+	// entirely. This is architecturally correct for non-llama-server backends
+	// (whisper.cpp) that share no KV cache, swap-grace, or slot-affinity
+	// machinery with the resident chat model. Empty (default) = upstream
+	// behaviour; transcription routes through the normal model dispatch.
+	TranscriptionEndpoint string `yaml:"transcriptionEndpoint"`
+
 	// TranscriptionModel is the model ID that handles /v1/audio/transcriptions
-	// requests. When set, the form filter middleware rewrites the model field
-	// on transcription requests to this value before dispatch, so voice
-	// dictation from any chat model (cq27, cq35, ck3) lands on a dedicated
-	// whisper backend rather than the text-only LLM the session is using.
-	// Empty (default) = no rewrite; transcription routes to whatever model
-	// the client names (upstream behaviour).
+	// requests when TranscriptionEndpoint is empty. When set, the form filter
+	// middleware rewrites the model field on transcription requests to this
+	// value before dispatch. Deprecated in favour of TranscriptionEndpoint for
+	// standalone STT services; kept for backwards compatibility with configs
+	// that register whisper as a llama-swap model.
 	TranscriptionModel string `yaml:"transcriptionModel"`
 
 	// for key/value replacements in model's cmd, cmdStop, proxy, checkEndPoint

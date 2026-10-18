@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/mostlygeek/llama-swap/internal/chain"
 	"github.com/mostlygeek/llama-swap/internal/config"
@@ -99,11 +101,29 @@ func CreateFilterMiddleware(cfg config.Config) chain.Middleware {
 // Non-multipart requests pass through untouched. When a rewrite is needed the
 // form is reconstructed and re-attached with Content-Type / Content-Length
 // cleanup so the downstream reverse proxy forwards the correct bytes.
+//
+// Transcription routing (2026-10-04): when cfg.TranscriptionEndpoint is set,
+// POST /v1/audio/transcriptions is reverse-proxied directly to that endpoint,
+// bypassing the model dispatch chain entirely. This is architecturally correct
+// for standalone STT services (whisper.cpp) that share no KV cache, swap-grace,
+// or slot-affinity machinery with the resident chat model. The request never
+// enters the FIFO scheduler, so there is no queue wait or model-load wait.
 func CreateFormFilterMiddleware(cfg config.Config) chain.Middleware {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if !strings.Contains(r.Header.Get("Content-Type"), "multipart/form-data") {
 				next.ServeHTTP(w, r)
+				return
+			}
+
+			// WHY: transcription requests to a standalone STT endpoint bypass the
+			// model dispatch chain entirely. The request is reverse-proxied
+			// directly to the configured endpoint; no model rewrite, no scheduler
+			// admission, no KV pool interaction. This runs BEFORE FetchContext so
+			// a missing model in the form (e.g. Claude Code sends model=<chat-model>
+			// which is valid for dispatch but irrelevant here) does not short-circuit.
+			if cfg.TranscriptionEndpoint != "" && r.URL.Path == "/v1/audio/transcriptions" {
+				proxyTranscription(w, r, cfg.TranscriptionEndpoint)
 				return
 			}
 
@@ -176,6 +196,54 @@ func CreateFormFilterMiddleware(cfg config.Config) chain.Middleware {
 			next.ServeHTTP(w, updated)
 		})
 	}
+}
+
+// proxyTranscription reverse-proxies a multipart transcription request directly
+// to the configured STT endpoint (e.g. whisper-server /inference). The request
+// body is forwarded verbatim; the response is streamed back to the client.
+// This bypasses the model dispatch chain entirely - no scheduler admission,
+// no KV pool interaction, no swap-grace wait.
+func proxyTranscription(w http.ResponseWriter, r *http.Request, endpoint string) {
+	target, err := url.Parse(endpoint)
+	if err != nil {
+		swaputil.SendResponse(w, r, http.StatusBadGateway, "invalid transcription endpoint: "+err.Error())
+		return
+	}
+
+	// Buffer the multipart body so we can set Content-Length on the proxied request.
+	bodyBytes, err := io.ReadAll(r.Body)
+	if err != nil {
+		swaputil.SendResponse(w, r, http.StatusBadRequest, "could not read transcription body: "+err.Error())
+		return
+	}
+	r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+
+	proxiedReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, target.String(), bytes.NewReader(bodyBytes))
+	if err != nil {
+		swaputil.SendResponse(w, r, http.StatusBadGateway, "could not create proxied request: "+err.Error())
+		return
+	}
+
+	// Forward the multipart Content-Type (with its boundary) verbatim.
+	proxiedReq.Header.Set("Content-Type", r.Header.Get("Content-Type"))
+	proxiedReq.ContentLength = int64(len(bodyBytes))
+
+	client := &http.Client{Timeout: 120 * time.Second}
+	resp, err := client.Do(proxiedReq)
+	if err != nil {
+		swaputil.SendResponse(w, r, http.StatusBadGateway, "transcription endpoint unreachable: "+err.Error())
+		return
+	}
+	defer resp.Body.Close()
+
+	// Copy response headers and status.
+	for key, values := range resp.Header {
+		for _, v := range values {
+			w.Header().Add(key, v)
+		}
+	}
+	w.WriteHeader(resp.StatusCode)
+	io.Copy(w, resp.Body)
 }
 
 // modelRejectsImages reports whether a requested LOCAL model has declared

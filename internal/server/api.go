@@ -338,6 +338,20 @@ func (s *Server) collectModelRecords(r *http.Request) []modelRecord {
 		}
 	}
 
+	// WHY: when a standalone STT endpoint is configured, every chat model can
+	// accept voice dictation - the form filter reverse-proxies transcription
+	// requests to the endpoint regardless of which model the session uses.
+	// Stamp audio_transcriptions on all records so /v1/models advertises the
+	// capability and Claude Code enables the hold-space button.
+	if s.cfg.TranscriptionEndpoint != "" {
+		for i := range data {
+			if data[i].Capabilities == nil {
+				data[i].Capabilities = make(map[string]any)
+			}
+			data[i].Capabilities["audio_transcriptions"] = true
+		}
+	}
+
 	sort.Slice(data, func(i, j int) bool { return data[i].ID < data[j].ID })
 	if isTailcatRequest(r.Context()) {
 		exposed := s.cfg.Tailcat
