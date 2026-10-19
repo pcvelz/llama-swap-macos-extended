@@ -225,3 +225,53 @@ func TestInflightTracker_YieldFloorSkipsPrefill(t *testing.T) {
 		t.Fatalf("prefill (zero tokens) should not be cancelled, got %v", cancelled)
 	}
 }
+
+// 2026-10-19 (W fea5693f, G 620c7b25): a request that waited parked and then
+// prefilled for more than the yield window was cancelled the instant its FIRST
+// token streamed, because yield was measured from arrival. Waiting is not low
+// yield: the window starts at the first real output token.
+func TestInflightTracker_YieldFloorIgnoresWaitBeforeFirstToken(t *testing.T) {
+	tracker := newInflightTracker()
+	tracker.setLoopGuard(config.LoopGuardConfig{
+		Enabled:             true,
+		RunBar:              999,
+		YieldFloorTokPerMin: 10,
+		YieldFloorMinutes:   15, // the live value
+	})
+
+	_, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+	id := tracker.Add(req, cancel)
+	tracker.SetMetadata(id, "session_id", "fea5693f-dd88-47d1-a37e-d5e2e2ed0d61")
+	// Arrived 17 minutes ago (8 parked + 9 cold prefill, as witnessed).
+	tracker.mu.Lock()
+	tracker.requests[id].entry.Timestamp = time.Now().Add(-17 * time.Minute)
+	tracker.mu.Unlock()
+
+	// The first real output token arrives now.
+	tracker.AddResponseBytes(id, []byte("event: content_block_delta\n"+
+		"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"I\"}}\n\n"))
+
+	cancelled, events := tracker.CheckYieldFloor()
+	if len(cancelled) != 0 || len(events) != 0 {
+		t.Fatalf("a request that just produced its first token after a long wait must not be struck; cancelled=%v events=%d", cancelled, len(events))
+	}
+
+	// A request that has been DECODING glacially for longer than the window is
+	// still struck: the floor keeps its job, only the clock start moved.
+	_, cancel2 := context.WithCancel(context.Background())
+	defer cancel2()
+	id2 := tracker.Add(httptest.NewRequest(http.MethodPost, "/v1/messages", nil), cancel2)
+	tracker.SetMetadata(id2, "session_id", "glacial-decoder")
+	tracker.AddResponseBytes(id2, []byte("event: content_block_delta\n"+
+		"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"a\"}}\n\n"))
+	tracker.mu.Lock()
+	tracker.requests[id2].entry.Timestamp = time.Now().Add(-40 * time.Minute)
+	tracker.requests[id2].firstOutputAt = time.Now().Add(-20 * time.Minute)
+	tracker.mu.Unlock()
+	cancelled2, _ := tracker.CheckYieldFloor()
+	if len(cancelled2) != 1 || cancelled2[0] != id2 {
+		t.Fatalf("a request decoding 1 token in 20 min must be struck; cancelled=%v", cancelled2)
+	}
+}

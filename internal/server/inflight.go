@@ -91,6 +91,11 @@ type inflightRequest struct {
 	// the next chunk complete and count it. Bounded by respCarryMax so a
 	// pathological unterminated line can never buffer the whole stream.
 	respCarry []byte
+	// firstOutputAt is when the first REAL output token (content_block_delta)
+	// streamed. The yield floor measures from here, not from arrival: time
+	// parked in the queue and in prefill is waiting, not low yield
+	// (2026-10-19: requests struck at their first token after a long wait).
+	firstOutputAt time.Time
 }
 
 // newInflightTracker builds a tracker. tierNames are the configured tier names
@@ -438,6 +443,9 @@ func (t *inflightTracker) AddResponseBytes(id string, data []byte) {
 	// are what let a reader tell a producing slot from an only-pinged one.
 	deltas, carry := scanRealOutputDeltas(req.respCarry, data)
 	req.respCarry = carry
+	if deltas > 0 && req.firstOutputAt.IsZero() {
+		req.firstOutputAt = time.Now()
+	}
 	req.entry.RespTokens += deltas
 
 	now := time.Now()
@@ -615,7 +623,16 @@ func (t *inflightTracker) CheckYieldFloor() ([]string, []swaputil.LoopPenaltyEve
 		if sid == "" || req.entry.RespTokens <= 0 {
 			continue
 		}
-		elapsed := now.Sub(req.entry.Timestamp)
+		// Yield is output per minute of PRODUCING, so the clock starts at the
+		// first real token; parked and prefill time before it is a wait, and
+		// counting it struck every request that had queued past the window the
+		// instant it began to decode. Arrival is only the fallback for an entry
+		// whose tokens were not counted through AddResponseBytes.
+		start := req.firstOutputAt
+		if start.IsZero() {
+			start = req.entry.Timestamp
+		}
+		elapsed := now.Sub(start)
 		candidates = append(candidates, candidate{id: id, session: sid, elapsed: elapsed, produced: req.entry.RespTokens})
 	}
 	t.mu.Unlock()
