@@ -13,6 +13,7 @@ import (
 	"github.com/mostlygeek/llama-swap/internal/config"
 	"github.com/mostlygeek/llama-swap/internal/logmon"
 	"github.com/mostlygeek/llama-swap/internal/process"
+	"github.com/mostlygeek/llama-swap/internal/swaputil"
 )
 
 // P4 tests: deadline-aware admission (feature A) and the sequenced pinger
@@ -338,31 +339,67 @@ func TestBaseRouter_SequencedPinger_SilentWhileReplayEligible(t *testing.T) {
 	}
 }
 
-// TestBaseRouter_PingedRequest_NeverReplays: the interaction guard. A request
-// whose pings already committed the response must NOT be transparently replayed
-// - preemptResponseWriter keeps its own wroteHeader, so it would happily
-// swallow a header and ask for a replay on a stream the client is already
-// reading, which would deliver a second response body on that same stream. The
-// stream is ended as an SSE error event instead, and the model is entered
-// exactly once for this caller.
-func TestBaseRouter_PingedRequest_NeverReplays(t *testing.T) {
-	// Surrender eligibility almost immediately so the victim is a PINGED
-	// request by the time the rival preempts it, while its attempt still holds
-	// a live replayWanted flag - the exact window the guard covers.
+// runPreemptedVictim drives one booted-victim scenario: a streaming victim of
+// tier victimTier is started on a single-model base with a KV pool of 8, the
+// caller's ready() reports when it is in the state under test, then a rival of
+// rivalTier pushes the pool over and preempts it. Returns the victim's body.
+func runPreemptedVictim(t *testing.T, proc *fakeProcess, victimTier, rivalTier swaputil.Tier, ready func(body string) bool) string {
+	t.Helper()
+	sendLoading := true
+	mc := config.ModelConfig{SendLoadingState: &sendLoading}
+	b := newDeadlineTestBase(t, proc, mc, config.FifoConfig{KVPoolTokens: map[string]int{"mdl": 8}}, &syncBuf{})
+
+	rec := newSyncRecorder()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		b.ServeHTTP(rec, buildParkReq("mdl", "victim", victimTier,
+			"/v1/messages", `{"model":"mdl","stream":true}`))
+	}()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for !ready(rec.bodyString()) {
+		if time.Now().After(deadline) {
+			t.Fatalf("victim never reached the state under test.\nbody: %q", rec.bodyString())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	go b.ServeHTTP(httptest.NewRecorder(), buildParkReq("mdl", "rival", rivalTier,
+		"/v1/chat/completions", `{"model":"mdl"}`))
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("victim never finished")
+	}
+	return rec.bodyString()
+}
+
+// TestBaseRouter_PingedRequest_ReplaysUntilContent: a request whose pings
+// committed the response, but which has received no upstream content yet, IS
+// transparently replayed when preempted. The client has read only a status
+// line and ping events, and pingWriter never commits a second status line, so
+// the replay's body is the only content it ever reads - the same shape as a
+// request pinged while parked and then served.
+func TestBaseRouter_PingedRequest_ReplaysUntilContent(t *testing.T) {
 	shortenReplayHeld(t, 50*time.Millisecond)
 	shortenPingCadence(t, 30*time.Millisecond)
 
-	m1 := newFakeProcess("m1")
-	m1.markReady()
+	proc := newFakeProcess("mdl")
+	proc.markReady()
 	var victimCalls atomic.Int32
-	m1.serveFunc = func(w http.ResponseWriter, r *http.Request, callNum int) bool {
+	proc.serveFunc = func(w http.ResponseWriter, r *http.Request, callNum int) bool {
 		if r.Header.Get("X-Role") == "victim" {
-			victimCalls.Add(1)
-			// Mirror a reverse proxy aborting its upstream call on preemption:
-			// it writes its OWN failure status, which preemptResponseWriter
-			// intercepts as the replay signal.
-			<-r.Context().Done()
-			w.WriteHeader(http.StatusBadGateway)
+			if victimCalls.Add(1) == 1 {
+				// A reverse proxy aborting its upstream call on preemption
+				// writes its OWN failure status.
+				<-r.Context().Done()
+				w.WriteHeader(http.StatusBadGateway)
+				return true
+			}
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprint(w, "event: message_start\ndata: {}\n\nserved")
 			return true
 		}
 		w.WriteHeader(http.StatusOK)
@@ -370,47 +407,95 @@ func TestBaseRouter_PingedRequest_NeverReplays(t *testing.T) {
 		return true
 	}
 
-	sendLoading := true
-	mc := config.ModelConfig{SendLoadingState: &sendLoading}
-	logs := &syncBuf{}
-	// Pool 8: the victim (est 7) is admitted alone, and the rival (est 3)
-	// pushes the model over, forcing a real same-model preemption.
-	b := newDeadlineTestBase(t, m1, mc, config.FifoConfig{KVPoolTokens: map[string]int{"m1": 8}}, logs)
+	body := runPreemptedVictim(t, proc, replayTierBackground, replayTierDefault,
+		func(b string) bool { return strings.Contains(b, "event: ping") })
 
-	rec := newSyncRecorder()
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		b.ServeHTTP(rec, buildParkReq("m1", "victim", replayTierBackground,
-			"/v1/messages", `{"model":"m1","stream":true}`))
-	}()
+	if got := victimCalls.Load(); got != 2 {
+		t.Fatalf("victim entered the model %d times, want 2 - a pinged-only stream must be replayed, not ended", got)
+	}
+	if strings.Contains(body, "event: error") || !strings.Contains(body, "served") {
+		t.Fatalf("victim body = %q, want the replay's served payload and no SSE error", body)
+	}
+}
 
-	// Wait until the victim has genuinely committed its response with a ping.
-	deadline := time.Now().Add(3 * time.Second)
-	for !strings.Contains(rec.bodyString(), "event: ping") {
-		if time.Now().After(deadline) {
-			t.Fatalf("victim never pinged, so this test is not exercising the guard.\nbody: %q", rec.bodyString())
+// TestBaseRouter_PriorityPreemptedDefaultSession_Replays: the incident shape
+// (llama-cm 2026-10-20-priority-preempt-503s-default-session). A default-tier
+// stream is NOT Preemptible, but a `preempts: true` tier outranks it and boots
+// it. Its upstream already committed 200 + an SSE comment (llama-server does
+// that at accept), so the preemption never reaches preemptResponseWriter's
+// first-WriteHeader swallow. It must still be replayed and served: never the
+// "never started" 503, never an SSE error.
+func TestBaseRouter_PriorityPreemptedDefaultSession_Replays(t *testing.T) {
+	shortenPingCadence(t, 30*time.Millisecond)
+
+	proc := newFakeProcess("mdl")
+	proc.markReady()
+	var victimCalls atomic.Int32
+	proc.serveFunc = func(w http.ResponseWriter, r *http.Request, callNum int) bool {
+		if r.Header.Get("X-Role") == "victim" {
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprint(w, ":\n\n")
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+			if victimCalls.Add(1) == 1 {
+				// A reverse proxy whose response already started writes
+				// nothing more when its context is cancelled.
+				<-r.Context().Done()
+				return true
+			}
+			fmt.Fprint(w, "event: message_start\ndata: {}\n\nserved")
+			return true
 		}
-		time.Sleep(10 * time.Millisecond)
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, "rival-ok")
+		return true
 	}
 
-	go b.ServeHTTP(httptest.NewRecorder(), buildParkReq("m1", "rival", replayTierDefault,
-		"/v1/chat/completions", `{"model":"m1"}`))
+	priority := swaputil.Tier{Name: "priority", Rank: 10, Preempts: true}
+	body := runPreemptedVictim(t, proc, replayTierDefault, priority,
+		func(string) bool { return victimCalls.Load() >= 1 })
 
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("victim never finished - it is stuck in a replay it should never have started")
+	if got := victimCalls.Load(); got != 2 {
+		t.Fatalf("victim entered the model %d times, want 2 - a booted default-tier turn must be replayed", got)
 	}
+	if strings.Contains(body, "event: error") || strings.Contains(body, "never started") || !strings.Contains(body, "served") {
+		t.Fatalf("victim body = %q, want the replay's served payload and no error", body)
+	}
+}
+
+// TestBaseRouter_ContentStreamedRequest_NeverReplays: the interaction guard. A
+// request whose upstream content already reached the client must NOT be
+// replayed - that would hand it a second message on a stream it is already
+// reading. The model is entered exactly once for this caller.
+func TestBaseRouter_ContentStreamedRequest_NeverReplays(t *testing.T) {
+	shortenPingCadence(t, 30*time.Millisecond)
+
+	proc := newFakeProcess("mdl")
+	proc.markReady()
+	var victimCalls atomic.Int32
+	proc.serveFunc = func(w http.ResponseWriter, r *http.Request, callNum int) bool {
+		if r.Header.Get("X-Role") == "victim" {
+			victimCalls.Add(1)
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprint(w, "event: message_start\ndata: {}\n\n")
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+			<-r.Context().Done()
+			return true
+		}
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, "rival-ok")
+		return true
+	}
+
+	priority := swaputil.Tier{Name: "priority", Rank: 10, Preempts: true}
+	runPreemptedVictim(t, proc, replayTierDefault, priority,
+		func(b string) bool { return strings.Contains(b, "message_start") })
 
 	if got := victimCalls.Load(); got != 1 {
-		t.Fatalf("victim entered the model %d times, want exactly 1 - a pinged request must never replay", got)
-	}
-	if body := rec.bodyString(); !strings.Contains(body, "event: error") {
-		t.Fatalf("victim body = %q, want a terminal SSE error event - a committed stream must be ended, not silently abandoned", body)
-	}
-	if got := logs.String(); !strings.Contains(got, "suppressed - keepalive pings already committed the response") {
-		t.Fatalf("the replay-suppression log line is missing.\nlogs:\n%s", got)
+		t.Fatalf("victim entered the model %d times, want exactly 1 - a stream that already carried content must never replay", got)
 	}
 }
 

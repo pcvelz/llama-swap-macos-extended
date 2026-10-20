@@ -1177,14 +1177,22 @@ func (b *baseRouter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 
 		// replayEligible: this attempt may transparently retry instead of
 		// 503ing the client if it is preempted before producing any body
-		// byte. Scope: only tiers marked Preemptible (today, just
-		// "background" — docs/intent/llama-swap-tiers.md) — a
-		// non-preemptible request is never a preemption victim in the first
-		// place, so this check is inert for it either way; making it
-		// explicit keeps that inertness obvious rather than implicit.
-		// Bounded by maxReplays/maxReplayHeld so a pathological hot-loop of
-		// same-model contention still falls back to the v1 503 well under
-		// the client's own ~300s abort ceiling. Memory tradeoff: origBody
+		// byte. Scope: EVERY tier. A non-preemptible request IS a preemption
+		// victim whenever a `preempts: true` tier outranks it
+		// (swaputil.CanPreempt): the priority tier boots default-tier
+		// holders. Tying replay to Preemptible handed exactly those victims
+		// the v1 503 - a default-tier session was 503'd on every turn of a
+		// priority session for 40+ minutes (llama-cm incident
+		// 2026-10-20-priority-preempt-503s-default-session). For a request
+		// that is never a victim this is inert.
+		//
+		// The maxReplays/maxReplayHeld caps exist for a SILENT request, which
+		// must fall back to the v1 503 well under the client's own ~300s
+		// zero-byte abort ceiling. A request whose keepalive pinger is live
+		// is not racing that wall - the pings feed it - so the caps do not
+		// apply to it: a booted turn is held and replayed for as long as it
+		// keeps being booted ("You are held, not refused",
+		// docs/intent/llama-swap-backend.md). Memory tradeoff: origBody
 		// (already buffered once by swaputil.FetchContext for every JSON POST,
 		// replay-eligible or not) is retained for this attempt's lifetime —
 		// interactive request bodies can run multi-MB, so this scales with
@@ -1192,7 +1200,8 @@ func (b *baseRouter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		// count, and is bounded by the same concurrency limits that already
 		// bound in-flight request memory today.
 		var replayWanted *atomic.Bool
-		replayEligible := data.Tier.Preemptible && replayCount < maxReplays && time.Since(replayStart) < maxReplayHeld
+		pingsLive := pw != nil && pw.allowed.Load()
+		replayEligible := pingsLive || (replayCount < maxReplays && time.Since(replayStart) < maxReplayHeld)
 		if replayEligible {
 			replayWanted = new(atomic.Bool)
 		} else if pw != nil {
@@ -1476,21 +1485,29 @@ func (b *baseRouter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		resp.HandleFunc(w, attemptReq)
 		removePrefill()
 
+		// A preemption that lands AFTER the upstream committed its status line
+		// (llama-server sends 200 + SSE headers at accept, then only ":"
+		// comments while it prefills) never reaches preemptResponseWriter's
+		// first-WriteHeader swallow, so replayWanted stays false and the
+		// cancelled stream would simply end. On the Anthropic streaming path
+		// the client has still seen nothing but headers, comments and pings
+		// until the first content byte, so that stream is just as replayable.
+		if replayWanted != nil && !replayWanted.Load() && preempted.Load() && pw != nil && pw.preFirstToken() {
+			replayWanted.Store(true)
+		}
 		if replayWanted != nil && replayWanted.Load() {
-			// GUARD on the pinger/replay interaction. preemptResponseWriter
-			// tracks its OWN wroteHeader, so it will happily swallow a first
-			// WriteHeader for a replay even on a response whose status line the
-			// pinger already committed - and replaying then means the client
-			// gets a second response body on a stream it is already reading.
-			// The sequencing above makes this unreachable in the common case
-			// (an eligible request is muted, so it cannot have pinged); it is
-			// reachable only in the narrow window where eligibility was
-			// surrendered by time AFTER this attempt's replayWanted was
-			// created. End the stream the way a committed stream must be ended -
-			// as an SSE error event (pingWriter.WriteHeader maps it) - instead
-			// of replaying.
-			if pw != nil && pw.pingsCommitted() {
-				b.logger.Warnf("preempt-replay: tier=%s model=%s attempt=%d suppressed - keepalive pings already committed the response",
+			// GUARD on the pinger/replay interaction. Replaying is safe while
+			// the client has read nothing but a status line, SSE comments and
+			// ping events: pingWriter never commits a second status line, so
+			// the next attempt's headers are absorbed and its body is the only
+			// content the client ever reads (the same shape as a request that
+			// was pinged while parked and then served). It is NOT safe once
+			// upstream content reached the client - a replay would hand it a
+			// second message on a stream it is already reading. End that
+			// stream the way a committed stream must be ended - as an SSE
+			// error event (pingWriter.WriteHeader maps it) - instead.
+			if pw != nil && !pw.preFirstToken() {
+				b.logger.Warnf("preempt-replay: tier=%s model=%s attempt=%d suppressed - upstream content already reached the client",
 					data.Tier.Name, data.ModelID, attempt)
 				w.WriteHeader(http.StatusServiceUnavailable)
 				return
