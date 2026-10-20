@@ -1,6 +1,7 @@
 package scheduler
 
 import (
+	"context"
 	"fmt"
 	"sort"
 	"strconv"
@@ -126,6 +127,15 @@ type FIFO struct {
 	// releaseKV.
 	kvLargeInFlight map[string]int
 
+	// kvLargeOrder / kvLargeByID are grant-ordered bookkeeping for model's
+	// currently-granted large requests (context -> HandlerReq): kvWaitingSession
+	// names the FIRST one - the turn a parked large request waits behind.
+	// The context is the request's identity: OnServeDone echoes it back as
+	// ServeDoneEvent.Ctx so releaseKV drops exactly this grant. Maintained
+	// alongside kvLargeInFlight in grantHandler / releaseKV.
+	kvLargeOrder map[string][]context.Context
+	kvLargeByID  map[string]map[context.Context]*HandlerReq
+
 	// kvResidents is the KV warm hold's view of whose prompt sits in each
 	// model's pool (model -> session lane -> residency); see kvwarm.go.
 	kvResidents map[string]map[string]*kvResident
@@ -243,6 +253,8 @@ func NewFIFO(name string, logger *logmon.Monitor, planner Swapper, cfg config.Fi
 		granted:         make(map[string][]*grantedReq),
 		kvInFlight:      make(map[string]int),
 		kvLargeInFlight: make(map[string]int),
+		kvLargeOrder:    make(map[string][]context.Context),
+		kvLargeByID:     make(map[string]map[context.Context]*HandlerReq),
 		kvResidents:     make(map[string]map[string]*kvResident),
 		maxLarge:        maxLarge,
 		slotCount:       slotCount,
@@ -401,6 +413,7 @@ func (s *FIFO) OnRequest(req HandlerReq) {
 			s.logKVParked(req.Model, req.EstimatedTokens)
 			markKVParked(req)
 			markParked(&req, ParkKV)
+			markWaitingFor(&req, s.kvWaitingSession(req.Model), "")
 			s.enqueue(req)
 			return
 		}
@@ -412,6 +425,7 @@ func (s *FIFO) OnRequest(req HandlerReq) {
 			s.logKVWarmHold(req, r)
 			markKVParked(req)
 			markParked(&req, ParkKVWarm)
+			markWaitingFor(&req, r.session, r.warmUntil.Format(time.RFC3339))
 			s.enqueue(req)
 			return
 		}
@@ -455,6 +469,8 @@ func (s *FIFO) OnRequest(req HandlerReq) {
 	if s.deferredByGrace(req, evict) {
 		s.logger.Debugf("%s: queuing request for model %s (evictee still within swap-grace)", s.name, req.Model)
 		markParked(&req, ParkCooldown)
+		until := s.graceUntil(evict)
+		markWaitingFor(&req, "", until.Format(time.RFC3339))
 		s.enqueue(req)
 		return
 	}
@@ -636,7 +652,7 @@ func (s *FIFO) OnServeDone(ev ServeDoneEvent) {
 		}
 	}
 
-	kvReleased := s.releaseKV(ev.ModelID, ev.EstimatedTokens)
+	kvReleased := s.releaseKV(ev.ModelID, ev.EstimatedTokens, ev.Ctx)
 	// Before the drain below: the prompt this request leaves resident is what
 	// that drain must not purge (kvwarm.go).
 	s.kvWarmOnDone(ev)
@@ -1050,6 +1066,13 @@ func (s *FIFO) grantHandler(req HandlerReq, modelID string) {
 			// is > 0, even when the summed-token pool check would still fit.
 			if req.EstimatedTokens >= largePrefillThreshold {
 				s.kvLargeInFlight[modelID]++
+				// Grant-order bookkeeping: kvWaitingSession names the FIRST
+				// large turn a parked request waits behind.
+				s.kvLargeOrder[modelID] = append(s.kvLargeOrder[modelID], req.Ctx)
+				if s.kvLargeByID[modelID] == nil {
+					s.kvLargeByID[modelID] = map[context.Context]*HandlerReq{}
+				}
+				s.kvLargeByID[modelID][req.Ctx] = &req
 			}
 		}
 		s.kvWarmOnGrant(req, modelID)
@@ -1246,6 +1269,41 @@ func (s *FIFO) kvAdmit(model string, estimate int) bool {
 	return inflight+estimate <= pool
 }
 
+// kvWaitingSession names the session whose in-flight large turn a KV hold
+// waits behind (the "after [id] (<model>: 1 at a time)" data): the first
+// LARGE request granted on model, by grant order. Empty when nothing large is
+// in flight - then the hold is on summed pool tokens and names no session.
+func (s *FIFO) kvWaitingSession(model string) string {
+	for _, ctx := range s.kvLargeOrder[model] {
+		if r, ok := s.kvLargeByID[model][ctx]; ok && r != nil {
+			return r.Session
+		}
+	}
+	return ""
+}
+
+// graceUntil returns the latest swap-grace end across evict's models still
+// inside theirs (idleSince + grace) - the "after resident cools down · m:ss"
+// clock for a model-cooldown hold. Zero when withinGrace would not defer.
+func (s *FIFO) graceUntil(evict []string) time.Time {
+	now := s.now()
+	var until time.Time
+	for _, m := range evict {
+		g := s.grace[m]
+		if g <= 0 {
+			continue
+		}
+		since, ok := s.idleSince[m]
+		if !ok || now.Sub(since) >= g {
+			continue
+		}
+		if end := since.Add(g); end.After(until) {
+			until = end
+		}
+	}
+	return until
+}
+
 // maxLargeFor returns model's maxParallelLargePrefill: the configured value,
 // or the config default for a model the scheduler has no config for. 0 means
 // no separate cap (concurrencyLimit and the pool decide alone).
@@ -1256,21 +1314,46 @@ func (s *FIFO) maxLargeFor(model string) int {
 	return config.MODEL_CONFIG_DEFAULT_MAX_PARALLEL_LARGE_PREFILL
 }
 
-// markKVParked stamps kv_parked=1 onto req's LIVE in-flight entry, so a
-// renderer reading the /api/events snapshot can tell a request that is merely
-// waiting on KV admission from one that is stalled: a parked request produces
-// no bytes, which every byte heuristic reads as FLAT. Cleared at the grant
-// (internal/router/base.go, alongside slot_granted). Silently a no-op for a
-// request that never passed through the inflight middleware - see
-// swaputil.InflightMetadataSetterFromContext.
+// markWaitingFor stamps the WHO/HOW LONG behind req's current park reason as
+// `waiting_for_session` / `waiting_for_until` on its live in-flight entry -
+// the same path park_reason takes (llama-cm docs/intent/cooldown.md "What the
+// user sees": every wait says what it waits for, who and for how long). Both
+// values are "" when the hold names no session or has no clock; an empty
+// value deletes the key (inflightTracker.SetMetadata), so a re-park with less
+// data never leaves a stale half. Called at the same places markParked stamps
+// the reason, and only on change like markParked does: every stamp is an SSE
+// upsert and drainQueue revisits every queued request once a second.
+func markWaitingFor(req *HandlerReq, session, until string) {
+	if req.waitingForSession == session && req.waitingForUntil == until {
+		return
+	}
+	req.waitingForSession = session
+	req.waitingForUntil = until
+	if req.Ctx == nil {
+		return
+	}
+	if setter, ok := swaputil.InflightMetadataSetterFromContext(req.Ctx); ok {
+		setter("waiting_for_session", session)
+		setter("waiting_for_until", until)
+	}
+}
+
 // markParked stamps reason as `park_reason` on req's live in-flight entry,
 // only when it differs from what was last stamped (see HandlerReq.parkReason).
-// Silently a no-op for a request without an inflight setter in its context.
+// A CLEAR (reason "") also clears the waitingFor pair: a granted or released
+// request waits for nothing. Silently a no-op for a request without an
+// inflight setter in its context.
 func markParked(req *HandlerReq, reason string) {
 	if req.parkReason == reason {
 		return
 	}
 	req.parkReason = reason
+	// WHY no early return on a clear: the park_reason key itself must still be
+	// deleted below (an empty value deletes it); returning here left a granted
+	// request showing its last reason.
+	if reason == "" {
+		markWaitingFor(req, "", "")
+	}
 	if req.Ctx == nil {
 		return
 	}
@@ -1285,6 +1368,13 @@ func clearParked(req *HandlerReq) {
 	markParked(req, "")
 }
 
+// markKVParked stamps kv_parked=1 onto req's LIVE in-flight entry, so a
+// renderer reading the /api/events snapshot can tell a request that is merely
+// waiting on KV admission from one that is stalled: a parked request produces
+// no bytes, which every byte heuristic reads as FLAT. Cleared at the grant
+// (internal/router/base.go, alongside slot_granted). Silently a no-op for a
+// request that never passed through the inflight middleware - see
+// swaputil.InflightMetadataSetterFromContext.
 func markKVParked(req HandlerReq) {
 	if req.Ctx == nil {
 		return
@@ -1299,7 +1389,7 @@ func markKVParked(req HandlerReq) {
 // parked request might now fit). A no-op for requests KV admission was never
 // tracking (estimate <= 0, or nothing currently reserved for the model — e.g.
 // admission is disabled for it).
-func (s *FIFO) releaseKV(model string, estimate int) bool {
+func (s *FIFO) releaseKV(model string, estimate int, ctx context.Context) bool {
 	if estimate <= 0 || s.kvInFlight[model] <= 0 {
 		return false
 	}
@@ -1312,6 +1402,20 @@ func (s *FIFO) releaseKV(model string, estimate int) bool {
 	if estimate >= largePrefillThreshold && s.kvLargeInFlight[model] > 0 {
 		s.kvLargeInFlight[model]--
 	}
+	// Drop this request from the large-turn bookkeeping: a parked request
+	// must wait behind a turn that is STILL in flight, not one already done.
+	if ids := s.kvLargeOrder[model]; ids != nil {
+		for i, kept := range ids {
+			if kept == ctx {
+				s.kvLargeOrder[model] = append(ids[:i], ids[i+1:]...)
+				break
+			}
+		}
+	}
+	if m := s.kvLargeByID[model]; m != nil {
+		delete(m, ctx)
+	}
+
 	s.logger.Infof("kv-admission: released %s est=%d inflight=%d pool=%d",
 		model, estimate, s.kvInFlight[model], s.cfg.KVPoolTokens[model])
 	return true
@@ -1472,6 +1576,7 @@ func (s *FIFO) drainQueue() {
 				}
 				markKVParked(req)
 				markParked(&req, ParkKV)
+				markWaitingFor(&req, s.kvWaitingSession(req.Model), "")
 				stick(req)
 				continue
 			}
@@ -1479,6 +1584,7 @@ func (s *FIFO) drainQueue() {
 				s.logKVWarmHold(req, r)
 				markKVParked(req)
 				markParked(&req, ParkKVWarm)
+				markWaitingFor(&req, r.session, r.warmUntil.Format(time.RFC3339))
 				stick(req)
 				continue
 			}
@@ -1501,6 +1607,8 @@ func (s *FIFO) drainQueue() {
 		}
 		if s.deferredByGrace(req, evict) {
 			markParked(&req, ParkCooldown)
+			until := s.graceUntil(evict)
+			markWaitingFor(&req, "", until.Format(time.RFC3339))
 			stick(req)
 			continue
 		}

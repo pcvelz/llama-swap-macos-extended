@@ -508,6 +508,39 @@ func (s *Server) handleAPISessionsUnpenalize(w http.ResponseWriter, r *http.Requ
 	json.NewEncoder(w).Encode(map[string]string{"msg": "session unpenalized", "sessionId": sessionID})
 }
 
+// handleAPISessionsSlotCooldown sets one session's slot cooldown on demand:
+// body {"enabled":false} ends it now (the per-session sibling of the menu's
+// swap-grace finish - the request-level equivalent is the X-Slot-Cooldown: off
+// header, which llama-cm's agentic.sh sends for dispatched child sessions).
+// The full session id is required, as in handleAPISessionsUnpenalize: the
+// 8-char short form is a rendering convenience, not an identifier.
+//
+// Always reports success, for the same reason those handlers do: disabling a
+// session that is not cooling is a no-op, and a stricter error path would only
+// add a race for the caller to lose. enabled:true is accepted as a no-op -
+// there is nothing extra to grant (a session without the header already
+// cools).
+func (s *Server) handleAPISessionsSlotCooldown(w http.ResponseWriter, r *http.Request) {
+	sessionID := r.PathValue("sessionId")
+	var body struct {
+		Enabled bool `json:"enabled"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil && err.Error() != "EOF" {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "expected JSON body {\"enabled\":bool}"})
+		return
+	}
+	s.local.SetSlotCooldown(sessionID, body.Enabled)
+	source := r.Header.Get("X-Action-Source")
+	if source == "" {
+		source = "API"
+	}
+	s.proxylog.Infof("slot-cooldown: session %s disabled via %s", shortOf(sessionID), source)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"msg": "slot cooldown set", "sessionId": sessionID})
+}
+
 func parseActivityLimit(raw string) (int, error) {
 	limit, err := strconv.Atoi(raw)
 	if err != nil {

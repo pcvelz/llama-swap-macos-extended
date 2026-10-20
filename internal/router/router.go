@@ -103,4 +103,13 @@ type LocalRouter interface {
 	// model has no slot-grace configured or the session is not warm. Safe to
 	// call from any goroutine.
 	SlotWarmUntil() map[string]string
+
+	// SetSlotCooldown enables (enabled) or ends (disabled) one session's slot
+	// cooldown on demand (POST /api/sessions/{id}/slot-cooldown). Disabling
+	// makes its slot takeable at once - the same per-session effect as the
+	// request's X-Slot-Cooldown: off header, for sessions that cannot send
+	// headers themselves. A no-op when the scheduler does not support it or
+	// the session is not cooling (enabled) / not resident (disabled). Safe to
+	// call from any goroutine.
+	SetSlotCooldown(session string, enabled bool)
 }

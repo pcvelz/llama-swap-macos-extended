@@ -260,6 +260,17 @@ func (s *FIFO) kvWarmOnDone(ev ServeDoneEvent) {
 	if r.busy > 0 {
 		return
 	}
+	// WHY: X-Slot-Cooldown: off (user ruling 2026-10-19/20 - a subagent
+	// dispatch gets no slot cooldown; llama-cm's agentic.sh sends the header).
+	// The session's slot does not cool after this request, so a waiting
+	// request may take it at once. The residency stays as displaceable KV:
+	// kvWarmDisplace drops it when a grant no longer fits beside it. Witnessed
+	// without this (llama-swap.log 2026-10-20 06:48:05): a dispatch running its
+	// own tools between turns kept its slot cooling while the GPU sat idle and
+	// 7 dispatches plus 2 interactive sessions waited.
+	if ev.SlotCooldownOff {
+		return
+	}
 	now := s.now()
 	r.tokens = ev.EstimatedTokens
 	r.lastEnd = now
@@ -269,6 +280,18 @@ func (s *FIFO) kvWarmOnDone(ev ServeDoneEvent) {
 	// cooldown runs down from the last productive completion.
 	if !ev.Looping {
 		r.warmUntil = now.Add(g)
+	}
+}
+
+// EndSlotCooldown implements SlotCooldownControl: it ends ONE session's slot
+// cooldown now (POST /api/sessions/{id}/slot-cooldown, the per-session sibling
+// of FinishCooldown). The residency stays as displaceable KV - only its cooling
+// protection goes. A no-op when the session is not resident or not cooling.
+func (s *FIFO) EndSlotCooldown(session string) {
+	for _, rs := range s.kvResidents {
+		if r, ok := rs[session]; ok && kvWarmCooling(r, s.now()) {
+			r.warmUntil = time.Time{}
+		}
 	}
 }
 

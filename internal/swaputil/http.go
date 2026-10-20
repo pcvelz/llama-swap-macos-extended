@@ -718,6 +718,24 @@ func CallerPurposeFromHeader(r *http.Request) string {
 	return v
 }
 
+// slotCooldownHeader opts a request's session OUT of the slot cooldown
+// (router/scheduler/kvwarm.go): with `X-Slot-Cooldown: off` on its requests,
+// the session's slot does not cool after each request and a waiting request
+// may take it at once. Generic per-session switch - the fork knows nothing
+// about who sends it or why; llama-cm's agentic.sh turns it off for its
+// dispatched child sessions (user ruling 2026-10-19/20: a subagent dispatch
+// gets no slot cooldown). Any other value, or an absent header, keeps today's
+// behaviour exactly.
+const slotCooldownHeader = "X-Slot-Cooldown"
+
+// SlotCooldownOffFromHeader reports whether r carries slotCooldownHeader with
+// the off value (case-insensitive, surrounding whitespace ignored). The
+// scheduler reads it once at arrival and stamps it on the request's lane for
+// the whole session; see kvwarm.go.
+func SlotCooldownOffFromHeader(r *http.Request) bool {
+	return strings.EqualFold(strings.TrimSpace(r.Header.Get(slotCooldownHeader)), "off")
+}
+
 // Client families reported in the `client` metadata key. The set is closed so
 // a renderer can switch on it instead of displaying a raw user-agent string,
 // which is what a session-less queue row used to surface.

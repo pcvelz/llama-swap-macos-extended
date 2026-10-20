@@ -511,7 +511,7 @@ func (b *baseRouter) GrantError(req scheduler.HandlerReq, err error) {
 // the router would never again be willing to evict this model.
 func (b *baseRouter) GrantServe(req scheduler.HandlerReq, modelID string) bool {
 	p := b.processes[modelID]
-	return b.grant(req, scheduler.HandlerResp{HandleFunc: b.trackedServe(modelID, p, req.EstimatedTokens, req.Session, req.Tier, req.StatusRead, req.Preempted, req.ReplayWanted)})
+	return b.grant(req, scheduler.HandlerResp{HandleFunc: b.trackedServe(modelID, p, req.EstimatedTokens, req.Session, req.Tier, req.StatusRead, req.SlotCooldownOff, req.Preempted, req.ReplayWanted)})
 }
 
 // StopProcesses implements scheduler.Effects, stopping the named processes in
@@ -555,7 +555,7 @@ func (b *baseRouter) StopProcesses(timeout time.Duration, ids []string) {
 // whatever the upstream reverse proxy would otherwise write. replayWanted,
 // when non-nil, is the same flag scheduler.HandlerReq.ReplayWanted carries —
 // see preemptResponseWriter's type doc for the v2 replay behavior it enables.
-func (b *baseRouter) trackedServe(modelID string, p process.Process, estimatedTokens int, session string, tier swaputil.Tier, statusRead bool, preempted *atomic.Bool, replayWanted *atomic.Bool) http.HandlerFunc {
+func (b *baseRouter) trackedServe(modelID string, p process.Process, estimatedTokens int, session string, tier swaputil.Tier, statusRead bool, slotCooldownOff bool, preempted *atomic.Bool, replayWanted *atomic.Bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// capReleased: the slot table declared this request a phantom and
 		// already gave its cap place back (see slotbind.go).
@@ -573,8 +573,8 @@ func (b *baseRouter) trackedServe(modelID string, p process.Process, estimatedTo
 			if verdict, ok := swaputil.LoopVerdictFromContext(r.Context()); ok && verdict != nil {
 				looping = verdict()
 			}
-			ev := scheduler.ServeDoneEvent{ModelID: modelID, EstimatedTokens: estimatedTokens, Session: session, Tier: tier, Cut: r.Context().Err() != nil, StatusRead: statusRead, Looping: looping,
-				Holder: preempted, CapReleased: capReleased.Load()}
+			ev := scheduler.ServeDoneEvent{ModelID: modelID, EstimatedTokens: estimatedTokens, Session: session, Tier: tier, Cut: r.Context().Err() != nil, StatusRead: statusRead, Looping: looping, SlotCooldownOff: slotCooldownOff,
+				Holder: preempted, CapReleased: capReleased.Load(), Ctx: r.Context()}
 			if orphan == nil {
 				b.sendServeDone(ev)
 				return
@@ -1074,6 +1074,12 @@ func (b *baseRouter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	// (whose grant writes data.Metadata concurrently - see sessionExemptID8
 	// below). Feeds the KV warm hold (scheduler/kvwarm.go).
 	session := laneKeyOf(data.Metadata)
+	// X-Slot-Cooldown: off opts this request's session out of the slot cooldown
+	// (kvwarm.go): its slot does not cool after the request, and a waiting
+	// request may take it at once. Read from the ARRIVAL request headers ONCE,
+	// like the lane above - the header is on the wire for every attempt, so
+	// replay attempts keep the same verdict without re-reading.
+	slotCooldownOff := swaputil.SlotCooldownOffFromHeader(req)
 
 	for {
 		attempt := replayCount + 1
@@ -1233,6 +1239,8 @@ func (b *baseRouter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 			// estimation rule.
 			EstimatedTokens: estimatedTokens,
 			Session:         session,
+			// X-Slot-Cooldown: off (read once from the arrival headers above).
+			SlotCooldownOff: slotCooldownOff,
 			// Tier is DefaultTier for every request on the main listener / when no
 			// `tiers:` block is configured (see swaputil.Tier).
 			Tier:         data.Tier,
@@ -1552,4 +1560,18 @@ func (b *baseRouter) SlotWarmUntil() map[string]string {
 		return r.SlotWarmUntil()
 	}
 	return nil
+}
+
+// SetSlotCooldown implements LocalRouter: one session's slot cooldown on demand
+// (POST /api/sessions/{id}/slot-cooldown). Disabling ends the cooldown now;
+// enabling is a no-op today - a request without X-Slot-Cooldown: off already
+// cools, and there is no other way for a session to have opted out. No-op when
+// the configured scheduler does not support it.
+func (b *baseRouter) SetSlotCooldown(session string, enabled bool) {
+	if enabled {
+		return
+	}
+	if r, ok := b.schedule.(scheduler.SlotCooldownControl); ok {
+		r.EndSlotCooldown(session)
+	}
 }

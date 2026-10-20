@@ -145,6 +145,21 @@ type sessionEntry struct {
 	// is then unchanged): the strike is real state an operator must be able
 	// to see before it escalates.
 	Penalty *sessionPenalty `json:"penalty,omitempty"`
+	// WaitingFor names WHO and HOW LONG a PARKED row waits for - the session
+	// id it waits behind ("" when there is none, e.g. a model cooldown) and
+	// the RFC3339 moment the hold ends ("" when it has no clock, e.g. a rank
+	// barrier). Set on EVERY parked row, empty-when-unstamped: the renderer
+	// must be able to tell "no data" from "field predates" (llama-cm
+	// docs/intent/cooldown.md "What the user sees"). Nil on non-parked rows.
+	WaitingFor *waitingFor `json:"waitingFor,omitempty"`
+}
+
+// waitingFor is the WHO/HOW LONG behind a parked request's reason - stamped
+// by the scheduler next to park_reason (fifo.go markWaitingFor) and copied
+// onto the row here, never derived client-side.
+type waitingFor struct {
+	Session string `json:"session"`
+	Until   string `json:"until"`
 }
 
 // sessionPenalty is the published penalty. RemainingSeconds is a POINTER so
@@ -679,6 +694,9 @@ func (b *sessionsBuilder) requestRow(in sessionsInput, r swaputil.InflightReques
 		if reason != "" {
 			row.ParkReason = strPtr(reason)
 		}
+		// Every parked row carries waitingFor, empty when the scheduler
+		// stamped nothing: the renderer tells "no data" from "field predates".
+		row.WaitingFor = &waitingFor{Session: m["waiting_for_session"], Until: m["waiting_for_until"]}
 		return row
 	}
 	if in.Running[r.Model] != process.StateReady {

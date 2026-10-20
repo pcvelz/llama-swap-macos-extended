@@ -616,6 +616,7 @@ func (s *Server) routes() {
 	mux.Handle("GET /api/slots", apiChain.ThenFunc(s.handleAPISlots))
 	mux.Handle("GET /api/sessions", apiChain.ThenFunc(s.handleAPISessions))
 	mux.Handle("POST /api/sessions/{sessionId}/unpenalize", apiChain.ThenFunc(s.handleAPISessionsUnpenalize))
+	mux.Handle("POST /api/sessions/{sessionId}/slot-cooldown", apiChain.ThenFunc(s.handleAPISessionsSlotCooldown))
 	mux.Handle("GET /api/debug/history", apiChain.ThenFunc(s.handleAPIDebugHistory))
 	mux.Handle("GET /api/state-trace", apiChain.ThenFunc(s.handleAPIStateTrace))
 

@@ -176,6 +176,15 @@ type HandlerReq struct {
 	// baseRouter.ServeHTTP; false for every ordinary inference request.
 	ConcurrencyExempt bool
 
+	// SlotCooldownOff marks a request whose session opted out of the slot
+	// cooldown (kvwarm.go) via the X-Slot-Cooldown: off header: its slot does
+	// not cool after the request ends, and a waiting request may take it at
+	// once. Generic per-session switch - the fork knows nothing about who or
+	// why sends it; llama-cm's agentic.sh turns it off for its dispatched
+	// child sessions (user ruling 2026-10-19/20: a subagent dispatch gets no
+	// slot cooldown). false for every request without the header.
+	SlotCooldownOff bool
+
 	// StatusRead marks a GET/HEAD status read (/slots, /props, /metrics,
 	// /health under /upstream/<model>/). Such a read is answered only by a
 	// model that is ready or already loading; it is never allowed to queue
@@ -199,6 +208,16 @@ type HandlerReq struct {
 	// stamp is an SSE upsert, and drainQueue revisits every queued request
 	// once a second.
 	parkReason string
+
+	// waitingForSession / waitingForUntil are the WHO and HOW LONG behind a
+	// park reason (llama-cm docs/intent/cooldown.md "What the user sees"):
+	// the session id this hold waits on ("", e.g. a model cooldown, when there
+	// is none) and the RFC3339 moment it ends ("", e.g. a rank barrier, when
+	// there is no clock). Stamped next to park_reason by markWaitingFor and
+	// read by the sessions API as `waitingFor: {session, until}`; cleared with
+	// the reason at grant (clearParked -> markParked("")).
+	waitingForSession string
+	waitingForUntil   string
 
 	// Preempted, when non-nil, is set to true by Preempt just before it
 	// cancels this request's serving context. Only populated on requests
@@ -277,6 +296,11 @@ type ServeDoneEvent struct {
 	// at grant time, echoed back so the scheduler can release exactly what it
 	// reserved. 0 when KV admission wasn't in play for this request.
 	EstimatedTokens int
+	// Ctx echoes the originating request's context, so the scheduler can drop
+	// exactly this grant from its per-request bookkeeping (the kv-large
+	// turn order in fifo.go releaseKV). Nil for events that carry no request
+	// context (bare test harnesses) - releaseKV then drops nothing.
+	Ctx context.Context
 	// Session echoes HandlerReq.Session: the KV warm hold (kvwarm.go) marks
 	// this session's prompt resident when its large request completes.
 	Session string
@@ -288,6 +312,10 @@ type ServeDoneEvent struct {
 	// cancelled, not because the turn completed. Its partial prefill stays
 	// resident for the retry; the KV warm hold does not count it as a turn.
 	Cut bool
+	// SlotCooldownOff echoes HandlerReq.SlotCooldownOff (the X-Slot-Cooldown:
+	// off header): kvWarmOnDone must not start or restart this session's slot
+	// cooldown on this completion. false for every request without the header.
+	SlotCooldownOff bool
 	// Holder identifies WHICH granted request this event is about: the same
 	// pointer as that request's HandlerReq.Preempted. The scheduler drops
 	// exactly that request's preemption entry, so a finished request never

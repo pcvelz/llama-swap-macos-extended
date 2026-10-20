@@ -54,6 +54,25 @@ func (r *slotGraceRig) coldReq(session string, tokens int) {
 	})
 }
 
+func (r *slotGraceRig) coldReqNoCooldown(session string, tokens int) {
+	r.s.OnRequest(HandlerReq{
+		Model:           "m",
+		Session:         session,
+		EstimatedTokens: tokens,
+		Tier:            swaputil.DefaultTier,
+		SlotCooldownOff: true, // X-Slot-Cooldown: off
+	})
+}
+
+func (r *slotGraceRig) warmDoneNoCooldown(session string, tokens int) {
+	r.s.OnServeDone(ServeDoneEvent{
+		ModelID:         "m",
+		Session:         session,
+		EstimatedTokens: tokens,
+		SlotCooldownOff: true, // X-Slot-Cooldown: off
+	})
+}
+
 func (r *slotGraceRig) warmDone(session string, tokens int) {
 	r.s.OnServeDone(ServeDoneEvent{
 		ModelID:         "m",
@@ -222,6 +241,59 @@ func TestSlotGrace_WarmSessionNotBlockedByItself(t *testing.T) {
 	r.advance(5 * time.Second)
 	r.coldReq("B", 10000)
 	r.wantQueuedCount(1, "B parked: A's cooldown not yet over")
+}
+
+// --- Test: X-Slot-Cooldown: off - the slot does not cool, B is granted at once ---
+//
+// WHY (llama-swap.log 2026-10-20 06:48:05): a dispatched subagent session that
+// runs tools between its turns kept its slot cooling for the full swap grace;
+// while it cooled, the GPU sat idle and 7 dispatches plus 2 interactive
+// sessions waited. User ruling 2026-10-19/20: a subagent dispatch gets NO slot
+// cooldown - the fork offers this generic per-session opt-out and llama-cm's
+// agentic.sh turns it off for its child session.
+
+func TestSlotGrace_SlotCooldownOff_GrantedAtOnce(t *testing.T) {
+	r := newSlotGraceRig(t, 60) // 60s cooldown
+
+	// Session A makes a large turn and finishes, carrying X-Slot-Cooldown: off.
+	r.coldReqNoCooldown("A", 10000)
+	r.wantServed(1, "A's first request")
+	r.warmDoneNoCooldown("A", 10000)
+
+	// Session B sends a request that overflows the pool beside A's slot (10s
+	// elapsed). A opted out of cooling, so it is not a blocker: B is granted at
+	// once and its grant displaces A's idle residency.
+	r.advance(10 * time.Second)
+	r.coldReq("B", 10000)
+	r.wantServed(2, "A sent X-Slot-Cooldown: off, so B must be granted at once")
+	r.wantQueuedCount(0, "nothing parked behind an opted-out session")
+	if _, ok := r.s.kvResidents["m"]["A"]; ok {
+		t.Fatal("A's residency must be displaced by B's grant (its slot does not cool)")
+	}
+}
+
+// --- Test: no header - unchanged behaviour, B is held ---
+
+func TestSlotGrace_NoHeader_HeldUnchanged(t *testing.T) {
+	r := newSlotGraceRig(t, 60) // 60s cooldown
+
+	// Session A makes a large turn and finishes WITHOUT the opt-out header.
+	r.coldReq("A", 10000)
+	r.wantServed(1, "A's first request")
+	r.warmDone("A", 10000)
+
+	// B overflows the pool beside A's cooling slot: held, exactly as before
+	// the opt-out existed.
+	r.advance(10 * time.Second)
+	r.coldReq("B", 10000)
+	r.wantServed(1, "B must park: granting it would displace A's cooling slot")
+	r.wantQueuedCount(1, "one request queued")
+	if r.s.queued[0].parkReason != ParkKVWarm {
+		t.Fatalf("park_reason=%q want %q", r.s.queued[0].parkReason, ParkKVWarm)
+	}
+	if _, ok := r.s.kvResidents["m"]["A"]; !ok {
+		t.Fatal("A's cooling slot must survive while B parks beside it")
+	}
 }
 
 // --- Test: the sessions API reads the unified cooling record ---

@@ -4,7 +4,7 @@ summary: Configure concurrencyLimit and globalConcurrencyLimit, and understand q
 category: guides
 tags: [routing, queue, capacity, concurrency, concurrency-limit, max-concurrent-requests, global-concurrency-limit, rate-limit]
 config_keys: [routing, models.*.concurrencyLimit, globalConcurrencyLimit]
-updated: 2026-09-10
+updated: 2026-10-20
 ---
 
 # Routing capacity and request queues
@@ -42,3 +42,24 @@ Use this to protect shared hardware (CPU, disk, network) from being
 overwhelmed by traffic spread across many different models, which a per-model
 `concurrencyLimit` cannot do since it only counts requests to one model at a
 time.
+
+## Per-session slot cooldown opt-out
+
+A session that finished a request keeps its serving slot COOLING for the
+model's `swapGraceSeconds`: another session's request is held while granting
+it would displace that cooling slot (pool tokens or slot count). A caller can
+opt its own session out per request with the header:
+
+```
+X-Slot-Cooldown: off
+```
+
+With the header, the session's slot does not cool after the request ends and a
+waiting request may take it at once; KV pool admission is unchanged (the slot
+stays displaceable KV). Without the header behaviour is exactly as before.
+This is a generic per-session switch - the proxy does not know who sends it or
+why; e.g. llama-cm sends it for dispatched subagent child sessions, which run
+tools between turns and would otherwise hold their slot cooling while the GPU
+sits idle. The same effect can be applied to an existing session via
+`POST /api/sessions/{sessionId}/slot-cooldown` with body `{"enabled":false}`
+(the full session id is required; `enabled:true` is a no-op).
