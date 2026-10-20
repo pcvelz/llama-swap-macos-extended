@@ -43,7 +43,13 @@ loaded, draining on their own at only ~0.2 GB/min. After a kill, the brake:
    `--model-draft`, plus all shards of a split GGUF) from the file cache. It
    logs `MEMORY BRAKE EVICT` with file-backed before and after;
 3. holds every local-model load until file-backed has stayed below
-   `drainBelowGB` for 60 s, re-evicting every 15 s until then.
+   `drainBelowGB` for 60 s, re-evicting every 15 s until then, and a quiet
+   window (`windowMinutes`) has passed with no rise of `growthGB` above the
+   post-eviction minimum. A purge drop does not hide a rise. A re-trip within
+   30 min of a release doubles the next quiet window (cap 60 min). The
+   `MEMORY-BRAKE-RELEASE` marker line ends with `quiet_s=` and `backoff=`.
+   A purge that never exits is reported as `MEMORY-BRAKE-PURGE-STUCK` in the
+   marker file; the purge start and result are marked too.
 
 A request that arrives during the hold is parked, not failed, and shows as
 loading. The macOS menu shows `Memory brake: loads held until file-backed <

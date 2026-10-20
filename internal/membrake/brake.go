@@ -40,7 +40,18 @@
 //     (msync MS_INVALIDATE, no root needed), logging file-backed before and
 //     after, and re-evicts every reEvictEvery while the gate stays shut;
 //  3. keeps admission HELD (Hold.Wait parks the next load, it does not fail
-//     it) until file-backed has stayed below drainBelowGB for drainSettle.
+//     it) until file-backed has stayed below drainBelowGB for drainSettle AND
+//     a quiet window has passed with no rise of growthGB above the minimum
+//     since the eviction (windowMinutes; a purge drop never hides a rise).
+//     A re-trip within 30 min of a release doubles the next quiet window
+//     (cap 60 min); it resets after 30 min without a trip. Incident
+//     2026-10-20: an external writer filled the cache after the kill, a purge
+//     dropped it, the level rule released into the live run-up, re-kill 96 s
+//     later.
+//
+// The purge valve never kills a hung purge (uninterruptible): it reports
+// MEMORY-BRAKE-PURGE-STUCK to the marker file and does not exec another.
+// START/RESULT/FAILED lines go to the marker from the purge goroutine.
 //
 // # Calibration (replay_test.go, the real observer ticks of 2026-09-18/19)
 //
@@ -102,7 +113,18 @@ const (
 	// password rule, but a permitted purge of a ~40 GB cache ran for more than
 	// 2 minutes on this box, so the bound only has to catch a truly hung run.
 	purgeTimeout = 10 * time.Minute
+	// quietBackoffReset is how long a release must survive without a new trip
+	// before the quiet-window backoff returns to level 0; a re-trip sooner
+	// than this doubles the window for the next hold.
+	quietBackoffReset = 30 * time.Minute
+	// maxQuietWindow caps the doubled quiet window.
+	maxQuietWindow = 60 * time.Minute
 )
+
+// errPurgeStillRunning is returned by the default purge func when a purge
+// process (e.g. from a previous llama-swap) is already alive; the purge
+// goroutine reports it as STUCK, not as a failure.
+var errPurgeStillRunning = fmt.Errorf("a purge is still running; not starting another")
 
 // Reading is one memory sample, in bytes. Only FileBacked is the signal;
 // Wired and SwapUsed are sampled for the marker's context.
@@ -120,7 +142,11 @@ type Sampler interface {
 }
 
 // ChildSource appends the live local children to dst and reports whether any
-// is still starting (loading). process.SnapshotLive in production.
+// is transitioning: starting (loading its model, which floods the file cache
+// on purpose) or stopping (un-wiring it, which reclassifies the same pages as
+// file cache with no new data read - witnessed 2026-10-19 16:06:39: cq35 stop,
+// file-backed 1.84 -> 25.72 GB in one second). Either way it is not a run-up.
+// process.SnapshotLive in production.
 type ChildSource func(dst []process.LiveChild) ([]process.LiveChild, bool)
 
 // Killer SIGKILLs one process group. killGroup in production.
@@ -276,9 +302,27 @@ type Brake struct {
 	// goroutine) and read/written by the purge goroutine it spawns, so both
 	// are atomic. purgeWG lets tests wait for an attempt to finish
 	// deterministically.
+	// purging clears ONLY when the purge func has actually returned: a hung
+	// purge (uninterruptible, as root under sudo) cannot be killed, so the
+	// timeout reports it instead of freeing the slot for a second exec.
 	purging          atomic.Bool
 	lastPurgeAttempt atomic.Int64 // unix nanos; reset to killedAt on every trip
+	purgeStartedAt   atomic.Int64 // unix nanos of the attempt now in flight
+	lastStuckReport  atomic.Int64 // unix nanos of the last PURGE-STUCK report
 	purgeWG          sync.WaitGroup
+
+	// Quiet-window state (per Brake, not per hold). A release that is followed
+	// by a re-trip within quietBackoffReset raises backoff by one; the quiet
+	// window is windowMinutes << backoff, capped at maxQuietWindow. Not
+	// persisted: a restart starts at level 0 (the hold-state file only keeps
+	// the kill time).
+	lastReleaseAt int64
+	backoff       int
+	// Post-eviction monotonic-min deque in a fixed ring (sized for
+	// maxQuietWindow at the sample interval): the rise since the eviction.
+	qT, qV []int64
+	qHead  int
+	qN     int
 
 	window     time.Duration
 	armAfter   time.Duration
@@ -314,6 +358,11 @@ type postKill struct {
 	lastEvict  int64
 	belowSince int64 // 0 = not below the drain level
 	lastLog    int64
+	// lastRiseAt is the last sample at which file-backed stood >= growthGB above
+	// the minimum since the eviction (within the quiet window); 0 = none yet.
+	// A purge drop never resets it.
+	lastRiseAt int64
+	evictedAt  int64
 }
 
 // New builds a brake. sampler/children/kill/hold may be nil to use the
@@ -350,6 +399,8 @@ func New(cfg config.MemoryBrakeConfig, sampler Sampler, children ChildSource, ki
 		kids:       make([]process.LiveChild, 0, 16),
 		dqT:        make([]int64, capacity),
 		dqV:        make([]int64, capacity),
+		qT:         make([]int64, int(maxQuietWindow/interval)+8),
+		qV:         make([]int64, int(maxQuietWindow/interval)+8),
 	}
 	b.loadHoldState()
 	return b
@@ -376,7 +427,7 @@ func purgeCommandWith(cmd []string, running func() bool) func() error {
 			return fmt.Errorf("memoryBrake.purgeCommand is empty")
 		}
 		if running() {
-			return fmt.Errorf("a purge is still running; not starting another")
+			return errPurgeStillRunning
 		}
 		c := exec.Command(cmd[0], cmd[1:]...)
 		out, err := c.CombinedOutput()
@@ -560,14 +611,28 @@ func (b *Brake) trip(now time.Time, r Reading, growth, windowMin int64, span tim
 	} else {
 		b.hold.Record(ev)
 	}
+	// Backoff: a trip soon after a release means the release was premature, so
+	// the next hold demands a longer quiet window; a release that survived
+	// quietBackoffReset starts over at level 0.
+	if b.lastReleaseAt != 0 {
+		if now.UnixNano()-b.lastReleaseAt < int64(quietBackoffReset) {
+			if b.window<<uint(b.backoff) < maxQuietWindow {
+				b.backoff++
+			}
+		} else {
+			b.backoff = 0
+		}
+	}
 	b.post = postKill{active: true, killedAt: now.UnixNano(), pgids: b.post.pgids[:0]}
+	b.qHead, b.qN = 0, 0
 	for _, c := range b.kids {
 		b.post.pgids = append(b.post.pgids, c.Pgid)
 	}
 	// A fresh trip resets the purge clock: the first attempt is eligible
-	// purgeAfterMinutes after THIS kill, not the last one.
-	b.purging.Store(false)
+	// purgeAfterMinutes after THIS kill, not the last one. `purging` is NOT
+	// cleared: a purge still in flight stays single-flight.
 	b.lastPurgeAttempt.Store(now.UnixNano())
+	b.lastStuckReport.Store(0)
 
 	line := fmt.Sprintf("%s MEMORY-BRAKE killed=%s signal=filebacked growth_gb=%.2f window_min_gb=%.2f filebacked_gb=%.2f window_span_s=%d window_min=%d threshold_gb=%.2f arm_after_min=%d confirm=%d wired_gb=%.2f swap_used_gb=%.2f drain_below_gb=%.2f",
 		now.Format("2006-01-02 15:04:05"), strings.Join(killed, ","), ev.GrowthGB, ev.WindowMinGB, ev.FileGB, ev.WindowSpanS,
@@ -595,19 +660,30 @@ func (b *Brake) drain(now time.Time, r Reading) {
 		}
 		b.evictAll(now, r, true)
 		p.evicted, p.lastEvict, p.lastLog = true, ts, ts
+		p.evictedAt = ts
+		b.trackRise(ts, r.metric())
 		return
 	}
-	// The ONLY release condition: file-backed below the drain level for the
-	// settle time. Nothing else may open the gate - a path that opened once
-	// the killed model's own file had left the cache reloaded into 32 GB of
+	b.trackRise(ts, r.metric())
+	// Release needs BOTH: file-backed below the drain level for the settle
+	// time AND a quiet window with no rise of growthGB above the post-eviction
+	// minimum. Nothing else may open the gate - a path that opened once the
+	// killed model's own file had left the cache reloaded into 32 GB of
 	// file-backed memory and the machine died (watchdog panic, 2026-09-27).
+	// The level alone is not enough (2026-10-20): an external writer filled the
+	// cache 7.8 -> 33 GB after the kill, a purge at 14:17 dropped it to 7.6 GB,
+	// the level rule released at 14:19:19 into the still-active run-up and the
+	// reload was killed again at 14:20:55. A purge drop must not hide the rise,
+	// so lastRiseAt is never cleared by a fall.
 	if r.metric() < b.drainBelow || b.drainBelow == 0 {
 		if p.belowSince == 0 {
 			p.belowSince = ts
 		}
-		if ts-p.belowSince >= int64(drainSettle) || b.drainBelow == 0 {
+		if b.drainBelow == 0 || (ts-p.belowSince >= int64(drainSettle) && b.quietSatisfied(ts)) {
 			b.releaseAfterDrain(now, r)
+			return
 		}
+		b.holdLog(now, r)
 		return
 	}
 	p.belowSince = 0
@@ -616,13 +692,67 @@ func (b *Brake) drain(now time.Time, r Reading) {
 		p.lastEvict = ts
 	}
 	b.maybePurge(now, r)
-	if ts-p.lastLog >= int64(holdLogEvery) {
-		p.lastLog = ts
-		if b.log != nil {
-			b.log.Warnf("MEMORY BRAKE HOLD: local-model loads still parked %s after the kill: file-backed %.2f GB, drain level %.2f GB",
-				time.Duration(ts-p.killedAt).Round(time.Second), float64(r.FileBacked)/gib, b.cfg.DrainBelowGB)
-		}
+	b.holdLog(now, r)
+}
+
+// quietWindow is the rise-free time a release requires: windowMinutes doubled
+// per backoff level, capped at maxQuietWindow.
+func (b *Brake) quietWindow() time.Duration {
+	w := b.window << uint(b.backoff)
+	if w > maxQuietWindow || w <= 0 {
+		w = maxQuietWindow
 	}
+	return w
+}
+
+// quietSatisfied reports whether no rise has been seen for a full quiet window.
+func (b *Brake) quietSatisfied(ts int64) bool {
+	return b.post.lastRiseAt == 0 || ts-b.post.lastRiseAt >= int64(b.quietWindow())
+}
+
+// trackRise feeds one post-eviction sample to the monotonic-min deque (fixed
+// ring, no allocation) and stamps lastRiseAt when file-backed stands >=
+// growthGB above the minimum of the trailing quiet window.
+func (b *Brake) trackRise(ts, v int64) {
+	c := len(b.qT)
+	for b.qN > 0 && b.qV[(b.qHead+b.qN-1)%c] >= v {
+		b.qN--
+	}
+	if b.qN == c {
+		b.qHead = (b.qHead + 1) % c
+		b.qN--
+	}
+	i := (b.qHead + b.qN) % c
+	b.qT[i], b.qV[i] = ts, v
+	b.qN++
+	win := int64(b.quietWindow())
+	for b.qN > 1 && ts-b.qT[b.qHead] > win {
+		b.qHead = (b.qHead + 1) % c
+		b.qN--
+	}
+	if v-b.qV[b.qHead] >= b.threshold {
+		b.post.lastRiseAt = ts
+	}
+}
+
+// holdLog says every holdLogEvery that the gate is still shut and why.
+func (b *Brake) holdLog(now time.Time, r Reading) {
+	p := &b.post
+	ts := now.UnixNano()
+	if ts-p.lastLog < int64(holdLogEvery) {
+		return
+	}
+	p.lastLog = ts
+	if b.log == nil {
+		return
+	}
+	quiet := b.quietWindow()
+	if p.lastRiseAt != 0 {
+		quiet = time.Duration(ts - p.lastRiseAt)
+	}
+	b.log.Warnf("MEMORY BRAKE HOLD: local-model loads still parked %s after the kill: file-backed %.2f GB, drain level %.2f GB, quiet %s of %s needed",
+		time.Duration(ts-p.killedAt).Round(time.Second), float64(r.FileBacked)/gib, b.cfg.DrainBelowGB,
+		quiet.Round(time.Second), b.quietWindow())
 }
 
 // maybePurge starts one purge attempt when the valve is armed
@@ -631,41 +761,77 @@ func (b *Brake) drain(now time.Time, r Reading) {
 // already in flight (single-flight). Purging never opens the gate itself -
 // only the ordinary drain rule in drain() does.
 func (b *Brake) maybePurge(now time.Time, r Reading) {
-	if b.cfg.PurgeAfterMinutes <= 0 || b.purging.Load() {
+	if b.cfg.PurgeAfterMinutes <= 0 {
 		return
 	}
 	interval := int64(time.Duration(b.cfg.PurgeAfterMinutes) * time.Minute)
 	ts := now.UnixNano()
-	if ts-b.lastPurgeAttempt.Load() < interval {
+	last := b.lastPurgeAttempt.Load()
+	if rep := b.lastStuckReport.Load(); rep > last {
+		last = rep
+	}
+	if ts-last < interval {
+		return
+	}
+	// An earlier attempt is still in flight as the next one falls due: report
+	// it (once per interval) instead of silently skipping.
+	if b.purging.Load() {
+		running := int((ts - b.purgeStartedAt.Load()) / int64(time.Second))
+		b.reportStuck(now, running, float64(r.FileBacked)/gib)
 		return
 	}
 	b.startPurge(now, r)
 }
 
-// startPurge runs one attempt off the sampling goroutine, bounded to
-// purgeTimeout so a purge that hangs (e.g. sudo -n blocked on a password
-// prompt it cannot answer) cannot stall sampling.
+// reportStuck records a purge that has not returned. It never kills it: a
+// purge in uninterruptible sleep cannot be killed. The marker survives a crash
+// that loses the main log (2026-10-20). runningS is -1 when unknown (a purge
+// left by a previous llama-swap process, seen via pgrep).
+func (b *Brake) reportStuck(now time.Time, runningS int, fileGB float64) {
+	b.lastStuckReport.Store(now.UnixNano())
+	if b.log != nil {
+		b.log.Warnf("MEMORY BRAKE PURGE STUCK: a purge has been running for %ds (-1 = unknown) and has not exited; not starting another (file-backed %.2f GB). It cannot be killed from here.",
+			runningS, fileGB)
+	}
+	b.mark(fmt.Sprintf("%s MEMORY-BRAKE-PURGE-STUCK running_s=%d filebacked_gb=%.2f",
+		now.Format("2006-01-02 15:04:05"), runningS, fileGB))
+}
+
+// startPurge runs one attempt off the sampling goroutine. `purging` clears only
+// when the purge func has returned; after purgeTimeout the attempt is reported
+// STUCK but not abandoned (never killed, and a second exec would pile up).
+// START/RESULT/FAILED marker lines are written (and fsynced) from this
+// goroutine, never from the sampling one.
 func (b *Brake) startPurge(now time.Time, r Reading) {
 	b.purging.Store(true)
 	b.lastPurgeAttempt.Store(now.UnixNano())
+	b.purgeStartedAt.Store(now.UnixNano())
 	before := float64(r.FileBacked) / gib
 	b.purgeWG.Add(1)
 	go func() {
 		defer b.purgeWG.Done()
 		defer b.purging.Store(false)
 
+		b.mark(fmt.Sprintf("%s MEMORY-BRAKE-PURGE-START filebacked_gb=%.2f", now.Format("2006-01-02 15:04:05"), before))
 		done := make(chan error, 1)
 		go func() { done <- b.purge() }()
 		var err error
 		select {
 		case err = <-done:
 		case <-time.After(purgeTimeout):
-			err = fmt.Errorf("timed out after %s", purgeTimeout)
+			b.reportStuck(time.Now(), int(purgeTimeout/time.Second), before)
+			err = <-done
+		}
+		if err == errPurgeStillRunning {
+			b.reportStuck(time.Now(), -1, before)
+			return
 		}
 		if err != nil {
 			if b.log != nil {
 				b.log.Warnf("MEMORY BRAKE PURGE FAILED: %v", err)
 			}
+			b.mark(fmt.Sprintf("%s MEMORY-BRAKE-PURGE-FAILED err=%s", time.Now().Format("2006-01-02 15:04:05"),
+				strings.Join(strings.Fields(err.Error()), " ")))
 			return
 		}
 		after := before
@@ -678,6 +844,8 @@ func (b *Brake) startPurge(now time.Time, r Reading) {
 		if b.log != nil {
 			b.log.Warnf("MEMORY BRAKE PURGE: file-backed %.2f -> %.2f GB", before, after)
 		}
+		b.mark(fmt.Sprintf("%s MEMORY-BRAKE-PURGE-RESULT filebacked_before_gb=%.2f filebacked_after_gb=%.2f",
+			time.Now().Format("2006-01-02 15:04:05"), before, after))
 	}()
 }
 
@@ -688,13 +856,20 @@ func (b *Brake) releaseAfterDrain(now time.Time, r Reading) {
 		return
 	}
 	b.hold.Release()
+	b.lastReleaseAt = now.UnixNano()
 	b.removeHoldState()
+	quietS := int((now.UnixNano() - b.post.killedAt) / int64(time.Second))
+	if b.post.lastRiseAt != 0 {
+		quietS = int((now.UnixNano() - b.post.lastRiseAt) / int64(time.Second))
+	} else if b.post.evictedAt != 0 {
+		quietS = int((now.UnixNano() - b.post.evictedAt) / int64(time.Second))
+	}
 	if b.log != nil {
 		b.log.Warnf("MEMORY BRAKE HOLD RELEASED: file-backed %.2f GB has stayed below %.2f GB for %s; local-model loads admitted again (held %s after the kill)",
 			float64(r.FileBacked)/gib, b.cfg.DrainBelowGB, drainSettle, held)
 	}
-	b.mark(fmt.Sprintf("%s MEMORY-BRAKE-RELEASE filebacked_gb=%.2f drain_below_gb=%.2f held_s=%d",
-		now.Format("2006-01-02 15:04:05"), float64(r.FileBacked)/gib, b.cfg.DrainBelowGB, int(held/time.Second)))
+	b.mark(fmt.Sprintf("%s MEMORY-BRAKE-RELEASE filebacked_gb=%.2f drain_below_gb=%.2f held_s=%d quiet_s=%d backoff=%d",
+		now.Format("2006-01-02 15:04:05"), float64(r.FileBacked)/gib, b.cfg.DrainBelowGB, int(held/time.Second), quietS, b.backoff))
 }
 
 // evictAll drops every known model file from the file cache and logs

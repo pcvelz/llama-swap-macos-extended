@@ -110,18 +110,24 @@ func unregisterLive(p *ProcessCommand) {
 }
 
 // SnapshotLive appends every live child to dst (pass a preallocated slice to
-// stay allocation-free) and reports whether any of them is still starting.
-// A starting child is loading its model: the GGUF read floods the file cache
-// on purpose, which the brake must not mistake for a pager run-up.
+// stay allocation-free) and reports whether any of them is transitioning:
+// starting or stopping. A starting child is loading its model: the GGUF read
+// floods the file cache on purpose, which the brake must not mistake for a
+// pager run-up. A stopping child does the same in reverse (witnessed 2026-10-19
+// 16:06:39: as cq35 stopped, its weights un-wired and reclassified as file
+// cache with no new data read - file-backed 1.84 -> 25.72 GB in one second,
+// wired 33.07 -> 4.87 GB). The brake was disarmed only for starting children,
+// so the stop read as a +24 GB run-up and it SIGKILLed the model it was about
+// to unload anyway. A transition is not a run-up in either direction.
 func SnapshotLive(dst []LiveChild) ([]LiveChild, bool) {
-	loading := false
+	transitioning := false
 	liveMu.Lock()
 	for p, e := range live {
 		dst = append(dst, LiveChild{ID: p.id, Pgid: e.pgid, Files: e.files})
-		if p.State() == StateStarting {
-			loading = true
+		if st := p.State(); st == StateStarting || st == StateStopping {
+			transitioning = true
 		}
 	}
 	liveMu.Unlock()
-	return dst, loading
+	return dst, transitioning
 }

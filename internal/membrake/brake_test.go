@@ -34,10 +34,13 @@ func (r *recorder) Warnf(format string, args ...any) {
 type fakeKids struct {
 	kids    []process.LiveChild
 	loading bool
+	// transitioning reports a child in StateStopping (un-wiring): the second
+	// transition direction SnapshotLive must disarm on, alongside loading.
+	transitioning bool
 }
 
 func (f *fakeKids) snap(dst []process.LiveChild) ([]process.LiveChild, bool) {
-	return append(dst, f.kids...), f.loading
+	return append(dst, f.kids...), f.loading || f.transitioning
 }
 
 func testCfg(t *testing.T) config.MemoryBrakeConfig {
