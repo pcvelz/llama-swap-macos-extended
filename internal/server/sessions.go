@@ -443,10 +443,31 @@ func (b *sessionsBuilder) build(in sessionsInput) sessionsBody {
 		}
 	}
 
+	// One-lane backends (a single /slots row) run with slot affinity off, so
+	// no request carries a slot id. When exactly one session of such a model
+	// is admitted, the slot is that session's - deterministic, no guessing.
+	// With more than one admitted the binding stays unknown (unchanged).
+	admitted := map[string][]string{}
+	for _, key := range order {
+		r := chosen[key]
+		if requestRank(r.Metadata) == 0 && in.Running[r.Model] == process.StateReady {
+			admitted[r.Model] = append(admitted[r.Model], key)
+		}
+	}
+
 	held := heldNow(in)
 	present := map[string]bool{}
 	for _, key := range order {
 		r := chosen[key]
+		if keys := admitted[r.Model]; len(keys) == 1 && keys[0] == key && len(in.Slots[r.Model]) == 1 &&
+			r.Metadata["slot_id"] == "" && r.Metadata[slotAffinityMetadataKey] == "" {
+			md := make(map[string]string, len(r.Metadata)+1)
+			for k, v := range r.Metadata {
+				md[k] = v
+			}
+			md["slot_id"] = strconv.Itoa(in.Slots[r.Model][0].ID)
+			r.Metadata = md
+		}
 		row := b.requestRow(in, r)
 		// Before stampPhaseSince, so a held row's phase clock measures the
 		// PENALIZED phase rather than the phase it was displaced from.

@@ -512,3 +512,73 @@ func TestSessions_ActiveFirstOrder(t *testing.T) {
 		t.Fatalf("want DECODE then PARKED, got %s then %s", got.Sessions[0].Phase, got.Sessions[1].Phase)
 	}
 }
+
+// One-lane backend (Splash shim): slot affinity is off at nSlots<=1, so the
+// request carries no slot_id. With exactly one slot and exactly one admitted
+// session the binding is deterministic: that session owns slot 0.
+func oneLaneReq(id, sess string, granted bool, t0 time.Time) swaputil.InflightRequestEntry {
+	md := map[string]string{"session_id": sess}
+	if granted {
+		md["slot_granted"] = "1"
+	}
+	return swaputil.InflightRequestEntry{ID: id, Model: sessModel, Timestamp: t0, Metadata: md}
+}
+
+func oneLaneSlots(processed, decoded int) map[string][]childSlot {
+	return map[string][]childSlot{sessModel: {{ID: 0, NCtx: 262144, IsProcessing: true, NPromptTokens: 9000, NPromptTokensProcessed: processed, NDecoded: decoded}}}
+}
+
+func TestSessions_OneLaneSoleAdmittedBindsSlot0(t *testing.T) {
+	b := newSessionsBuilder(sessionsTestConfig())
+	t0 := time.Date(2026, 10, 24, 12, 0, 0, 0, time.UTC)
+	running := map[string]process.ProcessState{sessModel: process.StateReady}
+	reqs := []swaputil.InflightRequestEntry{oneLaneReq("1", "sess-aaaaaaaa", true, t0)}
+	got := b.build(sessionsInput{Now: t0, Running: running, Requests: reqs, Slots: oneLaneSlots(2000, 0)})
+	row := got.Sessions[0]
+	if row.Slot == nil || *row.Slot != 0 {
+		t.Fatalf("slot = %v, want 0", row.Slot)
+	}
+	if row.Context.Window != 262144 || row.Context.Processed != 2000 || row.Context.Used != 2000 {
+		t.Fatalf("context = %+v", row.Context)
+	}
+	if row.Phase != "PREFILL" || row.Progress == nil {
+		t.Fatalf("phase=%s progress=%v", row.Phase, row.Progress)
+	}
+	// First poll: no rate yet (null, not 0).
+	if row.Rate.TokensPerSecond != nil {
+		t.Fatalf("first-poll rate = %v, want null", *row.Rate.TokensPerSecond)
+	}
+	// Second poll 2 s later: 1000 more prompt tokens -> 500 tok/s prefill.
+	got = b.build(sessionsInput{Now: t0.Add(2 * time.Second), Running: running, Requests: reqs, Slots: oneLaneSlots(3000, 0)})
+	row = got.Sessions[0]
+	if row.Rate.Kind == nil || *row.Rate.Kind != "prefill" || row.Rate.TokensPerSecond == nil || *row.Rate.TokensPerSecond != 500 {
+		t.Fatalf("prefill rate = %+v", row.Rate)
+	}
+	// Decoding starts: phase follows the slot, decode rate from decoded delta.
+	got = b.build(sessionsInput{Now: t0.Add(3 * time.Second), Running: running, Requests: reqs, Slots: oneLaneSlots(9000, 10)})
+	got = b.build(sessionsInput{Now: t0.Add(5 * time.Second), Running: running, Requests: reqs, Slots: oneLaneSlots(9000, 50)})
+	row = got.Sessions[0]
+	if row.Phase != "DECODE" || row.Rate.Kind == nil || *row.Rate.Kind != "decode" || row.Rate.TokensPerSecond == nil || *row.Rate.TokensPerSecond != 20 {
+		t.Fatalf("decode row = phase %s rate %+v", row.Phase, row.Rate)
+	}
+	if row.Context.Decoded != 50 || row.Context.Used != 9050 {
+		t.Fatalf("decode context = %+v", row.Context)
+	}
+	assertSessionsInvariants(t, got)
+}
+
+func TestSessions_OneLaneTwoAdmittedUnchanged(t *testing.T) {
+	b := newSessionsBuilder(sessionsTestConfig())
+	t0 := time.Date(2026, 10, 24, 12, 0, 0, 0, time.UTC)
+	running := map[string]process.ProcessState{sessModel: process.StateReady}
+	reqs := []swaputil.InflightRequestEntry{
+		oneLaneReq("1", "sess-aaaaaaaa", true, t0),
+		oneLaneReq("2", "sess-bbbbbbbb", true, t0),
+	}
+	got := b.build(sessionsInput{Now: t0, Running: running, Requests: reqs, Slots: oneLaneSlots(2000, 0)})
+	for _, row := range got.Sessions {
+		if row.Slot != nil || row.Context.Processed != 0 {
+			t.Fatalf("%s bound with two admitted: slot=%v ctx=%+v", row.SessionShort, row.Slot, row.Context)
+		}
+	}
+}

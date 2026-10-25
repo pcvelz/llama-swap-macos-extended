@@ -380,6 +380,14 @@ type MemoryBrakeConfig struct {
 	ArmAfterMinutes  int     `yaml:"armAfterMinutes"`
 	ConfirmSamples   int     `yaml:"confirmSamples"`
 	DrainBelowGB     float64 `yaml:"drainBelowGB"`
+	// SplashGrowthGB, when > 0, replaces GrowthGB while EVERY live child runs
+	// the Splash engine (its process group holds a `splash` process). Splash
+	// keeps its weights wired, so its file-backed growth is its own SSD
+	// prefix-cache restores - up to ~8 GiB for one full 256K context at int8 KV
+	// - which a 3.5 GB trigger mistakes for the fatal run-up. Any llama-server
+	// child keeps GrowthGB, the value the 2026-09-18/19 replays calibrate.
+	// 0 (default) = off.
+	SplashGrowthGB float64 `yaml:"splashGrowthGB"`
 	// ReleaseWhenModelsEvictedBelowGB is REMOVED: load refuses any value but 0.
 	// It opened the gate once the killed model's files left the cache; the
 	// reload went into 32 GB of file-backed memory and the machine died.

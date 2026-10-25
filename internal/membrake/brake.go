@@ -328,6 +328,15 @@ type Brake struct {
 	armAfter   time.Duration
 	threshold  int64
 	drainBelow int64
+	// splashThreshold (0 = off) replaces threshold while every live child is a
+	// Splash engine; isSplash probes a child's process group, splashKnown
+	// caches the answer per pgid (one probe per child start, not per sample).
+	splashThreshold int64
+	isSplash        func(pgid int) bool
+	splashKnown     map[int]bool
+	splashNegAt     map[int]int64 // pgid -> unix nanos of its last "not Splash" probe
+	// effThreshold is the threshold the last armed sample used (for the marker).
+	effThreshold int64
 
 	// files is every model file any child was seen with: after a kill the
 	// file cache can hold the weights of earlier models too.
@@ -402,6 +411,10 @@ func New(cfg config.MemoryBrakeConfig, sampler Sampler, children ChildSource, ki
 		qT:         make([]int64, int(maxQuietWindow/interval)+8),
 		qV:         make([]int64, int(maxQuietWindow/interval)+8),
 	}
+	b.splashThreshold = int64(cfg.SplashGrowthGB * gib)
+	b.isSplash = groupRunsSplash
+	b.splashKnown = map[int]bool{}
+	b.splashNegAt = map[int]int64{}
 	b.loadHoldState()
 	return b
 }
@@ -566,7 +579,8 @@ func (b *Brake) observe(now time.Time, r Reading) bool {
 	lo := b.dqV[b.head]
 	growth := m - lo
 	b.lastGrowth = growth
-	if growth < b.threshold {
+	b.effThreshold = b.thresholdFor(b.kids, ts)
+	if growth < b.effThreshold {
 		b.consec = 0
 		return false
 	}
@@ -581,6 +595,55 @@ func (b *Brake) observe(now time.Time, r Reading) bool {
 	b.trip(now, r, growth, lo, span)
 	b.resetWindow(ts)
 	return true
+}
+
+// splashReprobeSecs is how long a "not Splash" probe answer is trusted. Splash's
+// shim answers /health before its engine process exists, so the first probe of
+// a fresh child can run too early; a positive answer is kept for the child's life.
+const splashReprobeSecs = 30
+
+// thresholdFor is the growth trigger for the live children: splashThreshold
+// only when it is set and every child is a Splash engine, else threshold.
+func (b *Brake) thresholdFor(kids []process.LiveChild, now int64) int64 {
+	if b.splashThreshold <= 0 || len(kids) == 0 {
+		return b.threshold
+	}
+	for i := range kids {
+		pgid := kids[i].Pgid
+		if b.splashKnown[pgid] {
+			continue
+		}
+		if at, ok := b.splashNegAt[pgid]; ok && now-at < int64(splashReprobeSecs*time.Second) {
+			return b.threshold
+		}
+		if b.isSplash(pgid) {
+			b.splashKnown[pgid] = true
+			delete(b.splashNegAt, pgid)
+			continue
+		}
+		b.splashNegAt[pgid] = now
+		return b.threshold
+	}
+	return b.splashThreshold
+}
+
+// groupRunsSplash reports whether process group pgid holds a `splash` process
+// (the Splash engine's serve-native binary). Any error reads as "not Splash",
+// which keeps the stricter base threshold.
+func groupRunsSplash(pgid int) bool {
+	if pgid <= 1 {
+		return false
+	}
+	out, err := exec.Command("ps", "-o", "comm=", "-g", strconv.Itoa(pgid)).Output()
+	if err != nil {
+		return false
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		if filepath.Base(strings.TrimSpace(line)) == "splash" {
+			return true
+		}
+	}
+	return false
 }
 
 // trip is the ONE action: kill every live child's process group first, and
@@ -636,10 +699,10 @@ func (b *Brake) trip(now time.Time, r Reading, growth, windowMin int64, span tim
 
 	line := fmt.Sprintf("%s MEMORY-BRAKE killed=%s signal=filebacked growth_gb=%.2f window_min_gb=%.2f filebacked_gb=%.2f window_span_s=%d window_min=%d threshold_gb=%.2f arm_after_min=%d confirm=%d wired_gb=%.2f swap_used_gb=%.2f drain_below_gb=%.2f",
 		now.Format("2006-01-02 15:04:05"), strings.Join(killed, ","), ev.GrowthGB, ev.WindowMinGB, ev.FileGB, ev.WindowSpanS,
-		b.cfg.WindowMinutes, b.cfg.GrowthGB, b.cfg.ArmAfterMinutes, b.cfg.ConfirmSamples, ev.WiredGB, ev.SwapGB, b.cfg.DrainBelowGB)
+		b.cfg.WindowMinutes, float64(b.effThreshold)/gib, b.cfg.ArmAfterMinutes, b.cfg.ConfirmSamples, ev.WiredGB, ev.SwapGB, b.cfg.DrainBelowGB)
 	if b.log != nil {
 		b.log.Warnf("!!!!! MEMORY BRAKE TRIPPED: SIGKILLed every local model (%s). File-backed memory grew %.2f GB (%.2f -> %.2f GB) within %ds of a %d min rolling window (limit %.2f GB) - the run-up that preceded the 2026-09-18 kernel panics. Any live session on these models lost its KV cache and will RE-PREFILL from zero on its next turn. Local-model loads are held until file-backed memory drains below %.2f GB. Marker: %s",
-			strings.Join(killed, ", "), ev.GrowthGB, ev.WindowMinGB, ev.FileGB, ev.WindowSpanS, b.cfg.WindowMinutes, b.cfg.GrowthGB, b.cfg.DrainBelowGB, b.cfg.MarkerPath)
+			strings.Join(killed, ", "), ev.GrowthGB, ev.WindowMinGB, ev.FileGB, ev.WindowSpanS, b.cfg.WindowMinutes, float64(b.effThreshold)/gib, b.cfg.DrainBelowGB, b.cfg.MarkerPath)
 	}
 	b.mark(line)
 }
@@ -994,6 +1057,10 @@ func Start(ctx context.Context, cfg config.MemoryBrakeConfig, log Logger) bool {
 	if log != nil {
 		log.Warnf("memory brake ON: SIGKILL all local models if file-backed memory grows >= %.2f GB above its minimum within any rolling %d min window (%d confirming samples at %dms), armed %d min after a model is ready; after a kill, evict the model files from the file cache and hold loads until file-backed < %.2f GB; marker %s",
 			cfg.GrowthGB, cfg.WindowMinutes, cfg.ConfirmSamples, cfg.SampleIntervalMs, cfg.ArmAfterMinutes, cfg.DrainBelowGB, cfg.MarkerPath)
+		if cfg.SplashGrowthGB > 0 {
+			log.Warnf("memory brake: %.2f GB instead of %.2f GB while every live child is the Splash engine (its own SSD-cache restores); any llama-server child keeps %.2f GB",
+				cfg.SplashGrowthGB, cfg.GrowthGB, cfg.GrowthGB)
+		}
 	}
 	return true
 }
