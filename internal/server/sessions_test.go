@@ -582,3 +582,196 @@ func TestSessions_OneLaneTwoAdmittedUnchanged(t *testing.T) {
 		}
 	}
 }
+
+// Decode retention (PF-C, 2026-10-25): a session chaining short tool turns
+// reads DECODE -> IDLE/PREFILL -> DECODE at the 1 Hz poll. Within
+// sessionsDecodeRetention of the last DECODE poll a young PREFILL or IDLE row
+// keeps DISPLAYING DECODE; the raw phase, counters and PhaseSinceMs are
+// untouched (machine readers read `phase` as truth), and a phase that lasts
+// longer than the retention shows as itself from that moment on.
+func TestSessions_DecodeRetentionHoldsAcrossShortPrefill(t *testing.T) {
+	b := newSessionsBuilder(sessionsTestConfig())
+	t0 := time.Date(2026, 9, 18, 12, 0, 0, 0, time.UTC)
+	running := map[string]process.ProcessState{sessModel: process.StateReady}
+	mk := func(id string, sess string, at time.Time) swaputil.InflightRequestEntry {
+		return swaputil.InflightRequestEntry{ID: id, Model: sessModel, Timestamp: at,
+			Metadata: map[string]string{"session_id": sess, "slot_granted": "1", "slot_id": "0"}}
+	}
+	sl := func(processed, decoded int) map[string][]childSlot {
+		return map[string][]childSlot{sessModel: {{ID: 0, NCtx: 262144, IsProcessing: true, NPromptTokens: 90000, NPromptTokensProcessed: processed, NDecoded: decoded}}}
+	}
+	check := func(got sessionsBody, wantPhase, wantDisplay string) {
+		if len(got.Sessions) != 1 {
+			t.Fatalf("want one row, got %+v", got.Sessions)
+		}
+		row := got.Sessions[0]
+		if row.Phase != wantPhase {
+			t.Fatalf("raw phase = %s, want %s (display-only retention must never touch it)", row.Phase, wantPhase)
+		}
+		disp := ""
+		if row.Display != nil {
+			disp = row.Display.Phase
+		}
+		if disp != wantDisplay {
+			t.Fatalf("display.phase = %q, want %q (raw %s)", disp, wantDisplay, row.Phase)
+		}
+	}
+
+	// Poll 1: s1 decodes its first turn.
+	got := b.build(sessionsInput{Now: t0, Running: running, Requests: []swaputil.InflightRequestEntry{mk("r1", "s1", t0.Add(-5*time.Second))}, Slots: sl(100, 40)})
+	check(got, "DECODE", "")
+	if got.Sessions[0].Context.Decoded != 40 || got.Sessions[0].Rate.Kind == nil || *got.Sessions[0].Rate.Kind != "decode" {
+		t.Fatalf("decode row = ctx %+v rate %+v", got.Sessions[0].Context, got.Sessions[0].Rate)
+	}
+
+	// Poll 2 (+2 s): the request finished; raw IDLE, display still DECODE.
+	got = b.build(sessionsInput{Now: t0.Add(2 * time.Second), Running: running})
+	check(got, "IDLE", "DECODE")
+	// PhaseSinceMs is stamped from the builder's own memory (idleMark.since),
+	// never by the retention - pin it at its pre-retention value.
+	if got.Sessions[0].PhaseSinceMs != 0 {
+		t.Fatalf("IDLE phaseSinceMs=%d, want 0 (retention must not touch it)", got.Sessions[0].PhaseSinceMs)
+	}
+
+	// Poll 3 (+4 s): the next turn of s1 is in PREFILL (NDecoded 0); s2, which
+	// was never in DECODE, prefills beside it. Display holds for s1 only.
+	reqs := []swaputil.InflightRequestEntry{mk("r2", "s1", t0.Add(4*time.Second)), mk("r3", "s2", t0.Add(4*time.Second))}
+	got = b.build(sessionsInput{Now: t0.Add(4 * time.Second), Running: running, Requests: reqs, Slots: sl(10, 0)})
+	bySess := map[string]sessionEntry{}
+	for _, r := range got.Sessions {
+		bySess[r.SessionID] = r
+	}
+	if len(bySess) != 2 {
+		t.Fatalf("want two rows, got %+v", got.Sessions)
+	}
+	r1, ok1 := bySess["s1"]
+	r2, ok2 := bySess["s2"]
+	if !ok1 || !ok2 {
+		t.Fatalf("rows missing: %+v", got.Sessions)
+	}
+	if r1.Phase != "PREFILL" || (r1.Display == nil || r1.Display.Phase != "DECODE") {
+		t.Fatalf("s1 at +4s: raw %s display %+v, want PREFILL / DECODE", r1.Phase, r1.Display)
+	}
+	if r1.Context.Decoded != 0 {
+		t.Fatalf("s1 prefill context decoded=%d, want 0", r1.Context.Decoded)
+	}
+	if r2.Phase != "PREFILL" || r2.Display != nil {
+		t.Fatalf("s2 at +4s: raw %s display %+v, want PREFILL / absent (never decoded)", r2.Phase, r2.Display)
+	}
+
+	// Poll 4 (+12 s after the last DECODE): s1's request is STILL in PREFILL
+	// - past the retention, both fields read PREFILL. (s2 finishes here and
+	// keeps its IDLE row for the 60 s known-session retention; it was never
+	// in DECODE, so it has nothing to retain.)
+	s1req := []swaputil.InflightRequestEntry{mk("r2", "s1", t0.Add(4*time.Second))}
+	got = b.build(sessionsInput{Now: t0.Add(12 * time.Second), Running: running, Requests: s1req, Slots: sl(10, 0)})
+	bySess = map[string]sessionEntry{}
+	for _, r := range got.Sessions {
+		bySess[r.SessionID] = r
+	}
+	r1, ok1 = bySess["s1"]
+	if !ok1 {
+		t.Fatalf("s1 row missing, got %+v", got.Sessions)
+	}
+	if r1.Phase != "PREFILL" || r1.Display != nil {
+		t.Fatalf("s1 at +12s: raw %s display %+v, want PREFILL / absent (long prefill surfaces)", r1.Phase, r1.Display)
+	}
+
+	// A session IDLE for 12 s after its last DECODE reads IDLE in both fields.
+	// (s2's finished request leaves it an IDLE row too - the known-session
+	// retention is 60 s; only s1's display is asserted here.)
+	got = b.build(sessionsInput{Now: t0.Add(14 * time.Second), Running: running})
+	bySess = map[string]sessionEntry{}
+	for _, r := range got.Sessions {
+		bySess[r.SessionID] = r
+	}
+	r1, ok1 = bySess["s1"]
+	if !ok1 {
+		t.Fatalf("s1 row missing, got %+v", got.Sessions)
+	}
+	if r1.Phase != "IDLE" || r1.Display != nil {
+		t.Fatalf("s1 idle 12s after decode: raw %s display %+v, want IDLE / absent", r1.Phase, r1.Display)
+	}
+	assertSessionsInvariants(t, got)
+}
+
+// The retention's own clock (lastDecode) must not outlive the row it belongs
+// to. A session that leaves the snapshot entirely - a crash, a model swap, a
+// client that dies between turns - stops being polled, so its entry would
+// otherwise sit in the map forever: one permanent entry per dead session, and
+// nothing anywhere else bounds that map. Once the session is absent from the
+// body for a full retention window its memory is dropped with the rest.
+func TestSessions_DecodeRetentionMemoryDroppedWithDeadSession(t *testing.T) {
+	b := newSessionsBuilder(sessionsTestConfig())
+	t0 := time.Date(2026, 9, 18, 12, 0, 0, 0, time.UTC)
+	running := map[string]process.ProcessState{sessModel: process.StateReady}
+	mk := func(id string, sess string, at time.Time) swaputil.InflightRequestEntry {
+		return swaputil.InflightRequestEntry{ID: id, Model: sessModel, Timestamp: at,
+			Metadata: map[string]string{"session_id": sess, "slot_granted": "1", "slot_id": "0"}}
+	}
+	sl := func(processed, decoded int) map[string][]childSlot {
+		return map[string][]childSlot{sessModel: {{ID: 0, NCtx: 262144, IsProcessing: true, NPromptTokens: 90000, NPromptTokensProcessed: processed, NDecoded: decoded}}}
+	}
+
+	got := b.build(sessionsInput{Now: t0, Running: running, Requests: []swaputil.InflightRequestEntry{mk("r1", "s1", t0.Add(-5*time.Second))}, Slots: sl(100, 40)})
+	if len(b.lastDecode) != 1 {
+		t.Fatalf("lastDecode = %v after a DECODE poll, want one entry", b.lastDecode)
+	}
+
+	// s1 vanishes from the backend: no requests, no slots, and its IDLE row
+	// ages out of the body after sessionsIdleRetention.
+	for d := time.Second; d <= sessionsIdleRetention+sessionsDecodeRetention; d += time.Second {
+		got = b.build(sessionsInput{Now: t0.Add(d), Running: running})
+	}
+	for _, row := range got.Sessions {
+		if row.SessionID == "s1" {
+			t.Fatalf("s1 still in the body after both retentions: %+v", got.Sessions)
+		}
+	}
+	if _, ok := b.lastDecode["s1"]; ok {
+		t.Fatalf("lastDecode kept an entry for a session gone from the body: %v", b.lastDecode)
+	}
+	assertSessionsInvariants(t, got)
+}
+
+// The retention must be bounded by the retention itself, not just by the age
+// of the current phase: lastDecode refreshes on every DECODE poll, so without
+// that bound a chained session would carry display DECODE through a PREFILL
+// far longer than the constant promises. A PREFILL that starts within the
+// retention and outlives it shows as itself once it is >= 8 s old, even while
+// lastDecode is still fresh.
+func TestSessions_DecodeRetentionEndsAtRetentionDuringLongPrefill(t *testing.T) {
+	b := newSessionsBuilder(sessionsTestConfig())
+	t0 := time.Date(2026, 9, 18, 12, 0, 0, 0, time.UTC)
+	running := map[string]process.ProcessState{sessModel: process.StateReady}
+	mk := func(id string, sess string, at time.Time) swaputil.InflightRequestEntry {
+		return swaputil.InflightRequestEntry{ID: id, Model: sessModel, Timestamp: at,
+			Metadata: map[string]string{"session_id": sess, "slot_granted": "1", "slot_id": "0"}}
+	}
+	decodeSlots := map[string][]childSlot{sessModel: {{ID: 0, NCtx: 262144, IsProcessing: true, NPromptTokens: 90000, NPromptTokensProcessed: 100, NDecoded: 40}}}
+	prefillSlots := map[string][]childSlot{sessModel: {{ID: 0, NCtx: 262144, IsProcessing: true, NPromptTokens: 90000, NPromptTokensProcessed: 10, NDecoded: 0}}}
+
+	// Poll 1 (+0): s1 decodes turn 1.
+	got := b.build(sessionsInput{Now: t0, Running: running, Requests: []swaputil.InflightRequestEntry{mk("r1", "s1", t0.Add(-5*time.Second))}, Slots: decodeSlots})
+	if len(got.Sessions) != 1 || got.Sessions[0].Phase != "DECODE" || got.Sessions[0].Display != nil {
+		t.Fatalf("poll 1: %+v, want one DECODE row without display", got.Sessions)
+	}
+
+	// Poll 2 (+3 s): turn 2 arrives in PREFILL, 3 s after the last DECODE ->
+	// display holds.
+	got = b.build(sessionsInput{Now: t0.Add(3 * time.Second), Running: running, Requests: []swaputil.InflightRequestEntry{mk("r2", "s1", t0.Add(3*time.Second))}, Slots: prefillSlots})
+	if len(got.Sessions) != 1 || got.Sessions[0].Phase != "PREFILL" || got.Sessions[0].Display == nil || got.Sessions[0].Display.Phase != "DECODE" {
+		t.Fatalf("poll 2: %+v, want PREFILL / display DECODE", got.Sessions)
+	}
+
+	// Poll 3 (+10 s): the SAME request is still prefilling - 7 s of phase,
+	// and exactly 10 s since the last DECODE, i.e. right AT the retention
+	// boundary. The age-of-last-DECODE bound ends the retention there even
+	// though the phase itself is younger (lastDecode ages out on its own
+	// clock, so it is still in the map at this instant): display gone.
+	got = b.build(sessionsInput{Now: t0.Add(10 * time.Second), Running: running, Requests: []swaputil.InflightRequestEntry{mk("r2", "s1", t0.Add(3*time.Second))}, Slots: prefillSlots})
+	if len(got.Sessions) != 1 || got.Sessions[0].Phase != "PREFILL" || got.Sessions[0].Display != nil {
+		t.Fatalf("poll 3: %+v, want PREFILL / display absent (retention ends at 8s)", got.Sessions)
+	}
+	assertSessionsInvariants(t, got)
+}

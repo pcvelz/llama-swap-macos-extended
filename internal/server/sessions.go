@@ -45,6 +45,17 @@ const sessionsRateWindow = 30 * time.Second
 // after it stops holding anything.
 const sessionsIdleRetention = 60 * time.Second
 
+// sessionsDecodeRetention is how long a row keeps DISPLAYING DECODE after its
+// last DECODE poll while the raw phase reads PREFILL or IDLE - the short gap
+// between two chained turns of one dispatch, where the row would otherwise
+// flicker DECODE -> IDLE/PREFILL -> DECODE at the 1 Hz poll. The RAW phase is
+// never touched: machine readers (lane governor, liveness monitor, health
+// watch) read `phase` as truth, and the debug history's phase events feed the
+// health watch's turn reconstruction. Display-only, additive to
+// llama-swap.sessions/v1 (2026-10-25 PF-C amendment). Tune this constant if
+// the retention feels too eager or too shy.
+const sessionsDecodeRetention = 8 * time.Second
+
 // sessionsPollTimeout bounds one child /slots read so a stalled child cannot
 // stretch the 1 Hz tick.
 const sessionsPollTimeout = 900 * time.Millisecond
@@ -104,6 +115,17 @@ type sessionRate struct {
 	WindowSeconds   float64  `json:"windowSeconds"`
 }
 
+// sessionDisplay carries what a MENU should show for this row, kept apart
+// from the machine fields above. Today it holds only Phase - the decode
+// retention's display value (see sessionsDecodeRetention). Machine readers
+// (lane governor, liveness monitor, health watch) must keep reading `phase`;
+// renderers show `display.phase` when present, else `phase`. Additive to
+// llama-swap.sessions/v1, omitted entirely when there is nothing to override
+// (2026-10-25 PF-C amendment; MS-1 builds the rest of display around it).
+type sessionDisplay struct {
+	Phase string `json:"phase"`
+}
+
 type sessionEntry struct {
 	SessionID    string         `json:"sessionId"`
 	SessionShort string         `json:"sessionShort"`
@@ -152,6 +174,10 @@ type sessionEntry struct {
 	// must be able to tell "no data" from "field predates" (llama-cm
 	// docs/intent/cooldown.md "What the user sees"). Nil on non-parked rows.
 	WaitingFor *waitingFor `json:"waitingFor,omitempty"`
+	// Display is the menu-facing view of this row, nil whenever it equals the
+	// raw fields (so existing fixtures serialise byte-identical). See
+	// sessionDisplay.
+	Display *sessionDisplay `json:"display,omitempty"`
 }
 
 // waitingFor is the WHO/HOW LONG behind a parked request's reason - stamped
@@ -287,6 +313,7 @@ type sessionsBuilder struct {
 	known         map[string]sessionEntry
 	idle          map[string]idleMark
 	slotWarmUntil map[string]string // keyed by session ID, RFC3339
+	lastDecode    map[string]time.Time
 }
 
 func newSessionsBuilder(cfg config.Config) *sessionsBuilder {
@@ -297,6 +324,7 @@ func newSessionsBuilder(cfg config.Config) *sessionsBuilder {
 		known:         map[string]sessionEntry{},
 		idle:          map[string]idleMark{},
 		slotWarmUntil: map[string]string{},
+		lastDecode:    map[string]time.Time{},
 	}
 }
 
@@ -475,6 +503,7 @@ func (b *sessionsBuilder) build(in sessionsInput) sessionsBody {
 		b.stampPhaseSince(key, &row, now, r.Timestamp)
 		b.stampRate(key, &row, now, in, r)
 		b.stampSlotWarmUntil(&row)
+		b.stampDecodeDisplay(key, &row, now)
 		present[key] = true
 		body.Sessions = append(body.Sessions, row)
 	}
@@ -524,6 +553,7 @@ func (b *sessionsBuilder) build(in sessionsInput) sessionsBody {
 		row := b.idleRow(in, m, now)
 		b.applyLoopState(in, &row, held)
 		b.stampSlotWarmUntil(&row)
+		b.stampDecodeDisplay(key, &row, now)
 		body.Sessions = append(body.Sessions, row)
 	}
 
@@ -536,6 +566,31 @@ func (b *sessionsBuilder) build(in sessionsInput) sessionsBody {
 	for key := range b.rates {
 		if !present[key] {
 			delete(b.rates, key)
+		}
+	}
+	// lastDecode ages out on its own clock, NOT on presence: the retention's
+	// whole point is to survive the gap in which the session holds no request
+	// at all (the IDLE row between two turns of one dispatch). Deleting it
+	// here would kill exactly the case the display is meant to steady.
+	//
+	// But a stale entry only ever matters while the session still exists as a
+	// row somewhere in this body (a request row, an IDLE-retention row or a
+	// HOT row): once a session has left the snapshot entirely - crash, model
+	// swap, client dead between turns - nothing polls it again, and an entry
+	// kept past its own retention would never be touched or deleted again:
+	// one permanent entry per dead session. So age it out on its own clock
+	// ONLY while it is represented in the body; when it is not, drop it with
+	// the rest of the gone-row memory. A live chaining session always has a
+	// row (IDLE retention 60 s >> 8 s), so the survival case is untouched.
+	bodyHas := map[string]bool{}
+	for _, row := range body.Sessions {
+		if row.SessionID != "" {
+			bodyHas[row.SessionID] = true
+		}
+	}
+	for key, at := range b.lastDecode {
+		if !bodyHas[key] || now.Sub(at) >= sessionsDecodeRetention {
+			delete(b.lastDecode, key)
 		}
 	}
 
@@ -811,6 +866,43 @@ func (b *sessionsBuilder) stampPhaseSince(key string, row *sessionEntry, now, ar
 	if row.PhaseSinceMs < 0 {
 		row.PhaseSinceMs = 0
 	}
+	// Remember when the session last read DECODE, whatever the phase flips to
+	// afterwards: phaseMark.since resets the moment the phase changes away,
+	// so the retention needs its own clock (PF-C, 2026-10-25).
+	if row.Phase == phaseDecode {
+		b.lastDecode[key] = now
+	}
+}
+
+// stampDecodeDisplay is the decode retention, display-only. While a session
+// chains short tool turns its row flickers DECODE -> IDLE/PREFILL -> DECODE
+// at the 1 Hz poll; within sessionsDecodeRetention of the last DECODE poll a
+// young PREFILL or IDLE row keeps DISPLAYING DECODE so the menu reads one
+// steady row per chaining session. The raw Phase, every counter, the rate,
+// the slot and PhaseSinceMs are untouched - machine readers (lane governor,
+// liveness monitor, health watch) keep reading `phase` as truth, and the
+// debug history's phase events stay real. A phase that lasts longer than the
+// retention shows as itself from that moment on, so a genuinely idle session
+// or a long prefill still surfaces. PARKED, LOADING, HOT, PENALIZED and
+// DECODE rows are never overridden: real waiting is never hidden.
+func (b *sessionsBuilder) stampDecodeDisplay(key string, row *sessionEntry, now time.Time) {
+	if row.SessionID == "" || row.Display != nil {
+		return
+	}
+	if row.Phase != phasePrefill && row.Phase != phaseIdle {
+		return
+	}
+	last, ok := b.lastDecode[key]
+	if !ok || now.Sub(last) >= sessionsDecodeRetention {
+		return
+	}
+	// The current phase must still be younger than the retention: a phase
+	// that outlasts it is real and shows as itself. Same clock as
+	// PhaseSinceMs (the builder's Now), already stamped by the caller.
+	if row.PhaseSinceMs >= int64(sessionsDecodeRetention.Milliseconds()) {
+		return
+	}
+	row.Display = &sessionDisplay{Phase: phaseDecode}
 }
 
 // stampRate measures PREFILL on processed and DECODE on decoded, over the
