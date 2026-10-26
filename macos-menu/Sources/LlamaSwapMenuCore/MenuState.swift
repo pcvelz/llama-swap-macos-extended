@@ -269,6 +269,11 @@ public struct SessionRow: Identifiable, Encodable, Equatable {
     /// the server has not documented yet - rendered verbatim either way
     /// (invariant 5), never mapped through a Swift enum that could reject it.
     public let phase: String
+    /// The contract's optional `display.phase` (raw `phase` is kept in
+    /// `phase`; machine logic reads that). nil when the server sent no
+    /// `display` object or no `display.phase` - the renderer then falls back
+    /// to the raw phase. Never mutated by anything but the row's init.
+    public let displayPhase: String?
     /// Set only while `phase == "PARKED"`. Same verbatim rule as `phase`.
     public let parkReason: String?
     public let context: ContractContext
@@ -282,7 +287,7 @@ public struct SessionRow: Identifiable, Encodable, Equatable {
     public let penalty: PenaltyInfo?
 
     public init(id: String, sessionId: String = "", sessionShort: String, parentSessionShort: String? = nil, model: String, alias: String, tier: String,
-                priority: Int, phase: String, parkReason: String? = nil,
+                priority: Int, phase: String, displayPhase: String? = nil, parkReason: String? = nil,
                 context: ContractContext, progress: Double? = nil, rate: ContractRate,
                 penalty: PenaltyInfo? = nil) {
         self.id = id
@@ -294,6 +299,7 @@ public struct SessionRow: Identifiable, Encodable, Equatable {
         self.tier = tier
         self.priority = priority
         self.phase = phase
+        self.displayPhase = displayPhase
         self.parkReason = parkReason
         self.context = context
         self.progress = progress
@@ -384,7 +390,11 @@ public struct SessionRow: Identifiable, Encodable, Equatable {
 
         var segments: [String] = [idAndAlias]
 
-        var phaseSegment = phase
+        // Renderer rule (session-state-contract.md `display.phase`): show
+        // display.phase when present, else the raw phase. Every non-render
+        // use of `phase` (queue filter, progress gate, unpenalize restore)
+        // stays on the raw value.
+        var phaseSegment = displayPhase ?? phase
         if let phrase = SessionRow.parkPhrase(parkReason) { phaseSegment += " (\(phrase))" }
         segments.append(phaseSegment)
 

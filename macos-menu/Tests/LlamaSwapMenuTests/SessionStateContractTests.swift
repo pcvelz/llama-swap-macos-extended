@@ -298,4 +298,48 @@ final class SessionStateContractTests: XCTestCase {
         XCTAssertEqual(row.phase, "WARMING")
         XCTAssertTrue(row.displayLine.contains("WARMING"))
     }
+
+    // MARK: - display.phase (renderer rule, fork 9dfdc32)
+
+    /// Shared body for both display cases: identical except for the
+    /// optional `display` object.
+    private func retentionRowJSON(displayKey: String) -> Data {
+        // displayKey is a pre-quoted fragment like `"display":{"phase":"DECODE"},`
+        // (kept out of the multiline literal: a quote-terminated interpolation
+        // on its own line trips the multiline-literal parser).
+        """
+        {"sessionId":"z","sessionShort":"zzzzzzzz","requestId":null,"model":"m","alias":"a",
+         "tier":"default","priority":0,"phase":"IDLE",\(displayKey)"parkReason":null,"slot":null,
+         "context":{"used":0,"cached":0,"processed":0,"decoded":0,"promptTotal":0,"window":1},
+         "progress":null,"rate":{"kind":null,"tokensPerSecond":null,"windowSeconds":30.0},
+         "elapsedMs":0,"phaseSinceMs":0,"respTokens":0}
+        """.data(using: .utf8)!
+    }
+
+    /// A row with `display.phase` present renders the DISPLAYED phase while
+    /// the raw `phase` stays what the machine readers use.
+    func testDisplayPhaseRendersWhenPresent() throws {
+        let entry = try JSONDecoder().decode(ContractSession.self,
+                                             from: retentionRowJSON(displayKey: "\"display\":{\"phase\":\"DECODE\"},"))
+        let row = SessionRow(contract: entry)
+        XCTAssertEqual(row.phase, "IDLE", "the raw phase must stay IDLE for machine readers")
+        XCTAssertEqual(row.displayPhase, "DECODE")
+        XCTAssertTrue(row.displayLine.contains("· DECODE ·"),
+                      "the rendered phase segment must show display.phase, got '\(row.displayLine)'")
+        XCTAssertFalse(row.displayLine.contains("IDLE"),
+                       "the raw phase must not appear in the render, got '\(row.displayLine)'")
+    }
+
+    /// A row without `display` decodes (the key is optional) and renders
+    /// the raw phase unchanged - servers predating 9dfdc32 are unaffected.
+    func testDisplayPhaseAbsentFallsBackToRawPhase() throws {
+        let entry = try JSONDecoder().decode(ContractSession.self,
+                                             from: retentionRowJSON(displayKey: ""))
+        let row = SessionRow(contract: entry)
+        XCTAssertNil(entry.display)
+        XCTAssertNil(row.displayPhase)
+        XCTAssertEqual(row.phase, "IDLE")
+        XCTAssertTrue(row.displayLine.contains("· IDLE ·"),
+                      "without display the raw phase renders, got '\(row.displayLine)'")
+    }
 }

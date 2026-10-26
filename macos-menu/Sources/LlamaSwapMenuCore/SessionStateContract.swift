@@ -98,6 +98,21 @@ public struct ContractSession: Decodable {
     public let parentSessionId: String?
     /// First 8 chars of parentSessionId; absent when there is no parent.
     public let parentSessionShort: String?
+    /// The contract's optional `display` object (session-state-contract.md's
+    /// `display.phase` row): what a MENU shows for this row, absent when it
+    /// equals the raw `phase`. Today the server sets it only to DECODE for
+    /// 8 s (`sessionsDecodeRetention`) after the row's last raw DECODE.
+    /// Renderers show `display.phase` when present, else `phase`; machine
+    /// readers keep the raw `phase`, which is never altered. Absent on
+    /// servers that predate fork 9dfdc32, so the whole object is optional.
+    public let display: ContractDisplay?
+}
+
+/// The `display` object of a `sessions[]` entry. Only `phase` is defined
+/// today; an unknown shape decodes to nil fields, never a decode failure
+/// (invariant 5).
+public struct ContractDisplay: Codable, Equatable {
+    public let phase: String?
 }
 
 /// The PENALIZED hold's detail - session-state-contract.md's `penalty`
@@ -148,6 +163,7 @@ extension SessionRow {
             tier: entry.tier,
             priority: entry.priority,
             phase: entry.phase,
+            displayPhase: entry.display?.phase,
             parkReason: entry.parkReason,
             context: entry.context,
             progress: entry.progress,
