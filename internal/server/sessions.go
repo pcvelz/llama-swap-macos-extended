@@ -547,6 +547,7 @@ func (b *sessionsBuilder) build(in sessionsInput) sessionsBody {
 			delete(b.phases, h.SessionID)
 			delete(b.rates, h.SessionID)
 			b.stampSlotWarmUntil(&row)
+			b.stampDecodeDisplay(h.SessionID, &row, now)
 			body.Sessions = append(body.Sessions, row)
 		}
 	}
@@ -911,11 +912,13 @@ func (b *sessionsBuilder) stampPhaseSince(key string, row *sessionEntry, now, ar
 }
 
 // stampDecodeDisplay is the decode retention, display-only. While a session
-// chains tool turns its row flickers DECODE -> IDLE/PARKED/PREFILL -> DECODE
+// chains tool turns its row flickers DECODE -> HOT/IDLE/PARKED/PREFILL -> DECODE
 // at the 1 Hz poll; within the window (decodeWindow, measured from the LAST
-// RAW DECODE rather than from the start of the current phase) an IDLE, PARKED
-// or PREFILL row keeps DISPLAYING DECODE so the menu reads one steady row per
-// chaining session. The window counts from the last DECODE because with two
+// RAW DECODE rather than from the start of the current phase) a HOT, IDLE,
+// PARKED or PREFILL row keeps DISPLAYING DECODE so the menu reads one steady
+// row per chaining session. HOT is the usual between-turns phase once slot
+// affinity binds a session to a lane (no request in flight, the slot still
+// holds its cache), so it is retained like IDLE. The window counts from the last DECODE because with two
 // sessions on one lane the gap between turns is the tool call, the wait for
 // the lane, and the next prefill in sequence - bounding each of those
 // separately (the pre-2026-10-27 rule) released the row mid-gap.
@@ -925,7 +928,7 @@ func (b *sessionsBuilder) stampPhaseSince(key string, row *sessionEntry, now, ar
 // monitor, health watch, the thermal inference signal) keep reading `phase`
 // as truth, and the debug history's phase events stay real. Past the window
 // the row shows its raw phase again, so a genuinely idle session or a session
-// stuck in a long prefill still surfaces. LOADING, HOT, DECODE and any
+// stuck in a long prefill still surfaces. LOADING, DECODE and any
 // PENALIZED row are never overridden: a penalty is state an operator has to
 // see. A PARKED row is read AFTER applyLoopState, so a scheduler-held row
 // already reads PENALIZED here; the row.Penalty check additionally refuses
@@ -938,7 +941,7 @@ func (b *sessionsBuilder) stampDecodeDisplay(key string, row *sessionEntry, now 
 	if window <= 0 {
 		return
 	}
-	if row.Phase != phasePrefill && row.Phase != phaseIdle && row.Phase != phaseParked {
+	if row.Phase != phasePrefill && row.Phase != phaseIdle && row.Phase != phaseParked && row.Phase != phaseHot {
 		return
 	}
 	if row.Penalty != nil {

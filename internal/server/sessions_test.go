@@ -851,6 +851,33 @@ func TestSessions_DecodeRetentionHoldsAcrossParked(t *testing.T) {
 	assertSessionsInvariants(t, b.build(sessionsInput{Now: t0.Add(4 * time.Second), Running: map[string]process.ProcessState{sessModel: process.StateReady}}))
 }
 
+// HOT inside the window keeps displaying DECODE: with slot affinity a session
+// between turns has no request in flight but still owns its lane, which reads
+// HOT rather than IDLE.
+func TestSessions_DecodeRetentionHoldsAcrossHot(t *testing.T) {
+	b := newSessionsBuilder(sessionsTestConfig())
+	t0 := time.Date(2026, 9, 18, 12, 0, 0, 0, time.UTC)
+	running := map[string]process.ProcessState{sessModel: process.StateReady}
+	decodeSlots := map[string][]childSlot{sessModel: {{ID: 0, NCtx: 262144, IsProcessing: true, NPromptTokens: 90000, NPromptTokensProcessed: 100, NDecoded: 40}}}
+	b.build(sessionsInput{Now: t0, Running: running, Requests: []swaputil.InflightRequestEntry{retentionReq("r1", t0.Add(-5*time.Second), nil)}, Slots: decodeSlots})
+	hot := map[string][]swaputil.HotSlot{sessModel: {{Slot: 0, SessionID: "s1", IdleSeconds: 4}}}
+	got := b.build(sessionsInput{Now: t0.Add(4 * time.Second), Running: running, Hot: hot})
+	if len(got.Sessions) != 1 {
+		t.Fatalf("sessions = %+v, want one HOT row", got.Sessions)
+	}
+	row := got.Sessions[0]
+	if row.Phase != "HOT" {
+		t.Fatalf("raw phase = %s, want HOT (display-only retention must never touch it)", row.Phase)
+	}
+	if row.Display == nil || row.Display.Phase != "DECODE" {
+		t.Fatalf("display = %+v, want DECODE for a HOT row 4 s after the last DECODE", row.Display)
+	}
+	late := b.build(sessionsInput{Now: t0.Add(35 * time.Second), Running: running, Hot: map[string][]swaputil.HotSlot{sessModel: {{Slot: 0, SessionID: "s1", IdleSeconds: 35}}}})
+	if len(late.Sessions) != 1 || late.Sessions[0].Display != nil {
+		t.Fatalf("past the window = %+v, want the raw HOT row with no display override", late.Sessions)
+	}
+}
+
 // A PREFILL older than the old 8 s constant but inside the window keeps
 // displaying DECODE: the window is measured from the last raw DECODE, not
 // from the start of the current phase.
