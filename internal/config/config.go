@@ -194,6 +194,10 @@ type Config struct {
 	// LoopGuardConfig. On by default.
 	LoopGuard LoopGuardConfig `yaml:"loopGuard"`
 
+	// Sessions tunes what GET /api/sessions shows; see SessionsConfig.
+	// Defaults when the block is absent.
+	Sessions SessionsConfig `yaml:"sessions"`
+
 	Models    map[string]ModelConfig    `yaml:"models"` /* key is model ID */
 	Profiles  map[string]ProfileConfig  `yaml:"profiles"`
 	Selectors map[string]SelectorConfig `yaml:"selectors"`
@@ -535,6 +539,44 @@ func DefaultLoopGuardConfig() LoopGuardConfig {
 		YieldFloorTokPerMin:   10,
 		YieldFloorMinutes:     15,
 	}
+}
+
+// SessionsConfig tunes the session-state snapshot (GET /api/sessions,
+// llama-swap.sessions/v1). It changes only what a MENU shows: the raw `phase`
+// and every counter are never affected, so the lane governor, the liveness
+// monitor, the health watch and the thermal inference signal keep reading
+// truth.
+type SessionsConfig struct {
+	// DecodeRetentionSeconds is how long a row keeps DISPLAYING DECODE after
+	// its last raw DECODE, while the raw phase reads IDLE, PARKED or PREFILL -
+	// the gap between two chained turns of one dispatch. With two sessions
+	// sharing one lane that gap is the tool call (IDLE) plus the next turn
+	// queued behind the other session (PARKED) plus its prefill, and it
+	// routinely outlasts the 8 s the display originally held; the window is
+	// measured from the last DECODE, not from the start of the current phase.
+	// Default 30; 0 turns the retention off (every row shows its raw phase).
+	// A session that never decoded, a LOADING row and any penalized row are
+	// never retained.
+	DecodeRetentionSeconds int `yaml:"decodeRetentionSeconds"`
+}
+
+// DefaultSessionsConfig is the seeded value when the block is absent. The
+// window is the one that covers a real two-session lane gap (measured
+// 2026-10-27: IDLE ~5 s + PARKED + PREFILL, commonly 15-25 s); the builder
+// falls back to its own 8 s constant if the config leaves this unset.
+func DefaultSessionsConfig() SessionsConfig {
+	return SessionsConfig{DecodeRetentionSeconds: 30}
+}
+
+// UnmarshalYAML sets default values for SessionsConfig
+func (c *SessionsConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	type rawSessionsConfig SessionsConfig
+	defaults := rawSessionsConfig(DefaultSessionsConfig())
+	if err := unmarshal(&defaults); err != nil {
+		return err
+	}
+	*c = SessionsConfig(defaults)
+	return nil
 }
 
 // DefaultMemoryBrakeConfig returns the defaults applied when the yaml omits

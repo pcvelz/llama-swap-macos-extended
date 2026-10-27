@@ -400,6 +400,14 @@
                 "retainMinutes": {"type": "integer", "minimum": 1, "default": 15}
             }
         },
+        "sessions": {
+            "type": "object",
+            "additionalProperties": false,
+            "description": "What the session-state snapshot (GET /api/sessions, llama-swap.sessions/v1) SHOWS. Nothing here changes what a machine reader sees: the raw `phase` and every counter are never touched, so the lane governor, liveness monitor, health watch and the thermal inference signal keep reading truth. Only the additive `display.phase` field - the one menus render - is affected. Defaults apply when the block is absent.",
+            "properties": {
+                "decodeRetentionSeconds": {"type": "integer", "minimum": 0, "default": 30, "description": "How long a row keeps DISPLAYING DECODE after its last RAW DECODE while the raw phase reads IDLE, PARKED or PREFILL - the gap between two chained turns of one dispatch, where the menu would otherwise flicker DECODE -> IDLE/PARKED/PREFILL -> DECODE at the 1 Hz poll. The window is measured from the last DECODE, not from the start of the current phase: with two sessions sharing one lane the gap is the tool call (IDLE ~5 s) plus the next turn queued behind the other session (PARKED) plus its prefill, and that sequence routinely outlasts the 8 s the display originally held, so the row went bare mid-turn (2026-10-27). A session that never decoded, a LOADING row, a HOT row and any penalized row are never retained. 0 turns the retention off; negative fails the load."}
+            }
+        },
         "loopGuard": {
             "type": "object",
             "additionalProperties": false,

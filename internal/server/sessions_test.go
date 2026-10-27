@@ -16,6 +16,7 @@ import (
 	"github.com/mostlygeek/llama-swap/internal/config"
 	"github.com/mostlygeek/llama-swap/internal/membrake"
 	"github.com/mostlygeek/llama-swap/internal/process"
+	"github.com/mostlygeek/llama-swap/internal/router/scheduler"
 	"github.com/mostlygeek/llama-swap/internal/swaputil"
 	"github.com/stretchr/testify/require"
 )
@@ -37,6 +38,10 @@ func sessionsTestConfig() config.Config {
 			"priority":   {Listen: "127.0.0.1:8002", Rank: 10},
 			"background": {Listen: "127.0.0.1:8003", Rank: -10},
 		},
+		// What LoadConfigFromReader seeds when the sessions block is absent
+		// (config.DefaultSessionsConfig), so the retention tests exercise the
+		// window a real box runs.
+		Sessions: config.DefaultSessionsConfig(),
 	}
 }
 
@@ -659,10 +664,14 @@ func TestSessions_DecodeRetentionHoldsAcrossShortPrefill(t *testing.T) {
 		t.Fatalf("s2 at +4s: raw %s display %+v, want PREFILL / absent (never decoded)", r2.Phase, r2.Display)
 	}
 
-	// Poll 4 (+12 s after the last DECODE): s1's request is STILL in PREFILL
-	// - past the retention, both fields read PREFILL. (s2 finishes here and
-	// keeps its IDLE row for the 60 s known-session retention; it was never
-	// in DECODE, so it has nothing to retain.)
+	// Poll 4 (+12 s after the last DECODE): s1's request is STILL in PREFILL.
+	// The window is now measured from the last DECODE and configured at 30 s,
+	// so 12 s is still INSIDE it and the display holds - the old behaviour
+	// (a prefill past 8 s shows itself) is superseded by
+	// TestSessions_DecodeRetentionReleasedPastWindow, which takes the release
+	// past the configured window. (s2 finishes here and keeps its IDLE row
+	// for the 60 s known-session retention; it was never in DECODE, so it has
+	// nothing to retain.)
 	s1req := []swaputil.InflightRequestEntry{mk("r2", "s1", t0.Add(4*time.Second))}
 	got = b.build(sessionsInput{Now: t0.Add(12 * time.Second), Running: running, Requests: s1req, Slots: sl(10, 0)})
 	bySess = map[string]sessionEntry{}
@@ -673,14 +682,14 @@ func TestSessions_DecodeRetentionHoldsAcrossShortPrefill(t *testing.T) {
 	if !ok1 {
 		t.Fatalf("s1 row missing, got %+v", got.Sessions)
 	}
-	if r1.Phase != "PREFILL" || r1.Display != nil {
-		t.Fatalf("s1 at +12s: raw %s display %+v, want PREFILL / absent (long prefill surfaces)", r1.Phase, r1.Display)
+	if r1.Phase != "PREFILL" || r1.Display == nil || r1.Display.Phase != "DECODE" {
+		t.Fatalf("s1 at +12s: raw %s display %+v, want PREFILL / DECODE (inside the 30 s window)", r1.Phase, r1.Display)
 	}
 
-	// A session IDLE for 12 s after its last DECODE reads IDLE in both fields.
-	// (s2's finished request leaves it an IDLE row too - the known-session
-	// retention is 60 s; only s1's display is asserted here.)
-	got = b.build(sessionsInput{Now: t0.Add(14 * time.Second), Running: running})
+	// A session IDLE 34 s after its last DECODE is past the window: IDLE in
+	// both fields. (s2's finished request leaves it an IDLE row too - the
+	// known-session retention is 60 s; only s1's display is asserted here.)
+	got = b.build(sessionsInput{Now: t0.Add(34 * time.Second), Running: running})
 	bySess = map[string]sessionEntry{}
 	for _, r := range got.Sessions {
 		bySess[r.SessionID] = r
@@ -690,7 +699,7 @@ func TestSessions_DecodeRetentionHoldsAcrossShortPrefill(t *testing.T) {
 		t.Fatalf("s1 row missing, got %+v", got.Sessions)
 	}
 	if r1.Phase != "IDLE" || r1.Display != nil {
-		t.Fatalf("s1 idle 12s after decode: raw %s display %+v, want IDLE / absent", r1.Phase, r1.Display)
+		t.Fatalf("s1 idle 34s after decode: raw %s display %+v, want IDLE / absent (past the window)", r1.Phase, r1.Display)
 	}
 	assertSessionsInvariants(t, got)
 }
@@ -734,13 +743,13 @@ func TestSessions_DecodeRetentionMemoryDroppedWithDeadSession(t *testing.T) {
 	assertSessionsInvariants(t, got)
 }
 
-// The retention must be bounded by the retention itself, not just by the age
-// of the current phase: lastDecode refreshes on every DECODE poll, so without
-// that bound a chained session would carry display DECODE through a PREFILL
-// far longer than the constant promises. A PREFILL that starts within the
-// retention and outlives it shows as itself once it is >= 8 s old, even while
-// lastDecode is still fresh.
-func TestSessions_DecodeRetentionEndsAtRetentionDuringLongPrefill(t *testing.T) {
+// The window bounds the retention on its own clock: a chained session does
+// NOT carry display DECODE forever. A PREFILL that starts inside the window
+// shows itself once the window since the last DECODE has elapsed, however
+// fresh the phase itself is (the pre-2026-10-27 rule also required the phase
+// to be younger than the window; the window now counts from the last DECODE,
+// which is the bound that actually matches a two-session lane gap).
+func TestSessions_DecodeRetentionEndsAtWindowDuringLongPrefill(t *testing.T) {
 	b := newSessionsBuilder(sessionsTestConfig())
 	t0 := time.Date(2026, 9, 18, 12, 0, 0, 0, time.UTC)
 	running := map[string]process.ProcessState{sessModel: process.StateReady}
@@ -764,14 +773,180 @@ func TestSessions_DecodeRetentionEndsAtRetentionDuringLongPrefill(t *testing.T) 
 		t.Fatalf("poll 2: %+v, want PREFILL / display DECODE", got.Sessions)
 	}
 
-	// Poll 3 (+10 s): the SAME request is still prefilling - 7 s of phase,
-	// and exactly 10 s since the last DECODE, i.e. right AT the retention
-	// boundary. The age-of-last-DECODE bound ends the retention there even
-	// though the phase itself is younger (lastDecode ages out on its own
-	// clock, so it is still in the map at this instant): display gone.
-	got = b.build(sessionsInput{Now: t0.Add(10 * time.Second), Running: running, Requests: []swaputil.InflightRequestEntry{mk("r2", "s1", t0.Add(3*time.Second))}, Slots: prefillSlots})
+	// Poll 3 (+31 s): the SAME request is still prefilling - 28 s of phase,
+	// and 31 s since the last DECODE, i.e. past the 30 s window. The raw
+	// phase stays PREFILL and the display is gone: a session genuinely stuck
+	// in prefill surfaces again.
+	got = b.build(sessionsInput{Now: t0.Add(31 * time.Second), Running: running, Requests: []swaputil.InflightRequestEntry{mk("r2", "s1", t0.Add(3*time.Second))}, Slots: prefillSlots})
 	if len(got.Sessions) != 1 || got.Sessions[0].Phase != "PREFILL" || got.Sessions[0].Display != nil {
-		t.Fatalf("poll 3: %+v, want PREFILL / display absent (retention ends at 8s)", got.Sessions)
+		t.Fatalf("poll 3: %+v, want PREFILL / display absent (window 30 s from the last DECODE)", got.Sessions)
 	}
 	assertSessionsInvariants(t, got)
+}
+
+// --- decode retention round 2 (2026-10-27) ---
+//
+// With two sessions sharing one lane the gap between one session's turns is
+// IDLE (the tool call) plus PARKED (the next turn queued behind the other
+// session) plus PREFILL, and that whole gap routinely outlasts 8 s. The
+// retention therefore measures from the LAST RAW DECODE (not from the start
+// of the current phase), covers PARKED as well as IDLE and PREFILL, and the
+// window is configuration: sessions.decodeRetentionSeconds, default 30 s,
+// with the 8 s constant as the fallback when the config leaves it unset.
+// Raw phase, counters, PhaseSinceMs and the queue tallies stay untouched
+// throughout; a session that never decoded, a LOADING row and any penalized
+// row are never retained.
+
+// retentionPolls drives one builder through a DECODE poll (an admitted
+// request decoding) and a second poll `later` later carrying the NEXT request
+// (parked unless the caller's metadata says otherwise, so its raw phase is
+// PARKED, PREFILL or IDLE per `slots`/extraMeta). It returns that second
+// poll's single row for s1, `later` after the last DECODE.
+func retentionPolls(t *testing.T, b *sessionsBuilder, t0 time.Time, later time.Duration, extraMeta map[string]string, slots map[string][]childSlot) sessionEntry {
+	t.Helper()
+	running := map[string]process.ProcessState{sessModel: process.StateReady}
+	decodeSlots := map[string][]childSlot{sessModel: {{ID: 0, NCtx: 262144, IsProcessing: true, NPromptTokens: 90000, NPromptTokensProcessed: 100, NDecoded: 40}}}
+	if got := b.build(sessionsInput{Now: t0, Running: running, Requests: []swaputil.InflightRequestEntry{retentionReq("r1", t0.Add(-5*time.Second), nil)}, Slots: decodeSlots}); len(got.Sessions) != 1 || got.Sessions[0].Phase != "DECODE" {
+		t.Fatalf("setup poll: %+v, want one DECODE row", got.Sessions)
+	}
+	got := b.build(sessionsInput{Now: t0.Add(later), Running: running, Requests: []swaputil.InflightRequestEntry{retentionReq("r2", t0.Add(later), extraMeta)}, Slots: slots})
+	if len(got.Sessions) != 1 {
+		t.Fatalf("second poll: %+v, want one row", got.Sessions)
+	}
+	return got.Sessions[0]
+}
+
+// retentionReq is one in-flight request for s1: admitted (slot_granted) by
+// default, parked when the caller adds a park_reason (which the scheduler
+// only ever stamps on a request it has NOT granted a slot to).
+func retentionReq(id string, now time.Time, extraMeta map[string]string) swaputil.InflightRequestEntry {
+	md := map[string]string{"session_id": "s1"}
+	if _, parked := extraMeta["park_reason"]; !parked {
+		md["slot_granted"] = "1"
+		md["slot_id"] = "0"
+	}
+	for k, v := range extraMeta {
+		md[k] = v
+	}
+	return swaputil.InflightRequestEntry{ID: id, Model: sessModel, Timestamp: now, Metadata: md}
+}
+
+// PARKED inside the window keeps displaying DECODE: the session's turn is
+// queued behind another session on the same lane, which is exactly the state
+// the menu used to show as a bare PARKED row.
+func TestSessions_DecodeRetentionHoldsAcrossParked(t *testing.T) {
+	b := newSessionsBuilder(sessionsTestConfig())
+	t0 := time.Date(2026, 9, 18, 12, 0, 0, 0, time.UTC)
+	parkedSlots := map[string][]childSlot{sessModel: {{ID: 0, NCtx: 262144, IsProcessing: true, NPromptTokens: 90000, NPromptTokensProcessed: 100, NDecoded: 40}}}
+	row := retentionPolls(t, b, t0, 4*time.Second, map[string]string{"park_reason": "lane", "waiting_for_session": "s2"}, parkedSlots)
+	if row.Phase != "PARKED" {
+		t.Fatalf("raw phase = %s, want PARKED (display-only retention must never touch it)", row.Phase)
+	}
+	if row.Display == nil || row.Display.Phase != "DECODE" {
+		t.Fatalf("display = %+v, want DECODE for a PARKED row 4 s after the last DECODE", row.Display)
+	}
+	if row.WaitingFor == nil || row.WaitingFor.Session != "s2" {
+		t.Fatalf("waitingFor = %+v, want the park's own waitingFor kept intact", row.WaitingFor)
+	}
+	assertSessionsInvariants(t, b.build(sessionsInput{Now: t0.Add(4 * time.Second), Running: map[string]process.ProcessState{sessModel: process.StateReady}}))
+}
+
+// A PREFILL older than the old 8 s constant but inside the window keeps
+// displaying DECODE: the window is measured from the last raw DECODE, not
+// from the start of the current phase.
+func TestSessions_DecodeRetentionPrefillOlderThan8sInsideWindow(t *testing.T) {
+	b := newSessionsBuilder(sessionsTestConfig())
+	t0 := time.Date(2026, 9, 18, 12, 0, 0, 0, time.UTC)
+	prefillSlots := map[string][]childSlot{sessModel: {{ID: 0, NCtx: 262144, IsProcessing: true, NPromptTokens: 90000, NPromptTokensProcessed: 10, NDecoded: 0}}}
+	row := retentionPolls(t, b, t0, 12*time.Second, nil, prefillSlots)
+	if row.Phase != "PREFILL" {
+		t.Fatalf("raw phase = %s, want PREFILL", row.Phase)
+	}
+	if row.RequestID == nil || *row.RequestID != "r2" {
+		t.Fatalf("requestID = %v, want r2 (the phase under test is the NEW request's)", row.RequestID)
+	}
+	if row.Display == nil || row.Display.Phase != "DECODE" {
+		t.Fatalf("display = %+v, want DECODE 12 s after the last DECODE (window 30 s)", row.Display)
+	}
+}
+
+// Past the window the display is released: the row shows its raw phase again.
+func TestSessions_DecodeRetentionReleasedPastWindow(t *testing.T) {
+	b := newSessionsBuilder(sessionsTestConfig())
+	t0 := time.Date(2026, 9, 18, 12, 0, 0, 0, time.UTC)
+	parkedSlots := map[string][]childSlot{sessModel: {{ID: 0, NCtx: 262144, IsProcessing: true, NPromptTokens: 90000, NPromptTokensProcessed: 100, NDecoded: 40}}}
+	row := retentionPolls(t, b, t0, 35*time.Second, map[string]string{"park_reason": "lane"}, parkedSlots)
+	if row.Phase != "PARKED" {
+		t.Fatalf("raw phase = %s, want PARKED", row.Phase)
+	}
+	if row.Display != nil {
+		t.Fatalf("display = %+v, want none 35 s after the last DECODE (window 30 s)", row.Display)
+	}
+}
+
+// A penalized row is never retained - neither the scheduler-held row the
+// builder already rewrote to PENALIZED, nor a struck-but-admitted row that
+// still reads PARKED. A penalty is something an operator has to see.
+func TestSessions_DecodeRetentionNeverPenalized(t *testing.T) {
+	t0 := time.Date(2026, 9, 18, 12, 0, 0, 0, time.UTC)
+	clk := t0
+	lt := penaltyTracker(&clk, 0, 900)
+	feedSession(lt, "s1", 6) // strike 2 -> a 900 s hold exists
+
+	for _, tc := range []struct {
+		name  string
+		meta  map[string]string
+		phase string
+	}{
+		{"held by the scheduler", map[string]string{"park_reason": scheduler.ParkPenalized}, "PENALIZED"},
+		{"struck but admitted", map[string]string{"park_reason": "lane"}, "PARKED"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b := newSessionsBuilder(sessionsTestConfig())
+			decodeSlots := map[string][]childSlot{sessModel: {{ID: 0, NCtx: 262144, IsProcessing: true, NPromptTokens: 90000, NPromptTokensProcessed: 100, NDecoded: 40}}}
+			running := map[string]process.ProcessState{sessModel: process.StateReady}
+			if got := b.build(sessionsInput{Now: t0, Running: running, Loops: lt, Requests: []swaputil.InflightRequestEntry{retentionReq("r1", t0.Add(-5*time.Second), nil)}, Slots: decodeSlots}); len(got.Sessions) != 1 || got.Sessions[0].Phase != "DECODE" {
+				t.Fatalf("setup poll: %+v, want one DECODE row", got.Sessions)
+			}
+			at := t0.Add(4 * time.Second)
+			got := b.build(sessionsInput{Now: at, Running: running, Loops: lt, Requests: []swaputil.InflightRequestEntry{retentionReq("r2", at, tc.meta)}, Slots: decodeSlots})
+			row := rowFor(t, got, "s1")
+			if row.Phase != tc.phase {
+				t.Fatalf("raw phase = %s, want %s", row.Phase, tc.phase)
+			}
+			if row.Display != nil {
+				t.Fatalf("display = %+v, want none for a penalized row (%s)", row.Display, tc.name)
+			}
+			assertSessionsInvariants(t, got)
+		})
+	}
+}
+
+// The window is configuration: sessions.decodeRetentionSeconds overrides the
+// default, and 0 turns the retention off entirely.
+func TestSessions_DecodeRetentionConfiguredWindow(t *testing.T) {
+	cfg := sessionsTestConfig()
+	cfg.Sessions.DecodeRetentionSeconds = 4
+
+	b := newSessionsBuilder(cfg)
+	t0 := time.Date(2026, 9, 18, 12, 0, 0, 0, time.UTC)
+	parkedSlots := map[string][]childSlot{sessModel: {{ID: 0, NCtx: 262144, IsProcessing: true, NPromptTokens: 90000, NPromptTokensProcessed: 100, NDecoded: 40}}}
+	row := retentionPolls(t, b, t0, 3*time.Second, map[string]string{"park_reason": "lane"}, parkedSlots)
+	if row.Display == nil || row.Display.Phase != "DECODE" {
+		t.Fatalf("display = %+v, want DECODE inside the configured 4 s window", row.Display)
+	}
+
+	b = newSessionsBuilder(cfg)
+	row = retentionPolls(t, b, t0, 6*time.Second, map[string]string{"park_reason": "lane"}, parkedSlots)
+	if row.Display != nil {
+		t.Fatalf("display = %+v, want none past the configured 4 s window", row.Display)
+	}
+
+	off := sessionsTestConfig()
+	off.Sessions.DecodeRetentionSeconds = 0
+	b = newSessionsBuilder(off)
+	row = retentionPolls(t, b, t0, 2*time.Second, map[string]string{"park_reason": "lane"}, parkedSlots)
+	if row.Display != nil {
+		t.Fatalf("display = %+v, want none with the retention configured off", row.Display)
+	}
 }

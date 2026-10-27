@@ -303,6 +303,8 @@ groups:
 		DebugHistory: DefaultDebugHistoryConfig(),
 		// Seeded when the loopGuard block is absent: the guard defaults ON.
 		LoopGuard: DefaultLoopGuardConfig(),
+		// Seeded when the sessions block is absent; see SessionsConfig.
+		Sessions: DefaultSessionsConfig(),
 		// Seeded by LoadConfigFromReader when the peerStall block is absent;
 		// see Config.PeerStall.
 		PeerStall: PeerStallConfig{

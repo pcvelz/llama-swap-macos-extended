@@ -85,6 +85,9 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 		// The loop guard is on by default (absent block = ON), same
 		// decode-only-overwrites-present-keys rule as the brake above.
 		LoopGuard: DefaultLoopGuardConfig(),
+		// Session-state display defaults likewise seeded when the sessions
+		// block is absent; see SessionsConfig.
+		Sessions: DefaultSessionsConfig(),
 	}
 	if err = node.Decode(&config); err != nil {
 		return Config{}, err
@@ -120,6 +123,9 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 	}
 	if config.ResidentAliasGraceSeconds < 0 {
 		return Config{}, fmt.Errorf("residentAliasGraceSeconds must be >= 0")
+	}
+	if config.Sessions.DecodeRetentionSeconds < 0 {
+		return Config{}, fmt.Errorf("sessions.decodeRetentionSeconds must be >= 0")
 	}
 
 	// WHY reject > 0: the valve is gone, so a positive value would silently

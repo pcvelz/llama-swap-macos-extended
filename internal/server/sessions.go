@@ -45,15 +45,22 @@ const sessionsRateWindow = 30 * time.Second
 // after it stops holding anything.
 const sessionsIdleRetention = 60 * time.Second
 
-// sessionsDecodeRetention is how long a row keeps DISPLAYING DECODE after its
-// last DECODE poll while the raw phase reads PREFILL or IDLE - the short gap
-// between two chained turns of one dispatch, where the row would otherwise
-// flicker DECODE -> IDLE/PREFILL -> DECODE at the 1 Hz poll. The RAW phase is
-// never touched: machine readers (lane governor, liveness monitor, health
-// watch) read `phase` as truth, and the debug history's phase events feed the
-// health watch's turn reconstruction. Display-only, additive to
-// llama-swap.sessions/v1 (2026-10-25 PF-C amendment). Tune this constant if
-// the retention feels too eager or too shy.
+// sessionsDecodeRetention is the FALLBACK window a row keeps DISPLAYING
+// DECODE after its last raw DECODE while the raw phase reads IDLE, PARKED or
+// PREFILL - the gap between two chained turns of one dispatch, where the row
+// would otherwise flicker DECODE -> IDLE/PARKED/PREFILL -> DECODE at the 1 Hz
+// poll. Configuration owns the live value: sessions.decodeRetentionSeconds
+// (default 30 s, 0 = off); this constant is what a builder uses when the
+// config leaves it unset. The window is measured from the LAST RAW DECODE,
+// not from the start of the current phase, because with two sessions sharing
+// one lane the gap is the tool call (IDLE) plus the next turn queued behind
+// the other session (PARKED) plus its prefill, and that whole gap routinely
+// outlasts 8 s. The RAW phase is never touched: machine readers (lane
+// governor, liveness monitor, health watch, the thermal inference signal) read
+// `phase` as truth, and the debug history's phase events feed the health
+// watch's turn reconstruction. Display-only, additive to
+// llama-swap.sessions/v1 (2026-10-25 PF-C amendment; window widened and made
+// configurable 2026-10-27).
 const sessionsDecodeRetention = 8 * time.Second
 
 // sessionsPollTimeout bounds one child /slots read so a stalled child cannot
@@ -328,6 +335,26 @@ func newSessionsBuilder(cfg config.Config) *sessionsBuilder {
 	}
 }
 
+// decodeWindow resolves the display retention for this builder. Three cases,
+// deliberately spelled out:
+//   - a positive sessions.decodeRetentionSeconds is the window;
+//   - an explicit 0 turns the retention off (every row shows its raw phase);
+//   - the field left UNSET (a hand-built config, or a test config with no
+//     sessions block) falls back to the sessionsDecodeRetention constant, so
+//     the display never silently disappears for a caller that never
+//     configured it. LoadConfigFromReader always seeds 30, so a real box
+//     never takes this branch.
+func (b *sessionsBuilder) decodeWindow() time.Duration {
+	switch n := b.cfg.Sessions.DecodeRetentionSeconds; {
+	case n > 0:
+		return time.Duration(n) * time.Second
+	case n < 0:
+		return sessionsDecodeRetention
+	default:
+		return 0
+	}
+}
+
 func (b *sessionsBuilder) alias(model string) string {
 	if mc, ok := b.cfg.Models[model]; ok && len(mc.Aliases) > 0 {
 		return mc.Aliases[0]
@@ -580,16 +607,25 @@ func (b *sessionsBuilder) build(in sessionsInput) sessionsBody {
 	// kept past its own retention would never be touched or deleted again:
 	// one permanent entry per dead session. So age it out on its own clock
 	// ONLY while it is represented in the body; when it is not, drop it with
-	// the rest of the gone-row memory. A live chaining session always has a
-	// row (IDLE retention 60 s >> 8 s), so the survival case is untouched.
+	// the rest of the gone-row memory.
+	//
+	// While the session IS in the body its entry is kept for the window plus
+	// the body's own lifetime, not just the window: a session queued behind
+	// another on one lane can sit PARKED for far longer than the window, and
+	// dropping its entry there would leave the next poll with nothing to
+	// retain even though the row is live. A live entry is refreshed by the
+	// next DECODE (stampPhaseSince) or dropped the moment the session leaves
+	// the body, so this costs one entry per live session, bounded by the
+	// number of rows in the snapshot.
 	bodyHas := map[string]bool{}
 	for _, row := range body.Sessions {
 		if row.SessionID != "" {
 			bodyHas[row.SessionID] = true
 		}
 	}
+	window := b.decodeWindow()
 	for key, at := range b.lastDecode {
-		if !bodyHas[key] || now.Sub(at) >= sessionsDecodeRetention {
+		if !bodyHas[key] || window <= 0 || now.Sub(at) >= window+sessionsIdleRetention {
 			delete(b.lastDecode, key)
 		}
 	}
@@ -875,31 +911,41 @@ func (b *sessionsBuilder) stampPhaseSince(key string, row *sessionEntry, now, ar
 }
 
 // stampDecodeDisplay is the decode retention, display-only. While a session
-// chains short tool turns its row flickers DECODE -> IDLE/PREFILL -> DECODE
-// at the 1 Hz poll; within sessionsDecodeRetention of the last DECODE poll a
-// young PREFILL or IDLE row keeps DISPLAYING DECODE so the menu reads one
-// steady row per chaining session. The raw Phase, every counter, the rate,
-// the slot and PhaseSinceMs are untouched - machine readers (lane governor,
-// liveness monitor, health watch) keep reading `phase` as truth, and the
-// debug history's phase events stay real. A phase that lasts longer than the
-// retention shows as itself from that moment on, so a genuinely idle session
-// or a long prefill still surfaces. PARKED, LOADING, HOT, PENALIZED and
-// DECODE rows are never overridden: real waiting is never hidden.
+// chains tool turns its row flickers DECODE -> IDLE/PARKED/PREFILL -> DECODE
+// at the 1 Hz poll; within the window (decodeWindow, measured from the LAST
+// RAW DECODE rather than from the start of the current phase) an IDLE, PARKED
+// or PREFILL row keeps DISPLAYING DECODE so the menu reads one steady row per
+// chaining session. The window counts from the last DECODE because with two
+// sessions on one lane the gap between turns is the tool call, the wait for
+// the lane, and the next prefill in sequence - bounding each of those
+// separately (the pre-2026-10-27 rule) released the row mid-gap.
+//
+// The raw Phase, every counter, the rate, the slot, waitingFor and
+// PhaseSinceMs are untouched - machine readers (lane governor, liveness
+// monitor, health watch, the thermal inference signal) keep reading `phase`
+// as truth, and the debug history's phase events stay real. Past the window
+// the row shows its raw phase again, so a genuinely idle session or a session
+// stuck in a long prefill still surfaces. LOADING, HOT, DECODE and any
+// PENALIZED row are never overridden: a penalty is state an operator has to
+// see. A PARKED row is read AFTER applyLoopState, so a scheduler-held row
+// already reads PENALIZED here; the row.Penalty check additionally refuses
+// retention for a struck-but-admitted row, which still reads PARKED.
 func (b *sessionsBuilder) stampDecodeDisplay(key string, row *sessionEntry, now time.Time) {
 	if row.SessionID == "" || row.Display != nil {
 		return
 	}
-	if row.Phase != phasePrefill && row.Phase != phaseIdle {
+	window := b.decodeWindow()
+	if window <= 0 {
+		return
+	}
+	if row.Phase != phasePrefill && row.Phase != phaseIdle && row.Phase != phaseParked {
+		return
+	}
+	if row.Penalty != nil {
 		return
 	}
 	last, ok := b.lastDecode[key]
-	if !ok || now.Sub(last) >= sessionsDecodeRetention {
-		return
-	}
-	// The current phase must still be younger than the retention: a phase
-	// that outlasts it is real and shows as itself. Same clock as
-	// PhaseSinceMs (the builder's Now), already stamped by the caller.
-	if row.PhaseSinceMs >= int64(sessionsDecodeRetention.Milliseconds()) {
+	if !ok || now.Sub(last) >= window {
 		return
 	}
 	row.Display = &sessionDisplay{Phase: phaseDecode}
