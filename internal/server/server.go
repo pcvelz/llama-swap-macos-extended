@@ -1,11 +1,14 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -338,6 +341,20 @@ func (s *Server) localPeerHandler(w http.ResponseWriter, r *http.Request) {
 			time.Duration(s.cfg.ResidentAliasGraceSeconds)*time.Second, residentAliasPollInterval); ok {
 			s.proxylog.Debugf("dispatch: resident alias %s -> %s", data.Model, resolved)
 			data.ModelID = resolved
+			// The resolved model's useModelName, which the filter middleware
+			// could not apply to the alias id (residentAliasModelName).
+			body, changed, err := residentAliasModelName(s.cfg, resolved, r.Header.Get("Content-Type"), data.Body)
+			if err != nil {
+				swaputil.SendResponse(w, r, http.StatusInternalServerError, err.Error())
+				return
+			}
+			if changed {
+				r.Body = io.NopCloser(bytes.NewReader(body))
+				r.Header.Del("Transfer-Encoding")
+				r.Header.Set("Content-Length", strconv.Itoa(len(body)))
+				r.ContentLength = int64(len(body))
+				data.Body = body
+			}
 			// An alias that resolved only HERE (nothing was resident when the
 			// affinity middleware ran, e.g. inside the grace window after a
 			// restart) has no resolved_model on its live entry yet, so the menu

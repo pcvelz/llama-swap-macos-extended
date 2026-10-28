@@ -272,6 +272,26 @@ func resolveFilters(cfg config.Config, requested string) (useModelName string, f
 	return "", config.Filters{}, false
 }
 
+// residentAliasModelName returns body with its model field set to the resolved
+// model's useModelName, for a resident-alias request (an id such as
+// claude-haiku-* that dispatch maps to whichever local model is resident).
+// CreateFilterMiddleware ran before that mapping, found no model block for the
+// alias id and applied nothing. stripParams and setParams stay unapplied on
+// purpose (see dispatch), but the name rewrite cannot: an engine that checks
+// the model field (Splash answers 404 model_not_found to any name it does not
+// serve) would refuse every alias turn. changed is false when the model sets
+// no useModelName or the body is not JSON.
+func residentAliasModelName(cfg config.Config, resolved, contentType string, body []byte) (rewritten []byte, changed bool, err error) {
+	useModelName := cfg.Models[resolved].UseModelName
+	if useModelName == "" || len(body) == 0 || !strings.Contains(contentType, "application/json") {
+		return body, false, nil
+	}
+	if rewritten, err = sjson.SetBytes(body, "model", useModelName); err != nil {
+		return nil, false, fmt.Errorf("error rewriting model name in JSON: %w", err)
+	}
+	return rewritten, true, nil
+}
+
 // applyFilters rewrites the JSON body in place. Order matches the legacy
 // ProxyManager: useModelName, stripParams, setParams, then setParamsByID (which
 // can override setParams).

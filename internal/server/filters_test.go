@@ -313,3 +313,46 @@ func TestServer_FormFilterMiddleware(t *testing.T) {
 		t.Errorf("request context = %+v, want original whisper model", gotContext)
 	}
 }
+
+// TestResidentAliasModelName: a resident-alias request (claude-haiku-*) takes
+// the resolved model's useModelName, so an engine that checks the model field
+// (Splash) is sent a name it serves; everything else in the body is left as
+// the client sent it, and a model without useModelName or a non-JSON body is
+// not touched.
+func TestResidentAliasModelName(t *testing.T) {
+	cfg := config.Config{Models: map[string]config.ModelConfig{
+		"cq27": {
+			UseModelName: "Qwen3.8-27B",
+			Filters: config.ModelFilters{Filters: config.Filters{
+				SetParams: map[string]any{"top_p": 0.5},
+			}},
+		},
+		"plain": {},
+	}}
+	body := []byte(`{"model":"claude-haiku-4-5-20251001","max_tokens":5,"id_slot":1}`)
+
+	got, changed, err := residentAliasModelName(cfg, "cq27", "application/json", body)
+	if err != nil || !changed {
+		t.Fatalf("changed=%v err=%v, want a rewrite", changed, err)
+	}
+	if m := gjson.GetBytes(got, "model").String(); m != "Qwen3.8-27B" {
+		t.Errorf("model = %q, want Qwen3.8-27B", m)
+	}
+	if gjson.GetBytes(got, "max_tokens").Int() != 5 || gjson.GetBytes(got, "id_slot").Int() != 1 {
+		t.Errorf("other fields changed: %s", got)
+	}
+	if gjson.GetBytes(got, "top_p").Exists() {
+		t.Errorf("setParams applied to a resident-alias request: %s", got)
+	}
+
+	for _, tc := range []struct{ name, model, contentType string }{
+		{"no useModelName", "plain", "application/json"},
+		{"not JSON", "cq27", "application/x-www-form-urlencoded"},
+		{"unknown model", "gone", "application/json"},
+	} {
+		got, changed, err := residentAliasModelName(cfg, tc.model, tc.contentType, body)
+		if err != nil || changed || !bytes.Equal(got, body) {
+			t.Errorf("%s: changed=%v err=%v body=%s, want untouched", tc.name, changed, err, got)
+		}
+	}
+}
