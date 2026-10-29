@@ -26,6 +26,8 @@ import (
 //   - SetParamsByID per-alias overrides
 //   - image content blocks replaced by a text note for models whose declared
 //     capabilities lack image input (filters_image.go)
+//   - per-request sampling headers folded into the body for models that opted
+//     in via `samplingHeaders: true` (sampling_headers.go)
 //
 // Non-JSON requests (GET, multipart forms) pass through untouched. The buffered
 // body is re-attached with Content-Length / Transfer-Encoding cleanup so the
@@ -71,6 +73,21 @@ func CreateFilterMiddleware(cfg config.Config) chain.Middleware {
 			}
 			if textOnly {
 				body, err = replaceImageBlocks(body, data.Model)
+				if err != nil {
+					swaputil.SendResponse(w, r, http.StatusInternalServerError, err.Error())
+					return
+				}
+			}
+
+			// Sampling headers (X-Temperature and friends) fold into the body
+			// for opted-in models only, on the three completion endpoints.
+			// Runs after the configured filters so a per-request header wins
+			// over a static setParams default, and before the body is
+			// re-attached so Content-Length follows the final bytes. A header
+			// never fails a request: an unparsable or out-of-range value is
+			// ignored here.
+			if samplingEndpoints[r.URL.Path] {
+				body, err = applySamplingHeadersForModel(cfg, data.Model, r.Header, body)
 				if err != nil {
 					swaputil.SendResponse(w, r, http.StatusInternalServerError, err.Error())
 					return
