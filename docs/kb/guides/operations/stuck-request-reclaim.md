@@ -3,8 +3,8 @@ title: Reclaiming slots from stuck requests
 summary: How peerStall, slotStall and prefillStall free a serving slot held by a frozen client, a wedged stream or a prefill that stopped moving.
 category: guides
 tags: [stall, reclaim, slots, prefill, llama-server]
-config_keys: [peerStall, slotStall, prefillStall]
-updated: 2026-09-25
+config_keys: [peerStall, slotStall, prefillStall, models.*.slotsEndpoint]
+updated: 2026-10-21
 ---
 # Reclaiming slots from stuck requests
 
@@ -54,3 +54,21 @@ prefillStall:
 
 The poller only runs while a request holds a slot on that model, so an idle
 model is never polled.
+
+## A child without a /slots endpoint
+
+`prefillStall` needs the child's `/slots`. An engine that answers 404 there has
+no counter to read, and the 1 Hz session poll would draw a failed request a
+second from it. Declare it per model:
+
+```yaml
+models:
+  my-model:
+    slotsEndpoint: false
+```
+
+For that model nothing reads `/slots`: the session poll skips it, `prefillStall`
+never starts (no verdict, no restart), `GET /api/slots` lists it with no slots and
+no error, and slot affinity and slot binding are off even when `slotAffinity` is
+true. `peerStall` and `slotStall` do not use `/slots` and keep working. Default
+`true`.

@@ -731,6 +731,11 @@
                         "default": 1,
                         "description": "Only with a routing.scheduler.settings.fifo.kvPoolTokens budget for this model. At most this many large requests (estimated >= 8192 tokens) of the model are forwarded at once; a further large request waits in the queue even if the pool would fit it. Small requests are not counted. 1 serializes large requests. 0, or a value >= concurrencyLimit, sets no separate cap. concurrencyLimit stays the outer cap on all requests and the kvPoolTokens check still applies."
                     },
+                    "slotsEndpoint": {
+                        "type": "boolean",
+                        "default": true,
+                        "description": "false declares that the model's child has no llama.cpp style GET /slots endpoint. Nothing reads /slots for the model (no 1 Hz session poll, no prefillStall watcher, no fetch for GET /api/slots) and slot affinity and slot binding are off even when slotAffinity is true. Requests are still served, queued and preempted as usual."
+                    },
                     "sendLoadingState": {
                         "type": "boolean",
                         "description": "Overrides the global sendLoadingState for this model. Ommitting this property will use the global setting."

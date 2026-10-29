@@ -26,6 +26,21 @@ package router
 // promised"). A flat counter is zero progress, which is the one failure the
 // ruling names.
 //
+// NOT STARTED IS NOT FLAT. A task that has never reported processed > 0 has
+// not demonstrably started: on a single-lane child (Splash, queue_size 1) a
+// request that has merely been ACCEPTED sits queued behind the lane with
+// processed = 0, and its /status phase says "queued" while a shim translates
+// it into a slot row. Under the flat-counter rule alone such a wait - which
+// can outlast any budget - reads as a frozen prefill at 0 and gets cut, every
+// retry re-sending a larger prompt to be cut again (llama-cm incident
+// 2026-10-22-prefill-stall-cuts-queued-splash-request). So the budget starts
+// counting for a task only after at least one successful sample showed it
+// moving (processed > 0); until then the slot is watched but never a stall
+// candidate, and a change of task id resets the span. The shim itself no
+// longer reports an unstarted request as processing (splash-serve.py), which
+// keeps this guard honest even for a child whose /slots cannot say; this file
+// is the defence in depth.
+//
 // THE /slots TRAP (peerstall.go header): /slots is answered from the child's
 // task queue, so a loaded child may not answer in time. Here a failed or slow
 // poll is NO EVIDENCE - it neither advances nor resets anything - and a verdict
@@ -275,6 +290,13 @@ func (w *prefillWatch) observe(tracks map[int]*slotTrack, slots []upstreamSlot, 
 	}
 
 	for id, tr := range tracks {
+		// Not started is not flat: a task that has never reported processed > 0
+		// may be merely queued on a single-lane child, and its wait can outlast
+		// any budget. The span is kept (so the moment it starts moving the
+		// clock already runs), but it is no stall candidate until it moves.
+		if tr.processed <= 0 {
+			continue
+		}
 		flat := tr.lastSeen.Sub(tr.since)
 		if flat < w.budget {
 			continue
@@ -313,11 +335,16 @@ func (w *prefillWatch) otherSlotAdvancing(tracks map[int]*slotTrack, id int, now
 }
 
 // prefillWatchFor returns model's watcher, creating it on first use, or nil
-// (a no-op watcher) when the guard is disabled or the model has no resolvable
-// proxy URL.
+// (a no-op watcher) when the guard is disabled, the model has no resolvable
+// proxy URL, or the model is declared slotsEndpoint: false. The verdict reads
+// the child's /slots counter and nothing else, so for a child without one the
+// guard fails open: no poll, no verdict, no restart backstop.
 func (b *baseRouter) prefillWatchFor(model string) *prefillWatch {
 	budget := b.config.PrefillStall.StallTimeout()
 	if budget <= 0 {
+		return nil
+	}
+	if mc, ok := b.config.Models[model]; ok && !mc.HasSlotsEndpoint() {
 		return nil
 	}
 	b.prefillMu.Lock()

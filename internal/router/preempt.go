@@ -30,6 +30,12 @@ import (
 // rather than returning this response. A request that already streamed
 // anything never reaches this branch again (wroteHeader is already true), so
 // it keeps the v1 abort-in-place behavior unchanged, exactly as before.
+//
+// v3: a stream whose headers are already out can still be replayed while the
+// client holds nothing but admission traffic (comments, pings, a message_start;
+// see pingWriter.replaySafe). The attempt's cancel then produces writes of its
+// own (the proxy's terminal error event); Write discards them for a replayable
+// attempt so the client never sees the cut.
 type preemptResponseWriter struct {
 	http.ResponseWriter
 	preempted *atomic.Bool
@@ -39,8 +45,16 @@ type preemptResponseWriter struct {
 	// exhausted — see base.go maxReplays/maxReplayHeld) — the writer then
 	// falls back to the v1 cancel+503 exactly as before.
 	replayWanted *atomic.Bool
-	wroteHeader  bool
+	// gate, when the wrapped writer can tell (the pingWriter on the Anthropic
+	// stream path), says whether the client has been sent nothing a replay
+	// would repeat or contradict. See Write.
+	gate        replayGate
+	wroteHeader bool
 }
+
+// replayGate is implemented by the pingWriter: replaySafe reports that the
+// client holds nothing but admission traffic, on an event boundary.
+type replayGate interface{ replaySafe() bool }
 
 // newPreemptResponseWriter wraps w only when preempted is a real flag (a nil
 // *atomic.Bool means this request was granted without tiered-queue
@@ -51,7 +65,9 @@ func newPreemptResponseWriter(w http.ResponseWriter, preempted *atomic.Bool, rep
 	if preempted == nil {
 		return w
 	}
-	return &preemptResponseWriter{ResponseWriter: w, preempted: preempted, replayWanted: replayWanted}
+	p := &preemptResponseWriter{ResponseWriter: w, preempted: preempted, replayWanted: replayWanted}
+	p.gate, _ = w.(replayGate)
+	return p
 }
 
 // writePreemptGiveUp writes the canonical "llama-swap gave up on this request"
@@ -122,6 +138,17 @@ func (p *preemptResponseWriter) Write(b []byte) (int, error) {
 		// discard any trailing body the upstream still tries to flush (e.g.
 		// a reverse proxy writing an error body right after WriteHeader) so
 		// this attempt truly reaches the client as nothing at all.
+		return len(b), nil
+	}
+	// A booted request does not go quiet. The reverse proxy reports the abort
+	// of a stream whose headers are out as a terminal SSE error event
+	// (internal/process, the recovered http.ErrAbortHandler), and bytes that
+	// were already in flight can still arrive after the cancel. When the
+	// attempt is going to be replayed the client must read the replayed
+	// attempt as the continuation of the stream it already holds, so none of
+	// that may reach it. A stream that already carried content is not replayed
+	// (gate says no), and its terminal event goes out as it always did.
+	if p.preempted.Load() && p.replayWanted != nil && p.gate != nil && p.gate.replaySafe() {
 		return len(b), nil
 	}
 	return p.ResponseWriter.Write(b)

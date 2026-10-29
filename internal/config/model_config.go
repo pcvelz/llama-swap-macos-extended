@@ -165,6 +165,19 @@ type ModelConfig struct {
 	// with a kvPoolTokens budget.
 	MaxParallelLargePrefill int `yaml:"maxParallelLargePrefill"`
 
+	// SlotsEndpoint, when explicitly false, declares that this model's child
+	// has no llama.cpp style GET /slots endpoint (an engine that answers 404).
+	// Everything llama-swap derives from that endpoint is then switched off for
+	// the model and fails open: no 1 Hz session poll, no prefill-stall watcher,
+	// no slot lookup for GET /api/slots, and no slot affinity or slot binding
+	// (they pin sessions to llama.cpp slot ids the child neither reports nor
+	// accepts). Requests are still served, queued and preempted as usual.
+	// Unset or true keeps today's behavior.
+	//
+	// A pointer so a ModelConfig built in code, not decoded from yaml, keeps
+	// the default: use HasSlotsEndpoint, never the field.
+	SlotsEndpoint *bool `yaml:"slotsEndpoint"`
+
 	// SlotGraceSeconds is REMOVED (2026-10-18). The slot cooldown has ONE
 	// duration, the model's swapGraceSeconds, at model and slot level alike
 	// (llama-cm docs/intent/cooldown.md). The field is kept ONLY so an old yaml
@@ -222,6 +235,12 @@ func (m *ModelConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
 
 func (m *ModelConfig) SanitizedCommand() ([]string, error) {
 	return SanitizeCommand(m.Cmd)
+}
+
+// HasSlotsEndpoint reports whether this model's child serves a llama.cpp style
+// GET /slots (the slotsEndpoint key). True unless the key is explicitly false.
+func (m ModelConfig) HasSlotsEndpoint() bool {
+	return m.SlotsEndpoint == nil || *m.SlotsEndpoint
 }
 
 // ModelFilters embeds Filters and adds legacy support for strip_params field

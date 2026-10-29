@@ -146,6 +146,11 @@ type baseRouter struct {
 	// upstream before its holder counts as a phantom.
 	slots            *slotTable
 	slotPhantomAfter time.Duration
+
+	// cuts records when a request on each model was last cut, so that a
+	// refusal from the child that follows is read as the cut request's shadow
+	// and held rather than delivered (refusalhold.go).
+	cuts cutStamps
 }
 
 func newBaseRouter(
@@ -200,6 +205,17 @@ func newBaseRouter(
 	// because its session did not come back has no event of its own either.
 	for _, pool := range conf.Routing.Scheduler.Settings.Fifo.KVPoolTokens {
 		if pool > 0 {
+			b.graceTick = time.Second
+			break
+		}
+	}
+	// A TTL-unloaded model with parked work behind it generates NO scheduler
+	// event: the per-process TTL goroutine stops the child directly
+	// (process_command.go), bypassing unloadCh/OnUnload, so nothing re-walks
+	// the queue for an unloaded model on an idle box. The tick is the only
+	// periodic walk left, so arm it whenever any model can idle-unload.
+	for _, mc := range conf.Models {
+		if mc.UnloadAfter > 0 {
 			b.graceTick = time.Second
 			break
 		}
@@ -563,7 +579,17 @@ func (b *baseRouter) trackedServe(modelID string, p process.Process, estimatedTo
 		// orphan: this request was cut while the upstream kept its slot
 		// busy; its cap place is held until the slot reads idle.
 		var orphan <-chan struct{}
+		// holdsSlot: this request occupies a serving slot on the child, as
+		// opposed to a status read or a count_tokens call.
+		holdsSlot := !statusRead && !isSlotFreeRequest(r)
 		defer func() {
+			// A request cut while it held a slot (a preemption, a stall reclaim,
+			// a client that hung up) may still sit in the child's queue after
+			// this returns; the refusal hold reads a refusal that follows as its
+			// shadow (refusalhold.go).
+			if holdsSlot && r.Context().Err() != nil {
+				b.cuts.note(modelID)
+			}
 			// Read the loop verdict HERE, not at grant time: it is a property
 			// of the session's history as of this completion (see
 			// swaputil.LoopVerdict). Absent verdict = productive, which is the
@@ -581,7 +607,7 @@ func (b *baseRouter) trackedServe(modelID string, p process.Process, estimatedTo
 			}
 			go b.sendServeDoneWhenSlotIdle(ev, orphan)
 		}()
-		if !statusRead && !isSlotFreeRequest(r) {
+		if holdsSlot {
 			release := func() {
 				if capReleased.CompareAndSwap(false, true) {
 					b.logger.Warnf("%s: phantom holder on %s: its upstream slot read idle for %s while it was still being served; cap place released", b.name, modelID, b.slotPhantomAfter)
@@ -593,8 +619,96 @@ func (b *baseRouter) trackedServe(modelID string, p process.Process, estimatedTo
 				defer func() { orphan = b.slots.unbind(modelID, h, r.Context().Err() != nil) }()
 			}
 		}
-		p.ServeHTTP(newPreemptResponseWriter(w, preempted, replayWanted), r)
+		b.forward(modelID, p, w, r, preempted, replayWanted, holdsSlot)
 	}
+}
+
+// forward sends r to the child under the grant the caller holds, and forwards it
+// again under the same grant while the child answers with a refusal that is the
+// shadow of a request this router cut (refusalhold.go has the why).
+//
+// A refusal is withheld only when nothing of the attempt has reached the client,
+// which is what refusalWriter guarantees: the status, headers and body of a
+// withheld attempt are dropped, and the client-facing header map is put back as
+// it was. Every other answer, and any refusal once the budget is spent, goes
+// through exactly as before.
+func (b *baseRouter) forward(modelID string, p process.Process, w http.ResponseWriter, r *http.Request, preempted, replayWanted *atomic.Bool, holdsSlot bool) {
+	var (
+		first    time.Time // when this grant was first refused
+		refusals int
+		spent    bool // the budget is used up, or the request is going away
+	)
+	for {
+		out := newPreemptResponseWriter(w, preempted, replayWanted)
+		var rw *refusalWriter
+		if holdsSlot && !spent && b.refusalHoldArmed(modelID, r, first) {
+			rw = newRefusalWriter(out)
+			out = rw
+		}
+		p.ServeHTTP(out, r)
+		if rw == nil || !rw.refused() {
+			switch {
+			case refusals == 0:
+			case spent:
+				b.logger.Warnf("refusal-hold: model=%s hold over after %d refusals in %.1fs; the answer went to the client as the child gave it",
+					modelID, refusals, time.Since(first).Seconds())
+			default:
+				b.logger.Infof("refusal-hold: model=%s the child took the request after %d refusals in %.1fs",
+					modelID, refusals, time.Since(first).Seconds())
+			}
+			return
+		}
+
+		refusals++
+		if first.IsZero() {
+			first = time.Now()
+			since, _ := b.cuts.since(modelID)
+			b.logger.Infof("refusal-hold: model=%s status=%d %.1fs after a request on it was cut: the child still holds the cut request, so this refusal is held and the request is sent again under the same grant (up to %s)",
+				modelID, rw.status, since.Seconds(), refusalRetryBudget)
+		}
+		timer := time.NewTimer(refusalWait(rw.retryAfter))
+		select {
+		case <-timer.C:
+		case <-r.Context().Done():
+			// Cut (a preemption, a client that left): one more pass lets the
+			// cancelled context come out of the reverse proxy through the usual
+			// handlers, unwithheld, which is how a preempted attempt learns to
+			// replay.
+			timer.Stop()
+			spent = true
+		case <-b.shutdownCtx.Done():
+			timer.Stop()
+			spent = true
+		}
+		if time.Since(first) >= refusalRetryBudget {
+			spent = true
+		}
+		// The next try sends the same bytes the first did.
+		if r.GetBody != nil {
+			body, err := r.GetBody()
+			if err != nil {
+				spent = true
+			} else {
+				r.Body = body
+			}
+		}
+	}
+}
+
+// refusalHoldArmed reports whether a refusal of this attempt may be held: a
+// retry is possible (the body can be sent again), and the refusal is plausibly
+// the shadow of a cut request, either because this grant is already in a hold
+// that has budget left (first is set) or because a request on the model was cut
+// within cutLingerWindow.
+func (b *baseRouter) refusalHoldArmed(modelID string, r *http.Request, first time.Time) bool {
+	if r.Body != nil && r.Body != http.NoBody && r.GetBody == nil {
+		return false
+	}
+	if !first.IsZero() {
+		return time.Since(first) < refusalRetryBudget
+	}
+	since, cut := b.cuts.since(modelID)
+	return cut && since < cutLingerWindow
 }
 
 // penaltyGateOf lifts the loop guard's admission gate off r's context, or nil
@@ -1174,6 +1288,14 @@ func (b *baseRouter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 			// see origBody above.
 			attemptReq.Body = io.NopCloser(bytes.NewReader(origBody))
 		}
+		// GetBody lets baseRouter.forward send these bytes again under the same
+		// grant when the child refuses the request while it still holds one this
+		// router cut (refusalhold.go).
+		if origBody != nil {
+			attemptReq.GetBody = func() (io.ReadCloser, error) {
+				return io.NopCloser(bytes.NewReader(origBody)), nil
+			}
+		}
 
 		// replayEligible: this attempt may transparently retry instead of
 		// 503ing the client if it is preempted before producing any body
@@ -1256,6 +1378,9 @@ func (b *baseRouter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 			Preempted:    preempted,
 			ReplayWanted: replayWanted,
 			Preempt: func() {
+				// Stamped before the cancel, so it is already on record when the
+				// arrival this makes room for is granted and forwarded.
+				b.cuts.note(data.ModelID)
 				preempted.Store(true)
 				reqCancel()
 			},
@@ -1492,21 +1617,32 @@ func (b *baseRouter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		// cancelled stream would simply end. On the Anthropic streaming path
 		// the client has still seen nothing but headers, comments and pings
 		// until the first content byte, so that stream is just as replayable.
-		if replayWanted != nil && !replayWanted.Load() && preempted.Load() && pw != nil && pw.preFirstToken() {
+		//
+		// "Nothing but admission traffic" is pingWriter.replaySafe: SSE
+		// comments, ping events and ONE message_start, on an event boundary.
+		// An engine that speaks the Anthropic stream natively sends the pings
+		// and the message_start when it admits the request, minutes before
+		// its first token, and the replayed attempt's own message_start is
+		// discarded by the pingWriter (sseadmission.go) so the client keeps
+		// reading one message. The cancel's own writes (the proxy's terminal
+		// error event) were already discarded by preemptResponseWriter.Write.
+		if replayWanted != nil && !replayWanted.Load() && preempted.Load() && pw != nil && pw.replaySafe() {
 			replayWanted.Store(true)
 		}
 		if replayWanted != nil && replayWanted.Load() {
 			// GUARD on the pinger/replay interaction. Replaying is safe while
-			// the client has read nothing but a status line, SSE comments and
-			// ping events: pingWriter never commits a second status line, so
-			// the next attempt's headers are absorbed and its body is the only
-			// content the client ever reads (the same shape as a request that
-			// was pinged while parked and then served). It is NOT safe once
-			// upstream content reached the client - a replay would hand it a
-			// second message on a stream it is already reading. End that
+			// the client has read nothing but a status line, SSE comments,
+			// ping events and a message_start: pingWriter never commits a
+			// second status line, so the next attempt's headers are absorbed
+			// and its body is the only content the client ever reads (the same
+			// shape as a request that was pinged while parked and then served).
+			// It is NOT safe once upstream content reached the client - a
+			// replay would hand it a second message on a stream it is already
+			// reading - and a priority arrival keeps the right to cut such a
+			// stream (llama-cm docs/intent/llama-swap-backend.md). End that
 			// stream the way a committed stream must be ended - as an SSE
 			// error event (pingWriter.WriteHeader maps it) - instead.
-			if pw != nil && !pw.preFirstToken() {
+			if pw != nil && !pw.replaySafe() {
 				b.logger.Warnf("preempt-replay: tier=%s model=%s attempt=%d suppressed - upstream content already reached the client",
 					data.Tier.Name, data.ModelID, attempt)
 				w.WriteHeader(http.StatusServiceUnavailable)

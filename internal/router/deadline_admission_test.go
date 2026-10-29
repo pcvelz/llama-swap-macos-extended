@@ -468,6 +468,13 @@ func TestBaseRouter_PriorityPreemptedDefaultSession_Replays(t *testing.T) {
 // request whose upstream content already reached the client must NOT be
 // replayed - that would hand it a second message on a stream it is already
 // reading. The model is entered exactly once for this caller.
+//
+// "Content" is the first frame that belongs to the message itself. A
+// message_start alone is admission traffic (an engine that speaks the Anthropic
+// stream natively sends it when it admits the request, before the prompt is
+// processed), and a stream that has carried only that IS replayed: see
+// admission_replay_test.go. The victim here has also streamed its first
+// content block.
 func TestBaseRouter_ContentStreamedRequest_NeverReplays(t *testing.T) {
 	shortenPingCadence(t, 30*time.Millisecond)
 
@@ -478,7 +485,7 @@ func TestBaseRouter_ContentStreamedRequest_NeverReplays(t *testing.T) {
 		if r.Header.Get("X-Role") == "victim" {
 			victimCalls.Add(1)
 			w.WriteHeader(http.StatusOK)
-			fmt.Fprint(w, "event: message_start\ndata: {}\n\n")
+			fmt.Fprint(w, "event: message_start\ndata: {}\n\nevent: content_block_start\ndata: {}\n\n")
 			if f, ok := w.(http.Flusher); ok {
 				f.Flush()
 			}
@@ -492,7 +499,7 @@ func TestBaseRouter_ContentStreamedRequest_NeverReplays(t *testing.T) {
 
 	priority := swaputil.Tier{Name: "priority", Rank: 10, Preempts: true}
 	runPreemptedVictim(t, proc, replayTierDefault, priority,
-		func(b string) bool { return strings.Contains(b, "message_start") })
+		func(b string) bool { return strings.Contains(b, "content_block_start") })
 
 	if got := victimCalls.Load(); got != 1 {
 		t.Fatalf("victim entered the model %d times, want exactly 1 - a stream that already carried content must never replay", got)

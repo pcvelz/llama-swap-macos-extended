@@ -275,7 +275,10 @@ func (s *Server) handleAPISlots(w http.ResponseWriter, r *http.Request) {
 			State: string(state),
 			Slots: []apiSlot{},
 		}
-		if mc.ConcurrencyLimit > 0 && state == process.StateReady {
+		// A model declared slotsEndpoint: false has no /slots to read: it is
+		// listed with no slots and no error, the same "geometry unknown" answer
+		// as a model without a concurrencyLimit.
+		if mc.ConcurrencyLimit > 0 && mc.HasSlotsEndpoint() && state == process.StateReady {
 			body, err := fetchUpstreamSlots(s.cfg, id)
 			if err != nil {
 				ms.Error = err.Error()

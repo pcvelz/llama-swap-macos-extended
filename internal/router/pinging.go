@@ -134,8 +134,35 @@ type pingWriter struct {
 	// byte-based verdicts keep their accounting (it is what currently keeps
 	// pingZeroBudget off a legitimately long prefill); only the prefill-stall
 	// verdict (prefillstall.go) reads this, to tell "still prefilling" from
-	// "streaming tokens".
+	// "streaming tokens". A message_start counts as content here on purpose:
+	// llama-server emits it together with the first token.
 	wroteContent bool
+
+	// pastAdmission: upstream wrote a frame that belongs to the message itself,
+	// i.e. anything but SSE comments, ping events and the message_start event
+	// (sseadmission.go). It is the replay verdict, and deliberately NOT the same
+	// as wroteContent: an engine that speaks the Anthropic stream natively
+	// sends ping and message_start the moment it admits a request, minutes
+	// before the first token, and a client that has read only those frames
+	// still holds an empty message that a replayed attempt can continue.
+	pastAdmission bool
+	// msgStartSent: a message_start frame has been forwarded to the client. The
+	// message_start of any replayed attempt is then discarded (scan.filter), so
+	// the stream the client reads carries exactly one, and it is the FIRST
+	// attempt's: the client keeps that message id for the whole stream.
+	//
+	// WHY dropping the second is the harmless choice: the id names the message
+	// the client started, and nothing later in the stream refers to it (the
+	// content blocks, message_delta and message_stop carry no id), so the
+	// replayed attempt's content continues the message the client already
+	// holds. Delivering the second message_start instead would name a message
+	// the client never started, and Anthropic stream parsers reject two of them
+	// in one stream. The one thing that differs is accounting: the client's
+	// input token count is the first attempt's.
+	msgStartSent bool
+	// scan classifies the upstream bytes of the attempt in flight; it is reset
+	// by every WriteHeader, which is how a new attempt announces itself.
+	scan admissionScan
 
 	// slotStart is the moment the scheduler granted this request a serving
 	// slot, or the zero time while it is still parked in the queue. It is the
@@ -419,6 +446,13 @@ func (pw *pingWriter) tryPing() (time.Duration, bool) {
 // Write forwards upstream body bytes and records the write time plus the
 // trailing bytes, so the pinger can measure the silence gap and never inject
 // a ping mid-event.
+//
+// Until the first frame that belongs to the message itself (pastAdmission) the
+// bytes are also read frame by frame (sseadmission.go). Normally that changes
+// nothing: the bytes are forwarded exactly as they came. On a replayed attempt
+// whose client already holds a message_start, the attempt's own message_start
+// frame is withheld and dropped, and the caller is still told that every byte
+// was consumed.
 func (pw *pingWriter) Write(p []byte) (int, error) {
 	pw.mu.Lock()
 	pw.wroteBody = true
@@ -426,15 +460,32 @@ func (pw *pingWriter) Write(p []byte) (int, error) {
 	if !pw.wroteContent && !isSSECommentOnly(p) {
 		pw.wroteContent = true
 	}
+	out := p
+	if !pw.pastAdmission {
+		var res admissionResult
+		out, res = pw.scan.feed(p)
+		if res.content {
+			pw.pastAdmission = true
+		}
+		if res.msgStart {
+			pw.msgStartSent = true
+		}
+		if res.dropped {
+			pw.logger.Debugf("<%s> replayed attempt: dropped its message_start, the client already holds one", pw.model)
+		}
+	}
 	// WHY reset the gap threshold: fresh upstream bytes already fed the
 	// client's watchdog, so the next ping is due a full quiet delay later.
 	pw.pingedThisGap = false
-	if len(p) >= 2 {
-		pw.tail = string(p[len(p)-2:])
+	// The tail describes what the CLIENT has been sent, so it follows the
+	// forwarded bytes: a withheld message_start leaves it at the boundary the
+	// previous frame ended on.
+	if len(out) >= 2 {
+		pw.tail = string(out[len(out)-2:])
 	} else {
 		// Short writes (e.g. a single byte) append to the previous tail so
 		// boundary detection still sees the true last two bytes.
-		pw.tail = (pw.tail + string(p))
+		pw.tail = (pw.tail + string(out))
 		if len(pw.tail) > 2 {
 			pw.tail = pw.tail[len(pw.tail)-2:]
 		}
@@ -446,29 +497,46 @@ func (pw *pingWriter) Write(p []byte) (int, error) {
 		// swallow the raw error body that follows a mapped WriteHeader.
 		return len(p), nil
 	}
+	if len(out) == 0 {
+		return len(p), nil
+	}
 	// The body copy is where a frozen peer actually shows up: token deltas fill
 	// the socket buffer in seconds, whereas 40-byte pings would take an hour to
 	// do it. Guarding this write is what makes the reclaim timely.
-	return pw.stall.write(pw.writer, func() (int, error) { return pw.writer.Write(p) })
+	n, err := pw.stall.write(pw.writer, func() (int, error) { return pw.writer.Write(out) })
+	if err == nil && n == len(out) {
+		n = len(p)
+	}
+	return n, err
 }
 
 // WriteHeader forwards the upstream status line. It never disarms pinging:
 // llama-server commits 200 + SSE headers at request accept, minutes before
 // the first body byte, and headers alone do not feed client body timeouts.
+//
+// Every upstream response starts here, so this is also where the frame scan
+// begins anew. A replayed attempt starts a fresh response while the client's
+// stream carries on, and whatever frame the cut attempt left half-read must not
+// leak into it. A client that already holds a message_start gets the filtering
+// scan, which discards the replayed attempt's own.
 func (pw *pingWriter) WriteHeader(code int) {
 	pw.mu.Lock()
 	defer pw.mu.Unlock()
-	if !pw.pingsStarted {
+	pw.scan.reset(pw.msgStartSent)
+	if !pw.pingsStarted && !pw.headersSent {
 		// WHY: pass the real status through (pings commit their own 200 only
 		// when they win the race); remember it so tryPing never double-commits.
-		if !pw.headersSent {
-			pw.writer.WriteHeader(code)
-			pw.headersSent = true
-		}
+		pw.writer.WriteHeader(code)
+		pw.headersSent = true
 		return
 	}
-	// Status line already committed as 200 for the ping stream: map late
-	// failures to an Anthropic SSE error event the client can parse and retry.
+	// Status line already committed: by the pinger as a 200 for the ping
+	// stream, or by an earlier attempt's upstream (a replayed request answers
+	// with a status line of its own on a stream whose status the client has
+	// long read). Either way a later failure cannot be a status any more and
+	// its body is not an event: map it to an Anthropic SSE error event the
+	// client can parse and retry. Left alone, the body of a 503 from a busy
+	// engine was written into the stream as a line that is not a frame.
 	if code >= http.StatusBadRequest && !pw.errored {
 		pw.errored = true
 		fmt.Fprintf(pw.writer,
@@ -505,11 +573,26 @@ func isSSECommentOnly(p []byte) bool {
 }
 
 // preFirstToken reports whether upstream has written nothing but SSE
-// comments so far, i.e. the request is still in (or queued before) prefill.
+// comments so far, i.e. the request is still in (or queued before) prefill. A
+// message_start is a token for this purpose (llama-server sends it with the
+// first one); see replaySafe for the question a replay asks.
 func (pw *pingWriter) preFirstToken() bool {
 	pw.mu.Lock()
 	defer pw.mu.Unlock()
 	return !pw.wroteContent
+}
+
+// replaySafe reports whether cutting the attempt in flight can be hidden from
+// the client by replaying it: nothing that belongs to the message itself has
+// reached the client (pastAdmission), and what it has read ends on an event
+// boundary, so the replayed attempt's bytes start a fresh frame instead of
+// finishing half of one. The ping events and the message_start of an engine
+// that admits a request before processing its prompt do not count against it
+// (sseadmission.go).
+func (pw *pingWriter) replaySafe() bool {
+	pw.mu.Lock()
+	defer pw.mu.Unlock()
+	return !pw.pastAdmission && (pw.tail == "" || pw.tail == "\n\n")
 }
 
 // prefillStallCut ends a request whose upstream prefill counter went flat for

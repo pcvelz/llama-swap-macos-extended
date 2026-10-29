@@ -272,12 +272,15 @@ func (s *slotAffinityStore) Close() {
 }
 
 // enabled reports whether modelID (a real model id, not an alias) opted in.
+// A model declared slotsEndpoint: false never is: its child reports no slot
+// ids and takes no id_slot, so there is nothing to learn or to pin, and the
+// middleware passes its requests through untouched.
 func (s *slotAffinityStore) enabled(modelID string) bool {
 	if s == nil {
 		return false
 	}
 	mc, ok := s.cfg.Models[modelID]
-	return ok && mc.SlotAffinity
+	return ok && mc.SlotAffinity && mc.HasSlotsEndpoint()
 }
 
 // learn remembers slot for (modelID, sessionID). A no-op for models that did

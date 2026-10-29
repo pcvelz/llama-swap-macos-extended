@@ -1093,6 +1093,13 @@ func (h *sessionsHub) pollSlots(running map[string]process.ProcessState) map[str
 		if st != process.StateReady {
 			continue
 		}
+		// slotsEndpoint: false - the child has no /slots, so a poll would only
+		// draw a 404 every second. No reading is folded, kept over or passed to
+		// the router's slot table for it; its rows are built from the in-flight
+		// entries alone.
+		if mc, ok := h.s.cfg.Models[id]; ok && !mc.HasSlotsEndpoint() {
+			continue
+		}
 		url := childProxyURL(h.s.cfg, id)
 		if url == "" {
 			continue

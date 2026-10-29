@@ -181,6 +181,38 @@ func TestPrefillStall_FrozenPrefillIsReclaimed(t *testing.T) {
 	}
 }
 
+// TestPrefillStall_NeverStartedIsNotFlat pins the queued-request misread (the
+// single-lane child that reports an ACCEPTED request as a processing slot with
+// processed = 0): a task that has never reported processed > 0 has not
+// demonstrably started, so its wait - however long - is not a stall. The same
+// harness proves the other half still holds: once the task shows it moved
+// (processed > 0) and then freezes flat for the budget, it IS cut.
+func TestPrefillStall_NeverStartedIsNotFlat(t *testing.T) {
+	const budget = 200 * time.Millisecond
+	stub := newSlotsStub(t, "["+slotJSON(1, stuckTask, true, stuckPrompt, 0, 0)+"]")
+	h := newPrefillHarness(t, stub, budget, 0)
+
+	// Phase one: the slot reports processing with nothing processed, across
+	// many budgets. A queued request on a single-lane child reads exactly
+	// like this while it waits for its turn.
+	end := time.Now().Add(6 * budget)
+	for time.Now().Before(end) {
+		h.upstreamPing(t)
+		time.Sleep(30 * time.Millisecond)
+	}
+	if wasCancelled(h.cancelled, 0) {
+		t.Fatal("a task that never reported processed > 0 was cut - a queue wait is not a frozen prefill")
+	}
+
+	// Phase two: the same task starts moving and then freezes flat at 5000.
+	// It has now demonstrably started, and a flat counter after that is zero
+	// progress - the verdict must fire.
+	stub.set(frozenSlots(5000))
+	if !wasCancelled(h.cancelled, 2*time.Second) {
+		t.Fatal("a task that reached processed > 0 and then froze was never reclaimed")
+	}
+}
+
 // TestPrefillStall_SlowButAdvancingPrefillSurvives is the ruling's other half:
 // a prefill that advances even one token per sample is slow, not stuck, and
 // runs untouched for many budgets.

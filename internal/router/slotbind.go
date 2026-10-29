@@ -245,10 +245,11 @@ func (b *baseRouter) sendServeDoneWhenSlotIdle(ev scheduler.ServeDoneEvent, idle
 
 // bindSlot binds r (a granted request for modelID) to a slot of its own and
 // rewrites its id_slot to that slot. nil when modelID does not use slot
-// binding or r is not a JSON body.
+// binding (including a model declared slotsEndpoint: false, whose child has no
+// slots to bind) or r is not a JSON body.
 func (b *baseRouter) bindSlot(modelID string, r *http.Request, release func()) *slotHolder {
 	mc, ok := b.config.Models[modelID]
-	if !ok || !mc.SlotAffinity || mc.ConcurrencyLimit <= 1 || r.Method != http.MethodPost ||
+	if !ok || !mc.SlotAffinity || !mc.HasSlotsEndpoint() || mc.ConcurrencyLimit <= 1 || r.Method != http.MethodPost ||
 		!strings.Contains(r.Header.Get("Content-Type"), "application/json") || r.Body == nil {
 		return nil
 	}
