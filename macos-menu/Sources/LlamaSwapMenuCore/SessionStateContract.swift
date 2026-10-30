@@ -110,6 +110,9 @@ public struct ContractSession: Decodable {
     /// so the whole object is optional; `contextUsed`/`rate` are in turn
     /// optional inside it for servers between 9dfdc32 and the readout.
     public let display: ContractDisplay?
+    /// The row's menu text, rendered once by the server and printed verbatim
+    /// by every menu. Absent on servers that predate it.
+    public let line: String?
 }
 
 /// The `display` object of a `sessions[]` entry. Every field is optional:
@@ -157,8 +160,8 @@ public struct ContractRate: Codable, Equatable {
 extension SessionRow {
     /// The one place a `ContractSession` becomes the row the menu renders.
     /// Every displayed number (context, progress, rate, priority) is copied
-    /// from `entry` untouched - see SessionRow.displayLine for the formatting
-    /// (k-units, percent, "kind N.n t/s") that invariant 3 still allows.
+    /// from `entry` untouched; the row text is the server's `line`
+    /// (SessionRow.displayLine prints it verbatim).
     public init(contract entry: ContractSession) {
         // requestId identifies the in-flight request cancelInflight targets;
         // a HOT/IDLE row has none, so it falls back to the session (still
@@ -181,6 +184,7 @@ extension SessionRow {
             context: entry.context,
             progress: entry.progress,
             rate: entry.rate,
-            penalty: entry.penalty)
+            penalty: entry.penalty,
+            line: entry.line)
     }
 }

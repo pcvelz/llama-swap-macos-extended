@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -198,6 +199,9 @@ type sessionEntry struct {
 	// raw fields (so existing fixtures serialise byte-identical). See
 	// sessionDisplay.
 	Display *sessionDisplay `json:"display,omitempty"`
+	// Line is the row's menu text, rendered ONCE here (rowLine) so every menu
+	// prints it verbatim and none formats the row itself. Always set.
+	Line string `json:"line"`
 }
 
 // waitingFor is the WHO/HOW LONG behind a parked request's reason - stamped
@@ -358,6 +362,11 @@ type sessionsBuilder struct {
 	// stampRate) and deleted together in lastDecode's cleanup, so the display
 	// retention can never reference a readout whose timing has been dropped.
 	lastDecodeReadout map[string]decodeReadout
+	// lastUsed / lastRate are the no-zero memory (stampNoZero): a session's
+	// last nonzero context.used, and its last nonzero measured rate per kind
+	// (key + "\x00" + kind). Dropped when the session leaves the body.
+	lastUsed map[string]int
+	lastRate map[string]sessionRate
 }
 
 func newSessionsBuilder(cfg config.Config) *sessionsBuilder {
@@ -370,6 +379,63 @@ func newSessionsBuilder(cfg config.Config) *sessionsBuilder {
 		slotWarmUntil:     map[string]string{},
 		lastDecode:        map[string]time.Time{},
 		lastDecodeReadout: map[string]decodeReadout{},
+		lastUsed:          map[string]int{},
+		lastRate:          map[string]sessionRate{},
+	}
+}
+
+// stampNoZero is the display's no-zero rule (user, 2026-10-30: "zero is very
+// improbable"). It runs LAST on every row, after the decode retention, and
+// only ever adds to display - the raw context, rate and phase stay what the
+// child reported, for the machine readers.
+//
+//   - Context: a session that has had a nonzero context.used never displays
+//     0 again, in any phase and however long after its last decode (a PARKED
+//     request or a HOT slot that no longer reports the prompt reads 0 raw).
+//     A session that never had context shows its raw 0.
+//   - Rate: a displayed rate of exactly 0 t/s (a prefill whose counters did
+//     not move over the window, or a slot reading kept over from a poll the
+//     busy child did not answer) becomes the session's last nonzero measured
+//     rate of the same kind, or a rate with no number when it never measured
+//     one - the menus then show no rate instead of "0.0 t/s".
+func (b *sessionsBuilder) stampNoZero(key string, row *sessionEntry) {
+	if row.SessionID == "" {
+		return
+	}
+	if row.Context.Used > 0 {
+		b.lastUsed[key] = row.Context.Used
+	}
+	if rateMeasured(row.Rate) && *row.Rate.TokensPerSecond > 0 {
+		b.lastRate[key+"\x00"+*row.Rate.Kind] = row.Rate
+	}
+	ensure := func() {
+		if row.Display == nil {
+			row.Display = &sessionDisplay{Phase: row.Phase}
+		}
+	}
+	shownUsed := row.Context.Used
+	if row.Display != nil && row.Display.ContextUsed != nil {
+		shownUsed = *row.Display.ContextUsed
+	}
+	if shownUsed == 0 {
+		if v, ok := b.lastUsed[key]; ok {
+			ensure()
+			row.Display.ContextUsed = &v
+		}
+	}
+	shown := row.Rate
+	if row.Display != nil && row.Display.Rate != nil {
+		shown = *row.Display.Rate
+	}
+	if shown.TokensPerSecond != nil && *shown.TokensPerSecond == 0 {
+		ensure()
+		repl := sessionRate{Kind: shown.Kind, WindowSeconds: shown.WindowSeconds}
+		if shown.Kind != nil {
+			if last, ok := b.lastRate[key+"\x00"+*shown.Kind]; ok {
+				repl = last
+			}
+		}
+		row.Display.Rate = &repl
 	}
 }
 
@@ -570,6 +636,7 @@ func (b *sessionsBuilder) build(in sessionsInput) sessionsBody {
 		b.stampDecodeReadout(key, &row)
 		b.stampSlotWarmUntil(&row)
 		b.stampDecodeDisplay(key, &row, now)
+		b.stampNoZero(key, &row)
 		present[key] = true
 		body.Sessions = append(body.Sessions, row)
 	}
@@ -587,6 +654,7 @@ func (b *sessionsBuilder) build(in sessionsInput) sessionsBody {
 			delete(b.rates, h.SessionID)
 			b.stampSlotWarmUntil(&row)
 			b.stampDecodeDisplay(h.SessionID, &row, now)
+			b.stampNoZero(h.SessionID, &row)
 			body.Sessions = append(body.Sessions, row)
 		}
 	}
@@ -621,6 +689,7 @@ func (b *sessionsBuilder) build(in sessionsInput) sessionsBody {
 		b.applyLoopState(in, &row, held)
 		b.stampSlotWarmUntil(&row)
 		b.stampDecodeDisplay(key, &row, now)
+		b.stampNoZero(key, &row)
 		body.Sessions = append(body.Sessions, row)
 	}
 
@@ -670,6 +739,16 @@ func (b *sessionsBuilder) build(in sessionsInput) sessionsBody {
 			delete(b.lastDecodeReadout, key)
 		}
 	}
+	for key := range b.lastUsed {
+		if !bodyHas[key] {
+			delete(b.lastUsed, key)
+		}
+	}
+	for key := range b.lastRate {
+		if sid, _, _ := strings.Cut(key, "\x00"); !bodyHas[sid] {
+			delete(b.lastRate, key)
+		}
+	}
 
 	// Invariant 2 (waiting == count(PARKED)) is counted AFTER applyLoopState
 	// has replaced a held row's phase with PENALIZED, so a penalized row is
@@ -702,6 +781,9 @@ func (b *sessionsBuilder) build(in sessionsInput) sessionsBody {
 		}
 		return a.SessionShort < c.SessionShort
 	})
+	for i := range body.Sessions {
+		body.Sessions[i].Line = rowLine(body.Sessions[i])
+	}
 	return body
 }
 

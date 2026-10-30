@@ -9,6 +9,7 @@
     {
       "sessionId": "a1b2c3d4-1111-2222-3333-444455556666",
       "sessionShort": "a1b2c3d4",
+      "line": "[a1b2c3d4] cq27 · PARKED (kv pool) · 0/262.1k · priority P10",
       "requestId": "r-57",
       "model": "Qwen3.8-27B-UD-Q5_K_XL",
       "alias": "cq27",
@@ -27,6 +28,7 @@
     {
       "sessionId": "69699f8b-0b1e-4c3a-9f1e-2d7c5a1b9e00",
       "sessionShort": "69699f8b",
+      "line": "[69699f8b] cq27 · DECODE · 102.6k/262.1k · 7.1 t/s · default P0",
       "requestId": "r-55",
       "model": "Qwen3.8-27B-UD-Q5_K_XL",
       "alias": "cq27",
@@ -45,6 +47,7 @@
     {
       "sessionId": "0f0e0d0c-aaaa-bbbb-cccc-dddddddddddd",
       "sessionShort": "0f0e0d0c",
+      "line": "[0f0e0d0c] cq27 · HOT · 31.8k/262.1k · default P0",
       "requestId": null,
       "model": "Qwen3.8-27B-UD-Q5_K_XL",
       "alias": "cq27",

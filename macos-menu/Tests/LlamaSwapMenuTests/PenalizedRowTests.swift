@@ -92,7 +92,7 @@ final class PenalizedRowTests: XCTestCase {
     /// (the client keeps retrying) - so a test that accidentally posts `id`
     /// instead of `sessionId` fails loudly rather than passing by
     /// coincidence.
-    private func row(strike: Int, remainingSeconds: Int?, parkReason: String? = nil) -> SessionRow {
+    private func row(strike: Int, remainingSeconds: Int?, parkReason: String? = nil, line: String? = nil) -> SessionRow {
         SessionRow(
             id: "req-999", sessionId: "934159af-0000-0000-0000-000000000000", sessionShort: "934159af",
             model: "cq35", alias: "ALIAS", tier: "default",
@@ -100,26 +100,28 @@ final class PenalizedRowTests: XCTestCase {
             context: ContractContext(used: 228_100, cached: 0, processed: 0, decoded: 0, promptTotal: 0, window: 262_100),
             rate: ContractRate(kind: nil, tokensPerSecond: nil, windowSeconds: 30),
             penalty: PenaltyInfo(reason: "loop", strike: strike, strikes: 3,
-                                  remainingSeconds: remainingSeconds, uniformRun: 86, typicalTokens: 48))
+                                  remainingSeconds: remainingSeconds, uniformRun: 86, typicalTokens: 48),
+            line: line)
     }
 
     func testDisplayLineTimedPenalty() {
-        XCTAssertEqual(row(strike: 2, remainingSeconds: 760).displayLine,
+        XCTAssertEqual(row(strike: 2, remainingSeconds: 760, line: "[934159af] ALIAS · PENALIZED (loop 2/3) · 228.1k/262.1k · 12:40 · default P0").displayLine,
                        "[934159af] ALIAS · PENALIZED (loop 2/3) · 228.1k/262.1k · 12:40 · default P0")
     }
 
     func testDisplayLineHeldPenalty() {
-        XCTAssertEqual(row(strike: 3, remainingSeconds: nil).displayLine,
+        XCTAssertEqual(row(strike: 3, remainingSeconds: nil, line: "[934159af] ALIAS · PENALIZED (loop 3/3) · 228.1k/262.1k · held · default P0").displayLine,
                        "[934159af] ALIAS · PENALIZED (loop 3/3) · 228.1k/262.1k · held · default P0")
     }
 
-    /// The common PENALIZED shape: a request is still PARKED under park
+    /// The common PENALIZED shape (the line itself comes from the server; the
+    /// Go rowLine table tests own its wording): a request is still PARKED under park
     /// reason "penalized" while the hold is in effect. The park phrase must
     /// NOT be appended a second time alongside the PENALIZED segment - the
     /// line is exactly the same as the no-request case. Every row shows tier
     /// + rank, including PENALIZED (user ruling).
     func testDisplayLineWithRequestAndParkReasonDoesNotDoubleUpTheReason() {
-        XCTAssertEqual(row(strike: 2, remainingSeconds: 760, parkReason: "penalized").displayLine,
+        XCTAssertEqual(row(strike: 2, remainingSeconds: 760, parkReason: "penalized", line: "[934159af] ALIAS · PENALIZED (loop 2/3) · 228.1k/262.1k · 12:40 · default P0").displayLine,
                        "[934159af] ALIAS · PENALIZED (loop 2/3) · 228.1k/262.1k · 12:40 · default P0")
     }
 
@@ -132,7 +134,7 @@ final class PenalizedRowTests: XCTestCase {
             priority: 0, phase: "PENALIZED",
             context: ContractContext(used: 0, cached: 0, processed: 0, decoded: 0, promptTotal: 0, window: 262_144),
             rate: ContractRate(kind: nil, tokensPerSecond: nil, windowSeconds: 30))
-        XCTAssertEqual(row.displayLine, "[aaaaaaaa] cq35 · PENALIZED · 0/262.1k · default P0")
+        XCTAssertEqual(row.displayLine, "[aaaaaaaa] cq35 · PENALIZED")
     }
 
     /// Strike-1 (looping, not yet PENALIZED) renders exactly as today - no
@@ -146,7 +148,7 @@ final class PenalizedRowTests: XCTestCase {
          "elapsedMs":0,"phaseSinceMs":0,"respTokens":0,"looping":true,"uniformRun":12}
         """)
         let row = SessionRow(contract: entry)
-        XCTAssertEqual(row.displayLine, "[aaaaaaaa] cq35 · DECODE · 0/262.1k · default P0")
+        XCTAssertEqual(row.displayLine, "[aaaaaaaa] cq35 · DECODE")
     }
 
     // MARK: - tooltip

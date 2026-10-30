@@ -250,7 +250,7 @@ public struct SessionRow: Identifiable, Encodable, Equatable {
     public let tier: String
     /// The tier's configured rank; default tier 0, background negative.
     /// Reserved by the contract for a future per-session override - this
-    /// menu only renders it (see `tierText`).
+    /// menu only carries it.
     public let priority: Int
     /// `PARKED`, `LOADING`, `PREFILL`, `DECODE`, `HOT`, `IDLE`, or any value
     /// the server has not documented yet - rendered verbatim either way
@@ -280,12 +280,15 @@ public struct SessionRow: Identifiable, Encodable, Equatable {
     /// from a server that predates the penalty box (invariant 5 fallback:
     /// see `displayLine`).
     public let penalty: PenaltyInfo?
+    /// The server-rendered row text (`ContractSession.line`); nil on a server
+    /// that predates it. `displayLine` prints it verbatim.
+    public let line: String?
 
     public init(id: String, sessionId: String = "", sessionShort: String, parentSessionShort: String? = nil, model: String, alias: String, tier: String,
                 priority: Int, phase: String, displayPhase: String? = nil, displayContextUsed: Int? = nil, displayRate: ContractRate? = nil,
                 parkReason: String? = nil,
                 context: ContractContext, progress: Double? = nil, rate: ContractRate,
-                penalty: PenaltyInfo? = nil) {
+                penalty: PenaltyInfo? = nil, line: String? = nil) {
         self.id = id
         self.sessionId = sessionId
         self.sessionShort = sessionShort
@@ -303,133 +306,23 @@ public struct SessionRow: Identifiable, Encodable, Equatable {
         self.progress = progress
         self.rate = rate
         self.penalty = penalty
+        self.line = line
     }
 
-    /// Known park reasons in words, the same vocabulary the fork's scheduler
-    /// uses (Park* constants) - session-state-contract.md's `parkReason`
-    /// table. Anything else (a reason the client predates, or none of the
-    /// documented ones) renders VERBATIM rather than being dropped: invariant
-    /// 5 forbids silently swallowing an unknown value.
-    static func parkPhrase(_ reason: String?) -> String? {
-        guard let reason, !reason.isEmpty else { return nil }
-        switch reason {
-        case "cap": return "slots full"
-        case "kv": return "kv pool"
-        case "busy": return "resident busy"
-        case "cooldown": return "cooldown"
-        case "loading": return "loading"
-        case "rank": return "behind higher rank"
-        case "swap-collision": return "another swap in flight"
-        case "memory-brake": return "memory brake"
-        default: return reason
-        }
-    }
-
-    /// The phase the renderer presents: the server's `display.phase` when it
-    /// sent one (the decode retention), else the raw `phase`. EVERY
-    /// presentation gate below (progress, park-reason suffix) keys off this,
-    /// never the raw phase: a retained DECODE row must not leak the raw
-    /// PREFILL's progress percent or the raw PARKED's reason suffix. Machine
-    /// logic elsewhere keeps reading the raw `phase`.
-    private var shownPhase: String { displayPhase ?? phase }
-
-    /// PREFILL's progress as a percent, one decimal - nil for every other
-    /// phase (the contract only fills `progress` for PREFILL) or when the
-    /// body carries none yet. Gated on the SHOWN phase: a retained DECODE
-    /// row sitting on a raw PREFILL must not print the raw progress.
-    private var progressText: String? {
-        guard shownPhase == "PREFILL", let progress else { return nil }
-        return String(format: "%.1f%%", progress * 100)
-    }
-
-    /// "N.n t/s" whenever a rate exists, regardless of phase (user ruling
-    /// 2026-10-30: the phase kind is redundant - the phase segment already
-    /// says PREFILL/DECODE, so "PREFILL · prefill 50.7 t/s" printed the word
-    /// twice); nil until the contract has two samples
-    /// (rate.kind/tokensPerSecond both nil). A DECODE readout (raw or
-    /// retained) uses `display.rate` ONLY - it is the last real DECODE's
-    /// rate, copied verbatim; when the server omitted it (the last DECODE
-    /// never measured one) no rate renders at all, never this row's raw
-    /// PREFILL rate leaking into a DECODE line. Every other phase renders
-    /// the raw rate as before.
-    private var rateText: String? {
-        if shownPhase == "DECODE" {
-            let r = displayPhase == "DECODE" ? displayRate : rate
-            guard let r, let tokensPerSecond = r.tokensPerSecond else { return nil }
-            return "\(String(format: "%.1f", tokensPerSecond)) t/s"
-        }
-        guard let tokensPerSecond = rate.tokensPerSecond else { return nil }
-        return "\(String(format: "%.1f", tokensPerSecond)) t/s"
-    }
-
-    /// "<tier> P<priority>", e.g. "default P0" / "priority P10" /
-    /// "background P-10" - ALWAYS rendered, including the default tier
-    /// (user ruling 2026-09-25, overriding 40db173's "P0 is noise" and
-    /// "default renders nothing" reasoning: every row shows both its tier
-    /// AND its rank, with no case dropped). Straight from the contract's own
-    /// `tier` and `priority` fields (invariant 3); an unknown tier name
-    /// renders verbatim (invariant 5).
-    private var tierText: String {
-        "\(tier.isEmpty ? "-" : tier) P\(priority)"
-    }
-
-    /// The row as the menu shows it, purely from contract fields, in the
-    /// order the contract documents them:
-    ///
-    ///   `[<sessionShort>] <alias> · <PHASE[ (reason)]> · <used>/<window> ·
-    ///   [<progress>%] · [<N.n> t/s] · <tier> P<priority>`
-    ///
-    /// A segment the body did not supply (no progress, no rate yet) is
-    /// dropped rather than shown empty; the tier/priority segment is never
-    /// dropped.
-    ///
-    /// A PENALIZED row with `penalty` present takes a dedicated shape instead
-    /// (user-approved format): `[parent > child] alias · PENALIZED (reason
-    /// strike/strikes) · used/window · m:ss · tier P<priority>`, or
-    /// `· held` when `remainingSeconds` is null (a final-strike hold with no
-    /// timer). No progress/rate segments - a held session carries neither.
-    /// If `phase == "PENALIZED"` but `penalty` is absent (an older/odd server),
-    /// this falls through to the generic path below, which renders "PENALIZED"
-    /// verbatim rather than inventing a reason/strike count it was not given
-    /// (invariant 5).
+    /// The row as the menu shows it: the server's `line`, VERBATIM. The
+    /// server renders each row's text once (fork `rowLine`) and every menu -
+    /// this dropdown and cm-menu - prints it, so no client formats a row.
+    /// A server that predates `line` gets only the minimal
+    /// `[<bracket>] <alias> · <raw phase>`, never a client-side reconstruction.
     public var displayLine: String {
+        if let line { return line }
         let bracket: String
         if let parentSessionShort, !parentSessionShort.isEmpty {
             bracket = "\(parentSessionShort) > \(sessionShort.isEmpty ? "-" : sessionShort)"
         } else {
             bracket = sessionShort.isEmpty ? "-" : sessionShort
         }
-        let idAndAlias = "[\(bracket)] \(alias.isEmpty ? model : alias)"
-
-        if let penalty {
-            let phaseSegment = "PENALIZED (\(penalty.reason) \(penalty.strike)/\(penalty.strikes))"
-            let tokensSegment = "\(CompactFormatter.tokens(context.used))/\(CompactFormatter.tokens(context.window))"
-            let holdSegment = penalty.remainingSeconds.map(CompactFormatter.countdown) ?? "held"
-            return [idAndAlias, phaseSegment, tokensSegment, holdSegment, tierText].joined(separator: " · ")
-        }
-
-        var segments: [String] = [idAndAlias]
-
-        // Renderer rule (session-state-contract.md `display.phase`): show
-        // display.phase when present, else the raw phase. Every non-render
-        // use of `phase` (queue filter, progress gate, unpenalize restore)
-        // stays on the raw value.
-        var phaseSegment = shownPhase
-        // The park-reason suffix belongs to a PARKED presentation only: a
-        // retained DECODE row sitting on a raw PARKED must not read
-        // "DECODE (lane)" - the suffix would leak the phase being overridden.
-        if shownPhase == "PARKED", let phrase = SessionRow.parkPhrase(parkReason) {
-            phaseSegment += " (\(phrase))"
-        }
-        segments.append(phaseSegment)
-
-        // The used segment renders the retained readout's contextUsed when
-        // present; context.window stays the raw denominator throughout.
-        segments.append("\(CompactFormatter.tokens(displayContextUsed ?? context.used))/\(CompactFormatter.tokens(context.window))")
-        if let progressText { segments.append(progressText) }
-        if let rateText { segments.append(rateText) }
-        segments.append(tierText)
-        return segments.joined(separator: " · ")
+        return "[\(bracket)] \(alias.isEmpty ? model : alias) · \(phase)"
     }
 
     /// The loop detector's evidence behind a PENALIZED hold, shown only in

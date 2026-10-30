@@ -76,7 +76,7 @@ func TestSessions_DecodeStartKeepsLastMeasuredRate(t *testing.T) {
 	if got.Sessions[0].Rate.TokensPerSecond == nil {
 		t.Fatalf("setup: second DECODE sample rate = %+v, want measured", got.Sessions[0].Rate)
 	}
-	noDisplay(t, got, "s1")
+	rawWord(t, got, "s1")
 	assertSessionsInvariants(t, got)
 }
 

@@ -9,6 +9,7 @@
     {
       "sessionId": "69699f8b-0b1e-4c3a-9f1e-2d7c5a1b9e00",
       "sessionShort": "69699f8b",
+      "line": "[69699f8b] cq27 · PREFILL · 92.2k/262.1k · 90.0% · 50.7 t/s · default P0",
       "requestId": "r-41",
       "model": "Qwen3.8-27B-UD-Q5_K_XL",
       "alias": "cq27",

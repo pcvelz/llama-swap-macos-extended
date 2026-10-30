@@ -102,7 +102,8 @@ final class SessionStateContractTests: XCTestCase {
     private func row(tier: String, priority: Int, alias: String = "cq27", short: String = "ee000000",
                      phase: String = "PARKED") throws -> SessionRow {
         let json = """
-        {"sessionId":"\(short)-0000-0000-0000-000000000000","sessionShort":"\(short)",
+        {"line":"[\(short)] \(alias) · \(phase) · 100/262.1k · \(tier) P\(priority)",
+         "sessionId":"\(short)-0000-0000-0000-000000000000","sessionShort":"\(short)",
          "requestId":null,"model":"\(alias)","alias":"\(alias)","tier":"\(tier)","priority":\(priority),
          "phase":"\(phase)","parkReason":null,"slot":null,
          "context":{"used":100,"cached":100,"processed":0,"decoded":0,"promptTotal":100,"window":262144},
@@ -174,7 +175,8 @@ final class SessionStateContractTests: XCTestCase {
     func testParkedRowsRenderInServerPickOrder() throws {
         func session(_ short: String, _ alias: String, _ tier: String, _ priority: Int, _ elapsedMs: Int) -> String {
             """
-            {"sessionId":"\(short)-0000-0000-0000-000000000000","sessionShort":"\(short)",
+            {"line":"[\(short)] \(alias) · PARKED (slots full) · 0/262.1k · \(tier) P\(priority)",
+             "sessionId":"\(short)-0000-0000-0000-000000000000","sessionShort":"\(short)",
              "requestId":null,"model":"\(alias)","alias":"\(alias)","tier":"\(tier)","priority":\(priority),
              "phase":"PARKED","parkReason":"cap","slot":null,
              "context":{"used":0,"cached":0,"processed":0,"decoded":0,"promptTotal":0,"window":262144},
@@ -287,7 +289,7 @@ final class SessionStateContractTests: XCTestCase {
     /// given, never rejected and never guessed at.
     func testUnknownPhaseRendersVerbatim() throws {
         let json = """
-        {"sessionId":"y","sessionShort":"yyyyyyyy","requestId":null,"model":"m","alias":"a",
+        {"line":"[yyyyyyyy] a · WARMING · 0/1 · default P0","sessionId":"y","sessionShort":"yyyyyyyy","requestId":null,"model":"m","alias":"a",
          "tier":"default","priority":0,"phase":"WARMING","parkReason":null,"slot":null,
          "context":{"used":0,"cached":0,"processed":0,"decoded":0,"promptTotal":0,"window":1},
          "progress":null,"rate":{"kind":null,"tokensPerSecond":null,"windowSeconds":30.0},
@@ -303,12 +305,12 @@ final class SessionStateContractTests: XCTestCase {
 
     /// Shared body for both display cases: identical except for the
     /// optional `display` object.
-    private func retentionRowJSON(displayKey: String) -> Data {
+    private func retentionRowJSON(displayKey: String, line: String) -> Data {
         // displayKey is a pre-quoted fragment like `"display":{"phase":"DECODE"},`
         // (kept out of the multiline literal: a quote-terminated interpolation
         // on its own line trips the multiline-literal parser).
         """
-        {"sessionId":"z","sessionShort":"zzzzzzzz","requestId":null,"model":"m","alias":"a",
+        {"line":"\(line)","sessionId":"z","sessionShort":"zzzzzzzz","requestId":null,"model":"m","alias":"a",
          "tier":"default","priority":0,"phase":"IDLE",\(displayKey)"parkReason":null,"slot":null,
          "context":{"used":0,"cached":0,"processed":0,"decoded":0,"promptTotal":0,"window":1},
          "progress":null,"rate":{"kind":null,"tokensPerSecond":null,"windowSeconds":30.0},
@@ -320,7 +322,7 @@ final class SessionStateContractTests: XCTestCase {
     /// the raw `phase` stays what the machine readers use.
     func testDisplayPhaseRendersWhenPresent() throws {
         let entry = try JSONDecoder().decode(ContractSession.self,
-                                             from: retentionRowJSON(displayKey: "\"display\":{\"phase\":\"DECODE\"},"))
+                                             from: retentionRowJSON(displayKey: "\"display\":{\"phase\":\"DECODE\"},", line: "[zzzzzzzz] a · DECODE · 0/1 · default P0"))
         let row = SessionRow(contract: entry)
         XCTAssertEqual(row.phase, "IDLE", "the raw phase must stay IDLE for machine readers")
         XCTAssertEqual(row.displayPhase, "DECODE")
@@ -334,7 +336,7 @@ final class SessionStateContractTests: XCTestCase {
     /// the raw phase unchanged - servers predating 9dfdc32 are unaffected.
     func testDisplayPhaseAbsentFallsBackToRawPhase() throws {
         let entry = try JSONDecoder().decode(ContractSession.self,
-                                             from: retentionRowJSON(displayKey: ""))
+                                             from: retentionRowJSON(displayKey: "", line: "[zzzzzzzz] a · IDLE · 0/1 · default P0"))
         let row = SessionRow(contract: entry)
         XCTAssertNil(entry.display)
         XCTAssertNil(row.displayPhase)
@@ -352,7 +354,7 @@ final class SessionStateContractTests: XCTestCase {
     /// raw fields stay raw for machine readers.
     func testDisplayPhaseRetainedReadoutRendersVerbatim() throws {
         let json = """
-        {"sessionId":"z","sessionShort":"zzzzzzzz","requestId":null,"model":"m","alias":"a",
+        {"line":"[zzzzzzzz] a · DECODE · 100.8k/262.1k · 21.4 t/s · default P0","sessionId":"z","sessionShort":"zzzzzzzz","requestId":null,"model":"m","alias":"a",
          "tier":"default","priority":0,"phase":"HOT",
          "display":{"phase":"DECODE","contextUsed":100809,
            "rate":{"kind":"decode","tokensPerSecond":21.4,"windowSeconds":30.0}},
@@ -385,7 +387,7 @@ final class SessionStateContractTests: XCTestCase {
     /// fields still decode unchanged for machine readers.
     func testDisplayPhaseRetainedDecodeHidesRawPrefillProgress() throws {
         let json = """
-        {"sessionId":"z","sessionShort":"zzzzzzzz","requestId":"r2","model":"m","alias":"a",
+        {"line":"[zzzzzzzz] a · DECODE · 100.8k/262.1k · 21.4 t/s · default P0","sessionId":"z","sessionShort":"zzzzzzzz","requestId":"r2","model":"m","alias":"a",
          "tier":"default","priority":0,"phase":"PREFILL",
          "display":{"phase":"DECODE","contextUsed":100809,
            "rate":{"kind":"decode","tokensPerSecond":21.4,"windowSeconds":30.0}},
@@ -420,7 +422,7 @@ final class SessionStateContractTests: XCTestCase {
     /// shows the retained 41.5k, never "0/262.1k".
     func testDisplayPhaseRetainedDecodeCoversZeroFirstPrefill() throws {
         let json = """
-        {"sessionId":"z","sessionShort":"zzzzzzzz","requestId":"r2","model":"m","alias":"a",
+        {"line":"[zzzzzzzz] a · DECODE · 41.5k/262.1k · 58.0 t/s · default P0","sessionId":"z","sessionShort":"zzzzzzzz","requestId":"r2","model":"m","alias":"a",
          "tier":"default","priority":0,"phase":"PREFILL",
          "display":{"phase":"DECODE","contextUsed":41530,
            "rate":{"kind":"decode","tokensPerSecond":58.0,"windowSeconds":30.0}},
@@ -453,7 +455,7 @@ final class SessionStateContractTests: XCTestCase {
     /// the DISPLAYED phase, not the presence of parkReason.
     func testDisplayPhaseRetainedDecodeHidesRawParkReasonSuffix() throws {
         let json = """
-        {"sessionId":"z","sessionShort":"zzzzzzzz","requestId":"r2","model":"m","alias":"a",
+        {"line":"[zzzzzzzz] a · DECODE · 100.8k/262.1k · 21.4 t/s · default P0","sessionId":"z","sessionShort":"zzzzzzzz","requestId":"r2","model":"m","alias":"a",
          "tier":"default","priority":0,"phase":"PARKED",
          "display":{"phase":"DECODE","contextUsed":100809,
            "rate":{"kind":"decode","tokensPerSecond":21.4,"windowSeconds":30.0}},
@@ -486,7 +488,7 @@ final class SessionStateContractTests: XCTestCase {
     /// `display.contextUsed` still renders.
     func testDisplayPhaseRetainedDecodeWithoutDisplayRateShowsNoRate() throws {
         let json = """
-        {"sessionId":"z","sessionShort":"zzzzzzzz","requestId":"r2","model":"m","alias":"a",
+        {"line":"[zzzzzzzz] a · DECODE · 100.8k/262.1k · default P0","sessionId":"z","sessionShort":"zzzzzzzz","requestId":"r2","model":"m","alias":"a",
          "tier":"default","priority":0,"phase":"PREFILL",
          "display":{"phase":"DECODE","contextUsed":100809},
          "parkReason":null,"slot":0,
@@ -518,7 +520,7 @@ final class SessionStateContractTests: XCTestCase {
     /// PREFILL row with no display object renders its own measured rate.
     func testRawPrefillRowWithoutDisplayKeepsRenderingItsRate() throws {
         let json = """
-        {"sessionId":"z","sessionShort":"zzzzzzzz","requestId":"r2","model":"m","alias":"a",
+        {"line":"[zzzzzzzz] a · PREFILL · 20.0k/262.1k · 22.2% · 10000.0 t/s · default P0","sessionId":"z","sessionShort":"zzzzzzzz","requestId":"r2","model":"m","alias":"a",
          "tier":"default","priority":0,"phase":"PREFILL",
          "parkReason":null,"slot":0,
          "context":{"used":20000,"cached":0,"processed":20000,"decoded":0,"promptTotal":90000,"window":262144},
@@ -530,5 +532,53 @@ final class SessionStateContractTests: XCTestCase {
         XCTAssertEqual(row.displayLine,
                        "[zzzzzzzz] a · PREFILL · 20.0k/262.1k · 22.2% · 10000.0 t/s · default P0",
                        "a raw PREFILL row renders its own rate, got '\(row.displayLine)'")
+    }
+
+    /// The server's no-zero rule (2026-10-30): a raw 0 t/s arrives with a
+    /// display.rate - the last measured rate of that kind, or one with no
+    /// number. On EVERY phase, display.rate wins over the raw rate, so the
+    /// menu never prints "0.0 t/s".
+    func testDisplayRateReplacesRawZeroRateOnAnyPhase() throws {
+        func row(_ display: String, line: String) throws -> SessionRow {
+            let json = """
+            {"line":"\(line)","sessionId":"z","sessionShort":"zzzzzzzz","requestId":"r2","model":"m","alias":"a",
+             "tier":"default","priority":0,"phase":"PREFILL",
+             "display":\(display),
+             "parkReason":null,"slot":0,
+             "context":{"used":20000,"cached":0,"processed":20000,"decoded":0,"promptTotal":90000,"window":262144},
+             "progress":0.2222,"rate":{"kind":"prefill","tokensPerSecond":0.0,"windowSeconds":30.0},
+             "elapsedMs":2000,"phaseSinceMs":0,"respTokens":0}
+            """.data(using: .utf8)!
+            return SessionRow(contract: try JSONDecoder().decode(ContractSession.self, from: json))
+        }
+        let last = try row(#"{"phase":"PREFILL","rate":{"kind":"prefill","tokensPerSecond":611.2,"windowSeconds":30.0}}"#,
+                       line: "[zzzzzzzz] a · PREFILL · 20.0k/262.1k · 22.2% · 611.2 t/s · default P0")
+        XCTAssertEqual(last.rate.tokensPerSecond, 0.0, "raw stays raw")
+        XCTAssertEqual(last.displayLine,
+                       "[zzzzzzzz] a · PREFILL · 20.0k/262.1k · 22.2% · 611.2 t/s · default P0",
+                       "display.rate wins on a PREFILL row, got '\(last.displayLine)'")
+        let none = try row(#"{"phase":"PREFILL","rate":{"kind":"prefill","tokensPerSecond":null,"windowSeconds":30.0}}"#,
+                       line: "[zzzzzzzz] a · PREFILL · 20.0k/262.1k · 22.2% · default P0")
+        XCTAssertFalse(none.displayLine.contains("t/s"),
+                       "a display.rate with no number shows no rate, never 0.0, got '\(none.displayLine)'")
+    }
+
+    /// The no-zero context: past the decode retention a PARKED row of a
+    /// session that had real context carries display {phase: PARKED,
+    /// contextUsed} - the raw word with the last real context.
+    func testDisplayContextUsedRendersUnderRawWord() throws {
+        let json = """
+        {"line":"[zzzzzzzz] a · PARKED (kv pool) · 41.5k/262.1k · default P0","sessionId":"z","sessionShort":"zzzzzzzz","requestId":"r3","model":"m","alias":"a",
+         "tier":"default","priority":0,"phase":"PARKED",
+         "display":{"phase":"PARKED","contextUsed":41530},
+         "parkReason":"kv","slot":null,
+         "context":{"used":0,"cached":0,"processed":0,"decoded":0,"promptTotal":0,"window":262144},
+         "progress":null,"rate":{"kind":null,"tokensPerSecond":null,"windowSeconds":30.0},
+         "elapsedMs":2000,"phaseSinceMs":0,"respTokens":0}
+        """.data(using: .utf8)!
+        let row = SessionRow(contract: try JSONDecoder().decode(ContractSession.self, from: json))
+        XCTAssertTrue(row.displayLine.contains("41.5k/262.1k"),
+                      "the last real context renders, never 0/262.1k, got '\(row.displayLine)'")
+        XCTAssertTrue(row.displayLine.contains("PARKED"), "the raw word renders, got '\(row.displayLine)'")
     }
 }

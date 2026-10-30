@@ -613,7 +613,7 @@ func TestSessions_DecodeRetentionHoldsAcrossShortPrefill(t *testing.T) {
 			t.Fatalf("raw phase = %s, want %s (display-only retention must never touch it)", row.Phase, wantPhase)
 		}
 		disp := ""
-		if row.Display != nil {
+		if !wordReleased(row) {
 			disp = row.Display.Phase
 		}
 		if disp != wantDisplay {
@@ -659,7 +659,7 @@ func TestSessions_DecodeRetentionHoldsAcrossShortPrefill(t *testing.T) {
 	if r1.Context.Decoded != 0 {
 		t.Fatalf("s1 prefill context decoded=%d, want 0", r1.Context.Decoded)
 	}
-	if r2.Phase != "PREFILL" || r2.Display != nil {
+	if r2.Phase != "PREFILL" || !wordReleased(r2) {
 		t.Fatalf("s2 at +4s: raw %s display %+v, want PREFILL / absent (never decoded)", r2.Phase, r2.Display)
 	}
 
@@ -697,7 +697,7 @@ func TestSessions_DecodeRetentionHoldsAcrossShortPrefill(t *testing.T) {
 	if !ok1 {
 		t.Fatalf("s1 row missing, got %+v", got.Sessions)
 	}
-	if r1.Phase != "IDLE" || r1.Display != nil {
+	if r1.Phase != "IDLE" || !wordReleased(r1) {
 		t.Fatalf("s1 idle 34s after decode: raw %s display %+v, want IDLE / absent (past the window)", r1.Phase, r1.Display)
 	}
 	assertSessionsInvariants(t, got)
@@ -761,7 +761,7 @@ func TestSessions_DecodeRetentionEndsAtWindowDuringLongPrefill(t *testing.T) {
 
 	// Poll 1 (+0): s1 decodes turn 1.
 	got := b.build(sessionsInput{Now: t0, Running: running, Requests: []swaputil.InflightRequestEntry{mk("r1", "s1", t0.Add(-5*time.Second))}, Slots: decodeSlots})
-	if len(got.Sessions) != 1 || got.Sessions[0].Phase != "DECODE" || got.Sessions[0].Display != nil {
+	if len(got.Sessions) != 1 || got.Sessions[0].Phase != "DECODE" || !wordReleased(got.Sessions[0]) {
 		t.Fatalf("poll 1: %+v, want one DECODE row without display", got.Sessions)
 	}
 
@@ -777,7 +777,7 @@ func TestSessions_DecodeRetentionEndsAtWindowDuringLongPrefill(t *testing.T) {
 	// phase stays PREFILL and the display is gone: a session genuinely stuck
 	// in prefill surfaces again.
 	got = b.build(sessionsInput{Now: t0.Add(31 * time.Second), Running: running, Requests: []swaputil.InflightRequestEntry{mk("r2", "s1", t0.Add(3*time.Second))}, Slots: prefillSlots})
-	if len(got.Sessions) != 1 || got.Sessions[0].Phase != "PREFILL" || got.Sessions[0].Display != nil {
+	if len(got.Sessions) != 1 || got.Sessions[0].Phase != "PREFILL" || !wordReleased(got.Sessions[0]) {
 		t.Fatalf("poll 3: %+v, want PREFILL / display absent (window 30 s from the last DECODE)", got.Sessions)
 	}
 	assertSessionsInvariants(t, got)
@@ -873,7 +873,7 @@ func TestSessions_DecodeRetentionHoldsAcrossHot(t *testing.T) {
 		t.Fatalf("display = %+v, want DECODE for a HOT row 4 s after the last DECODE", row.Display)
 	}
 	late := b.build(sessionsInput{Now: t0.Add(35 * time.Second), Running: running, Hot: map[string][]swaputil.HotSlot{sessModel: {{Slot: 0, SessionID: "s1", IdleSeconds: 35}}}})
-	if len(late.Sessions) != 1 || late.Sessions[0].Display != nil {
+	if len(late.Sessions) != 1 || !wordReleased(late.Sessions[0]) {
 		t.Fatalf("past the window = %+v, want the raw HOT row with no display override", late.Sessions)
 	}
 }
@@ -906,7 +906,7 @@ func TestSessions_DecodeRetentionReleasedPastWindow(t *testing.T) {
 	if row.Phase != "PARKED" {
 		t.Fatalf("raw phase = %s, want PARKED", row.Phase)
 	}
-	if row.Display != nil {
+	if !wordReleased(row) {
 		t.Fatalf("display = %+v, want none 35 s after the last DECODE (window 30 s)", row.Display)
 	}
 }
@@ -941,7 +941,7 @@ func TestSessions_DecodeRetentionNeverPenalized(t *testing.T) {
 			if row.Phase != tc.phase {
 				t.Fatalf("raw phase = %s, want %s", row.Phase, tc.phase)
 			}
-			if row.Display != nil {
+			if !wordReleased(row) {
 				t.Fatalf("display = %+v, want none for a penalized row (%s)", row.Display, tc.name)
 			}
 			assertSessionsInvariants(t, got)
@@ -965,7 +965,7 @@ func TestSessions_DecodeRetentionConfiguredWindow(t *testing.T) {
 
 	b = newSessionsBuilder(cfg)
 	row = retentionPolls(t, b, t0, 6*time.Second, map[string]string{"park_reason": "lane"}, parkedSlots)
-	if row.Display != nil {
+	if !wordReleased(row) {
 		t.Fatalf("display = %+v, want none past the configured 4 s window", row.Display)
 	}
 
@@ -973,7 +973,7 @@ func TestSessions_DecodeRetentionConfiguredWindow(t *testing.T) {
 	off.Sessions.DecodeRetentionSeconds = 0
 	b = newSessionsBuilder(off)
 	row = retentionPolls(t, b, t0, 2*time.Second, map[string]string{"park_reason": "lane"}, parkedSlots)
-	if row.Display != nil {
+	if !wordReleased(row) {
 		t.Fatalf("display = %+v, want none with the retention configured off", row.Display)
 	}
 }
@@ -1071,13 +1071,23 @@ func retainedDisplay(t *testing.T, got sessionsBody, session string, wantUsed, w
 }
 
 // noDisplay pins the other side: no retention, no display key at all.
-func noDisplay(t *testing.T, got sessionsBody, session string) map[string]any {
+// rawWord: the row shows its RAW phase word - no display, or a display that
+// only carries the no-zero readout (stampNoZero) under the raw phase. It is
+// what "past the window" / "never retained" means; an absent display object
+// was the stand-in until the no-zero rule (2026-10-30) put a sticky
+// context.used on rows outside the window too.
+func rawWord(t *testing.T, got sessionsBody, session string) map[string]any {
 	t.Helper()
 	row := rowWireMap(t, got, session)
-	if _, ok := row["display"]; ok {
-		t.Fatalf("%s: display = %v, want no display override", session, row["display"])
+	if disp, ok := row["display"].(map[string]any); ok && disp["phase"] != row["phase"] {
+		t.Fatalf("%s: display = %v, want the raw word %v", session, disp, row["phase"])
 	}
 	return row
+}
+
+// wordReleased is rawWord on a built row.
+func wordReleased(r sessionEntry) bool {
+	return r.Display == nil || r.Display.Phase == r.Phase
 }
 
 func rawUsed(t *testing.T, row map[string]any) any {
@@ -1134,7 +1144,7 @@ func TestSessions_DecodeRetentionRetainsRateAndContextUsed(t *testing.T) {
 	if v := rawRateKind(t, row); v != "prefill" {
 		t.Fatalf("s1 raw rate.kind = %v, want prefill while display.rate holds the retained decode rate", v)
 	}
-	s2row := noDisplay(t, got, "s2")
+	s2row := rawWord(t, got, "s2")
 	if v := rawUsed(t, s2row); v != float64(10) {
 		t.Fatalf("s2 raw context.used = %v, want 10", v)
 	}
@@ -1143,8 +1153,8 @@ func TestSessions_DecodeRetentionRetainsRateAndContextUsed(t *testing.T) {
 	// +34 s: past the 30 s window the overrides are gone; both rows are bare
 	// IDLE rows reading their raw (zero) counters.
 	got = b.build(sessionsInput{Now: t0.Add(34 * time.Second), Running: running})
-	noDisplay(t, got, "s1")
-	s2row = noDisplay(t, got, "s2")
+	rawWord(t, got, "s1")
+	s2row = rawWord(t, got, "s2")
 	if v := rawUsed(t, s2row); v != float64(0) {
 		t.Fatalf("s2 raw context.used = %v, want 0", v)
 	}
@@ -1227,7 +1237,7 @@ func TestSessions_DecodeRetentionRetainsReadoutAcrossParkedAndHot(t *testing.T) 
 	// +35 s: past the window the HOT row shows itself with no override.
 	got = b.build(sessionsInput{Now: t0.Add(35 * time.Second), Running: running,
 		Hot: map[string][]swaputil.HotSlot{sessModel: {{Slot: 0, SessionID: "s1", IdleSeconds: 34}}}, Slots: hotSlots})
-	noDisplay(t, got, "s1")
+	rawWord(t, got, "s1")
 	assertSessionsInvariants(t, got)
 }
 
@@ -1306,7 +1316,7 @@ func TestSessions_DecodeRetentionZeroOmitsReadout(t *testing.T) {
 	decodeWithRate(t, b, t0)
 
 	got := b.build(sessionsInput{Now: t0.Add(2 * time.Second), Running: running})
-	row := noDisplay(t, got, "s1")
+	row := rawWord(t, got, "s1")
 	if v := rawRateKind(t, row); v != nil {
 		t.Fatalf("raw rate.kind = %v, want nil (retention=0 must not touch the raw fields either)", v)
 	}

@@ -19,7 +19,7 @@ final class ParentSessionTests: XCTestCase {
             priority: 0, phase: "DECODE",
             context: ContractContext(used: 50_000, cached: 40_000, processed: 10_000, decoded: 1200, promptTotal: 100_000, window: 262_144),
             rate: ContractRate(kind: "decode", tokensPerSecond: 45.2, windowSeconds: 30))
-        XCTAssertEqual(row.displayLine, "[aaaaaaaa] cq35 · DECODE · 50.0k/262.1k · 45.2 t/s · default P0")
+        XCTAssertEqual(row.displayLine, "[aaaaaaaa] cq35 · DECODE")
     }
 
     func testDispatchedRowBracketWithParent() {
@@ -29,7 +29,7 @@ final class ParentSessionTests: XCTestCase {
             priority: 0, phase: "PARKED", parkReason: "kv",
             context: ContractContext(used: 0, cached: 0, processed: 0, decoded: 0, promptTotal: 0, window: 262_144),
             rate: ContractRate(kind: nil, tokensPerSecond: nil, windowSeconds: 30))
-        XCTAssertEqual(row.displayLine, "[parent01 > child001] cq35 · PARKED (kv pool) · 0/262.1k · default P0")
+        XCTAssertEqual(row.displayLine, "[parent01 > child001] cq35 · PARKED")
     }
 
     func testDispatchedRowBracketWithShortParent() {
@@ -39,7 +39,7 @@ final class ParentSessionTests: XCTestCase {
             priority: 10, phase: "LOADING",
             context: ContractContext(used: 0, cached: 0, processed: 0, decoded: 0, promptTotal: 0, window: 262_144),
             rate: ContractRate(kind: nil, tokensPerSecond: nil, windowSeconds: 30))
-        XCTAssertEqual(row.displayLine, "[p1234567 > child002] cq27 · LOADING · 0/262.1k · priority P10")
+        XCTAssertEqual(row.displayLine, "[p1234567 > child002] cq27 · LOADING")
     }
 
     // MARK: - PENALIZED shape includes tier + rank
@@ -51,7 +51,8 @@ final class ParentSessionTests: XCTestCase {
             priority: 0, phase: "PENALIZED",
             context: ContractContext(used: 200_000, cached: 0, processed: 0, decoded: 0, promptTotal: 0, window: 262_144),
             rate: ContractRate(kind: nil, tokensPerSecond: nil, windowSeconds: 30),
-            penalty: PenaltyInfo(reason: "loop", strike: 2, strikes: 3, remainingSeconds: 760, uniformRun: 86, typicalTokens: 48))
+            penalty: PenaltyInfo(reason: "loop", strike: 2, strikes: 3, remainingSeconds: 760, uniformRun: 86, typicalTokens: 48),
+            line: "[penalized] cq35 · PENALIZED (loop 2/3) · 200.0k/262.1k · 12:40 · default P0")
         XCTAssertTrue(row.displayLine.hasSuffix("· default P0"))
     }
 
@@ -62,7 +63,8 @@ final class ParentSessionTests: XCTestCase {
             priority: 0, phase: "PENALIZED",
             context: ContractContext(used: 200_000, cached: 0, processed: 0, decoded: 0, promptTotal: 0, window: 262_144),
             rate: ContractRate(kind: nil, tokensPerSecond: nil, windowSeconds: 30),
-            penalty: PenaltyInfo(reason: "loop", strike: 3, strikes: 3, remainingSeconds: nil, uniformRun: 86, typicalTokens: 48))
+            penalty: PenaltyInfo(reason: "loop", strike: 3, strikes: 3, remainingSeconds: nil, uniformRun: 86, typicalTokens: 48),
+            line: "[parent02 > child003] cq35 · PENALIZED (loop 3/3) · 200.0k/262.1k · held · default P0")
         XCTAssertTrue(row.displayLine.hasPrefix("[parent02 > child003]"))
         XCTAssertTrue(row.displayLine.hasSuffix("· held · default P0"))
     }
@@ -176,6 +178,6 @@ final class ParentSessionTests: XCTestCase {
             priority: 0, phase: "PARKED", parkReason: "rank",
             context: ContractContext(used: 0, cached: 0, processed: 0, decoded: 0, promptTotal: 0, window: 262_144),
             rate: ContractRate(kind: nil, tokensPerSecond: nil, windowSeconds: 30))
-        XCTAssertEqual(row.displayLine, "[parent03 > -] cq35 · PARKED (behind higher rank) · 0/262.1k · default P0")
+        XCTAssertEqual(row.displayLine, "[parent03 > -] cq35 · PARKED")
     }
 }
