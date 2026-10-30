@@ -468,9 +468,7 @@ func (s *FIFO) OnRequest(req HandlerReq) {
 	// prio waits out low-prio cooldown).
 	if s.deferredByGrace(req, evict) {
 		s.logger.Debugf("%s: queuing request for model %s (evictee still within swap-grace)", s.name, req.Model)
-		markParked(&req, ParkCooldown)
-		until := s.graceUntil(evict)
-		markWaitingFor(&req, "", until.Format(time.RFC3339))
+		s.markGraceParked(&req, evict)
 		s.enqueue(req)
 		return
 	}
@@ -1306,6 +1304,27 @@ func (s *FIFO) kvWaitingSession(model string) string {
 // graceUntil returns the latest swap-grace end across evict's models still
 // inside theirs (idleSince + grace) - the "after resident cools down · m:ss"
 // clock for a model-cooldown hold. Zero when withinGrace would not defer.
+// markGraceParked stamps why a request held by deferredByGrace waits. Inside
+// the decode-retention delay (an evictee's idleSince still in the future) the
+// cooldown has not started - user ruling 2026-10-30: it starts only after the
+// retention, and Cooldown() already publishes nothing there - so the request
+// still waits for the resident to finish answering: ParkBusy, no countdown.
+// Before, it read ParkCooldown with the full deadline and every waiting row
+// flipped "finishes answering" <-> "cools down 10:10" at each turn boundary
+// of the resident's tool loop. Protection is the same either way.
+func (s *FIFO) markGraceParked(req *HandlerReq, evict []string) {
+	now := s.now()
+	for _, m := range evict {
+		if since, ok := s.idleSince[m]; ok && now.Before(since) {
+			markParked(req, ParkBusy)
+			markWaitingFor(req, "", "")
+			return
+		}
+	}
+	markParked(req, ParkCooldown)
+	markWaitingFor(req, "", s.graceUntil(evict).Format(time.RFC3339))
+}
+
 func (s *FIFO) graceUntil(evict []string) time.Time {
 	now := s.now()
 	var until time.Time
@@ -1627,9 +1646,7 @@ func (s *FIFO) drainQueue() {
 			continue
 		}
 		if s.deferredByGrace(req, evict) {
-			markParked(&req, ParkCooldown)
-			until := s.graceUntil(evict)
-			markWaitingFor(&req, "", until.Format(time.RFC3339))
+			s.markGraceParked(&req, evict)
 			stick(req)
 			continue
 		}

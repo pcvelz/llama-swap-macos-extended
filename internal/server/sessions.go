@@ -50,7 +50,7 @@ const sessionsIdleRetention = 60 * time.Second
 // PREFILL - the gap between two chained turns of one dispatch, where the row
 // would otherwise flicker DECODE -> IDLE/PARKED/PREFILL -> DECODE at the 1 Hz
 // poll. Configuration owns the live value: sessions.decodeRetentionSeconds
-// (default 30 s, 0 = off); this constant is what a builder uses when the
+// (default 10 s, 0 = off); this constant is what a builder uses when the
 // config leaves it unset. The window is measured from the LAST RAW DECODE,
 // not from the start of the current phase, because with two sessions sharing
 // one lane the gap is the tool call (IDLE) plus the next turn queued behind
@@ -331,6 +331,16 @@ type idleMark struct {
 type decodeReadout struct {
 	used int
 	rate sessionRate
+	// rateAt is when rate was measured. The first DECODE sample of a turn
+	// has no measured rate yet, so the snapshot carries the previous measured
+	// one forward with its original rateAt (see stampDecodeReadout).
+	rateAt time.Time
+}
+
+// rateMeasured: kind AND tokensPerSecond - stampRate sets the kind on the
+// first sample while tokensPerSecond stays nil until the second.
+func rateMeasured(r sessionRate) bool {
+	return r.Kind != nil && r.TokensPerSecond != nil
 }
 
 // sessionsBuilder holds the cross-tick memory a single snapshot cannot carry:
@@ -558,7 +568,7 @@ func (b *sessionsBuilder) build(in sessionsInput) sessionsBody {
 		b.applyLoopState(in, &row, held)
 		b.stampPhaseSince(key, &row, now, r.Timestamp)
 		b.stampRate(key, &row, now, in, r)
-		b.stampDecodeReadout(key, &row)
+		b.stampDecodeReadout(key, &row, now)
 		b.stampSlotWarmUntil(&row)
 		b.stampDecodeDisplay(key, &row, now)
 		present[key] = true
@@ -677,9 +687,12 @@ func (b *sessionsBuilder) build(in sessionsInput) sessionsBody {
 	// on elapsed time alone, which hid the session actually being served.
 	// Phase rank comes BEFORE priority; within one rank the old key still
 	// applies, so the parked subset keeps the scheduler's pick order.
+	// The rank reads the DISPLAYED phase: a retained DECODE row is the active
+	// row on screen, and ranking it by its raw HOT/IDLE/PARKED dropped it below
+	// the queue and back to the top at every turn of a tool loop (2026-10-30).
 	sort.SliceStable(body.Sessions, func(i, j int) bool {
 		a, c := body.Sessions[i], body.Sessions[j]
-		if ra, rc := phaseSortRank(a.Phase), phaseSortRank(c.Phase); ra != rc {
+		if ra, rc := phaseSortRank(shownPhase(a)), phaseSortRank(shownPhase(c)); ra != rc {
 			return ra < rc
 		}
 		if a.Priority != c.Priority {
@@ -691,6 +704,15 @@ func (b *sessionsBuilder) build(in sessionsInput) sessionsBody {
 		return a.SessionShort < c.SessionShort
 	})
 	return body
+}
+
+// shownPhase is the phase a menu renders for row: display.phase when the row
+// carries one, its raw phase otherwise.
+func shownPhase(row sessionEntry) string {
+	if row.Display != nil && row.Display.Phase != "" {
+		return row.Display.Phase
+	}
+	return row.Phase
 }
 
 // phaseSortRank orders rows for the menus: the backend is working on DECODE
@@ -893,10 +915,16 @@ func (b *sessionsBuilder) requestRow(in sessionsInput, r swaputil.InflightReques
 // prompt reads as cached (contract fixture decode-parked-hot.json).
 func (b *sessionsBuilder) hotRow(in sessionsInput, model string, h swaputil.HotSlot) sessionEntry {
 	tier := ""
-	if prev, ok := b.known[h.SessionID]; ok {
+	prev, known := b.known[h.SessionID]
+	if known {
 		tier = prev.Tier
 	}
 	row := b.baseRow(model, h.SessionID, tier)
+	if known {
+		// The parent is the session's identity, not its request's: without
+		// it the row's label lost "[parent >" at every turn boundary.
+		row.ParentSessionId, row.ParentSessionShort = prev.ParentSessionId, prev.ParentSessionShort
+	}
 	row.Phase = phaseHot
 	slot := h.Slot
 	row.Slot = &slot
@@ -915,6 +943,7 @@ func (b *sessionsBuilder) hotRow(in sessionsInput, model string, h swaputil.HotS
 
 func (b *sessionsBuilder) idleRow(in sessionsInput, m idleMark, now time.Time) sessionEntry {
 	row := b.baseRow(m.entry.Model, m.entry.SessionID, m.entry.Tier)
+	row.ParentSessionId, row.ParentSessionShort = m.entry.ParentSessionId, m.entry.ParentSessionShort
 	row.Phase = phaseIdle
 	row.PhaseSinceMs = now.Sub(m.since).Milliseconds()
 	row.Context.Window = b.window(in, m.entry.Model)
@@ -951,11 +980,17 @@ func (b *sessionsBuilder) stampPhaseSince(key string, row *sessionEntry, now, ar
 // A DECODE row whose rate is not measured yet (fewer than two samples)
 // still snapshots: contextUsed must be retained regardless, and the rate
 // travels with whatever stampRate set, including a nil kind.
-func (b *sessionsBuilder) stampDecodeReadout(key string, row *sessionEntry) {
+func (b *sessionsBuilder) stampDecodeReadout(key string, row *sessionEntry, now time.Time) {
 	if row.SessionID == "" || row.Phase != phaseDecode {
 		return
 	}
-	b.lastDecodeReadout[key] = decodeReadout{used: row.Context.Used, rate: row.Rate}
+	snap := decodeReadout{used: row.Context.Used, rate: row.Rate, rateAt: now}
+	if !rateMeasured(row.Rate) {
+		if prev, ok := b.lastDecodeReadout[key]; ok && rateMeasured(prev.rate) {
+			snap.rate, snap.rateAt = prev.rate, prev.rateAt
+		}
+	}
+	b.lastDecodeReadout[key] = snap
 }
 
 // stampDecodeDisplay is the decode retention, display-only. While a session
@@ -988,6 +1023,21 @@ func (b *sessionsBuilder) stampDecodeDisplay(key string, row *sessionEntry, now 
 	if window <= 0 {
 		return
 	}
+	if row.Phase == phaseDecode {
+		// The first DECODE sample of a new turn has no measured rate yet:
+		// show the last measured one (if it is inside the window) instead of
+		// blanking the t/s for that second. Context is the raw, current one.
+		if rateMeasured(row.Rate) || row.Penalty != nil {
+			return
+		}
+		snap, ok := b.lastDecodeReadout[key]
+		if !ok || !rateMeasured(snap.rate) || now.Sub(snap.rateAt) >= window {
+			return
+		}
+		used, rate := row.Context.Used, snap.rate
+		row.Display = &sessionDisplay{Phase: phaseDecode, ContextUsed: &used, Rate: &rate}
+		return
+	}
 	if row.Phase != phasePrefill && row.Phase != phaseIdle && row.Phase != phaseParked && row.Phase != phaseHot {
 		return
 	}
@@ -1007,7 +1057,7 @@ func (b *sessionsBuilder) stampDecodeDisplay(key string, row *sessionEntry, now 
 	}
 	used := snap.used
 	disp := &sessionDisplay{Phase: phaseDecode, ContextUsed: &used}
-	if snap.rate.Kind != nil && snap.rate.TokensPerSecond != nil {
+	if rateMeasured(snap.rate) {
 		// The last DECODE carried a MEASURED rate (kind AND tokensPerSecond -
 		// stampRate sets kind on the first sample while tokensPerSecond stays
 		// nil until the second): expose it verbatim. Anything less is omitted
