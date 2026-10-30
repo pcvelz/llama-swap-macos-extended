@@ -330,11 +330,10 @@ type idleMark struct {
 // raw counters have already fallen to 0 or switched to prefill.
 type decodeReadout struct {
 	used int
+	// rate is the last MEASURED decode rate: the first DECODE sample of a
+	// turn has none yet, so the snapshot carries the previous measured one
+	// forward (see stampDecodeReadout).
 	rate sessionRate
-	// rateAt is when rate was measured. The first DECODE sample of a turn
-	// has no measured rate yet, so the snapshot carries the previous measured
-	// one forward with its original rateAt (see stampDecodeReadout).
-	rateAt time.Time
 }
 
 // rateMeasured: kind AND tokensPerSecond - stampRate sets the kind on the
@@ -568,7 +567,7 @@ func (b *sessionsBuilder) build(in sessionsInput) sessionsBody {
 		b.applyLoopState(in, &row, held)
 		b.stampPhaseSince(key, &row, now, r.Timestamp)
 		b.stampRate(key, &row, now, in, r)
-		b.stampDecodeReadout(key, &row, now)
+		b.stampDecodeReadout(key, &row)
 		b.stampSlotWarmUntil(&row)
 		b.stampDecodeDisplay(key, &row, now)
 		present[key] = true
@@ -980,14 +979,14 @@ func (b *sessionsBuilder) stampPhaseSince(key string, row *sessionEntry, now, ar
 // A DECODE row whose rate is not measured yet (fewer than two samples)
 // still snapshots: contextUsed must be retained regardless, and the rate
 // travels with whatever stampRate set, including a nil kind.
-func (b *sessionsBuilder) stampDecodeReadout(key string, row *sessionEntry, now time.Time) {
+func (b *sessionsBuilder) stampDecodeReadout(key string, row *sessionEntry) {
 	if row.SessionID == "" || row.Phase != phaseDecode {
 		return
 	}
-	snap := decodeReadout{used: row.Context.Used, rate: row.Rate, rateAt: now}
+	snap := decodeReadout{used: row.Context.Used, rate: row.Rate}
 	if !rateMeasured(row.Rate) {
 		if prev, ok := b.lastDecodeReadout[key]; ok && rateMeasured(prev.rate) {
-			snap.rate, snap.rateAt = prev.rate, prev.rateAt
+			snap.rate = prev.rate
 		}
 	}
 	b.lastDecodeReadout[key] = snap
@@ -1025,13 +1024,16 @@ func (b *sessionsBuilder) stampDecodeDisplay(key string, row *sessionEntry, now 
 	}
 	if row.Phase == phaseDecode {
 		// The first DECODE sample of a new turn has no measured rate yet:
-		// show the last measured one (if it is inside the window) instead of
-		// blanking the t/s for that second. Context is the raw, current one.
+		// show the session's last measured one instead of blanking the t/s
+		// for that second. Not bounded by the window: the turn gap routinely
+		// outlasts it (measured 2026-10-30 on a Splash lane: median 14 s, p90
+		// 38 s), and the session IS decoding - only the number is a second
+		// old. Context is the raw, current one.
 		if rateMeasured(row.Rate) || row.Penalty != nil {
 			return
 		}
 		snap, ok := b.lastDecodeReadout[key]
-		if !ok || !rateMeasured(snap.rate) || now.Sub(snap.rateAt) >= window {
+		if !ok || !rateMeasured(snap.rate) {
 			return
 		}
 		used, rate := row.Context.Used, snap.rate

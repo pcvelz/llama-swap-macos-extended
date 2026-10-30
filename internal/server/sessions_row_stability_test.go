@@ -80,6 +80,31 @@ func TestSessions_DecodeStartKeepsLastMeasuredRate(t *testing.T) {
 	assertSessionsInvariants(t, got)
 }
 
+// The live case (2026-10-30, a cq180 dispatch on a Splash lane, 62 turns):
+// the gap between two decodes is usually LONGER than the retention window
+// (median 14 s, p90 38 s), and the t/s blanked for one tick at every decode
+// start because the carried rate was only used inside the window.
+func TestSessions_DecodeStartKeepsLastMeasuredRateAfterLongGap(t *testing.T) {
+	b := newSessionsBuilder(sessionsTestConfig()) // 30 s window
+	t0 := time.Date(2026, 9, 18, 12, 0, 0, 0, time.UTC)
+	running := map[string]process.ProcessState{sessModel: process.StateReady}
+	decodeWithRate(t, b, t0) // 58.0 t/s at t0+1s
+
+	slots := func(processed, decoded int) map[string][]childSlot {
+		return map[string][]childSlot{sessModel: {{ID: 0, NCtx: 262144, IsProcessing: true,
+			NPromptTokens: 90000, NPromptTokensCache: 38000, NPromptTokensProcessed: processed, NDecoded: decoded}}}
+	}
+	b.build(sessionsInput{Now: t0.Add(40 * time.Second), Running: running,
+		Requests: []swaputil.InflightRequestEntry{retentionReq("r2", t0.Add(39*time.Second), nil)}, Slots: slots(3100, 0)})
+	got := b.build(sessionsInput{Now: t0.Add(45 * time.Second), Running: running,
+		Requests: []swaputil.InflightRequestEntry{retentionReq("r2", t0.Add(39*time.Second), nil)}, Slots: slots(3300, 40)})
+	if r := got.Sessions[0]; r.Phase != "DECODE" || r.Rate.TokensPerSecond != nil {
+		t.Fatalf("setup: phase=%s rate=%+v, want raw DECODE with an unmeasured rate", r.Phase, r.Rate)
+	}
+	retainedDisplay(t, got, "s1", float64(got.Sessions[0].Context.Used), 58.0)
+	assertSessionsInvariants(t, got)
+}
+
 // A dispatched child's row names its parent ("[parent > child]"). HOT and
 // IDLE rows are rebuilt from the session's previous row, so they must carry
 // the same parent - otherwise the label changes at every turn boundary.
