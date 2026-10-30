@@ -11,7 +11,7 @@ import (
 // FifoConfig, but the operator-facing knob stays sessions.decodeRetentionSeconds
 // (it also drives the sessions API's display retention). The loader must
 // therefore copy the sessions value into the scheduler config: the seeded
-// default (10) reaches a box whose yaml names neither block, an explicit
+// default (30) reaches a box whose yaml names neither block, an explicit
 // sessions.decodeRetentionSeconds wins, and an explicit 0 means no delay.
 // A hand-built FifoConfig at its zero value means no delay, which is what
 // every pre-existing scheduler test pins.
@@ -24,9 +24,9 @@ models:
 
 	cfg, err := LoadConfigFromReader(strings.NewReader(base))
 	assert.NoError(t, err)
-	assert.Equal(t, 10, cfg.Sessions.DecodeRetentionSeconds,
+	assert.Equal(t, 30, cfg.Sessions.DecodeRetentionSeconds,
 		"the seeded default a real box runs")
-	assert.Equal(t, 10, cfg.Routing.Scheduler.Settings.Fifo.DecodeRetentionSeconds,
+	assert.Equal(t, 30, cfg.Routing.Scheduler.Settings.Fifo.DecodeRetentionSeconds,
 		"the loader must hand the sessions default to the scheduler")
 
 	custom := "sessions:\n  decodeRetentionSeconds: 12\n" + base
