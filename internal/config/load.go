@@ -127,6 +127,13 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 	if config.Sessions.DecodeRetentionSeconds < 0 {
 		return Config{}, fmt.Errorf("sessions.decodeRetentionSeconds must be >= 0")
 	}
+	// WHY a copy and not a second knob: the operator-facing setting stays
+	// sessions.decodeRetentionSeconds (it also drives the sessions API's
+	// display retention); the scheduler reads the same value through
+	// FifoConfig so both cooldowns are delayed by exactly the display
+	// window. Copied AFTER decoding/defaulting so the seeded 30, an explicit
+	// override and an explicit 0 all reach the scheduler.
+	config.Routing.Scheduler.Settings.Fifo.DecodeRetentionSeconds = config.Sessions.DecodeRetentionSeconds
 
 	// WHY reject > 0: the valve is gone, so a positive value would silently
 	// promise a timeout exit the scheduler no longer has. 0 and -1 (the old

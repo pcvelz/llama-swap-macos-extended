@@ -32,12 +32,21 @@ type slotGraceRig struct {
 
 func newSlotGraceRig(t *testing.T, graceSec int) *slotGraceRig {
 	t.Helper()
+	return newSlotGraceRigRetention(t, graceSec, 0)
+}
+
+// newSlotGraceRigRetention additionally wires the decode-retention delay
+// through FifoConfig the way the production config loader wires it
+// (sessions.decodeRetentionSeconds -> FifoConfig); retention 0 is the
+// pre-incident shape every other test in this file pins.
+func newSlotGraceRigRetention(t *testing.T, graceSec, retention int) *slotGraceRig {
+	t.Helper()
 	eff := newFakeEffects()
 	eff.states["m"] = process.StateReady
 	models := map[string]config.ModelConfig{
 		"m": {ConcurrencyLimit: 2, SwapGraceSeconds: graceSec},
 	}
-	cfg := config.FifoConfig{KVPoolTokens: map[string]int{"m": slotPool}}
+	cfg := config.FifoConfig{KVPoolTokens: map[string]int{"m": slotPool}, DecodeRetentionSeconds: retention}
 	r := &slotGraceRig{t: t, eff: eff, clock: time.Unix(1_000_000, 0)}
 	s := NewFIFO("test", logmon.NewWriter(io.Discard), &stubPlanner{}, cfg, models, eff)
 	r.s = s
@@ -314,4 +323,38 @@ func TestSlotGrace_SlotWarmUntilReportsCoolingSessions(t *testing.T) {
 	if got := r.s.SlotWarmUntil(); len(got) != 0 {
 		t.Fatalf("an expired cooldown must not be reported: %v", got)
 	}
+}
+
+// --- Test: the decode-retention delay pushes the whole cooldown out ---
+//
+// (2026-10-30 incident) With sessions.decodeRetentionSeconds=30 wired through
+// FifoConfig the way the production loader wires it, the slot cooldown starts
+// only AFTER the retention period: a session that finished at t0 keeps its
+// slot until t0+30+60, SlotWarmUntil reports that deadline, and a request
+// that would displace the slot parks until it.
+func TestSlotGrace_RetentionDelaysWarmUntil(t *testing.T) {
+	r := newSlotGraceRigRetention(t, 60, 30)
+
+	r.coldReq("A", 10000)
+	r.wantServed(1, "A's first request")
+	r.warmDone("A", 10000) // completion at t0
+	want := r.clock.Add(90 * time.Second).Format(time.RFC3339)
+	if got := r.s.SlotWarmUntil()["A"]; got != want {
+		t.Fatalf("SlotWarmUntil[A]=%q want %q (completion+retention+grace)", got, want)
+	}
+
+	r.advance(10 * time.Second)
+	r.coldReq("B", 10000)
+	r.wantServed(1, "B must park: granting it would displace A's delayed-cooling slot")
+	r.wantQueuedCount(1, "B parked behind the delayed cooldown")
+
+	r.advance(79 * time.Second) // t0+89: one second before the deadline
+	r.wantServed(1, "B still parked one second before completion+retention+grace")
+	if got := r.s.SlotWarmUntil()["A"]; got != want {
+		t.Fatalf("SlotWarmUntil[A]=%q want %q at t0+89", got, want)
+	}
+
+	r.advance(1 * time.Second) // t0+90
+	r.wantServed(2, "B admitted at completion+retention+grace")
+	r.wantQueuedCount(0, "queue drained")
 }

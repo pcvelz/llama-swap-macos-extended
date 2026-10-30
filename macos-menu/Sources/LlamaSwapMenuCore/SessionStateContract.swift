@@ -99,20 +99,31 @@ public struct ContractSession: Decodable {
     /// First 8 chars of parentSessionId; absent when there is no parent.
     public let parentSessionShort: String?
     /// The contract's optional `display` object (session-state-contract.md's
-    /// `display.phase` row): what a MENU shows for this row, absent when it
-    /// equals the raw `phase`. Today the server sets it only to DECODE for
-    /// 8 s (`sessionsDecodeRetention`) after the row's last raw DECODE.
-    /// Renderers show `display.phase` when present, else `phase`; machine
-    /// readers keep the raw `phase`, which is never altered. Absent on
-    /// servers that predate fork 9dfdc32, so the whole object is optional.
+    /// `display` row): what a MENU shows for this row, absent when it equals
+    /// the raw fields. The server sets it to DECODE for
+    /// `sessions.decodeRetentionSeconds` (default 30 s) after the row's last
+    /// raw DECODE, together with the last decode's `contextUsed` and `rate`
+    /// (2026-10-30: the witnessed case was the phase holding while the raw
+    /// HOT counters fell to 0). Renderers show the `display` values when
+    /// present, else the raw fields; machine readers keep the raw values,
+    /// which are never altered. Absent on servers that predate fork 9dfdc32,
+    /// so the whole object is optional; `contextUsed`/`rate` are in turn
+    /// optional inside it for servers between 9dfdc32 and the readout.
     public let display: ContractDisplay?
 }
 
-/// The `display` object of a `sessions[]` entry. Only `phase` is defined
-/// today; an unknown shape decodes to nil fields, never a decode failure
+/// The `display` object of a `sessions[]` entry. Every field is optional:
+/// an unknown or partial shape decodes to nil fields, never a decode failure
 /// (invariant 5).
 public struct ContractDisplay: Codable, Equatable {
     public let phase: String?
+    /// The last raw DECODE's `context.used`, present on every retained row
+    /// (including numeric zero - a decode can start at used=0).
+    public let contextUsed: Int?
+    /// The last raw DECODE's rate, same shape as the top-level `rate`;
+    /// absent when that row had no measured rate yet (the renderer must not
+    /// invent a 0 t/s).
+    public let rate: ContractRate?
 }
 
 /// The PENALIZED hold's detail - session-state-contract.md's `penalty`
@@ -164,6 +175,8 @@ extension SessionRow {
             priority: entry.priority,
             phase: entry.phase,
             displayPhase: entry.display?.phase,
+            displayContextUsed: entry.display?.contextUsed,
+            displayRate: entry.display?.rate,
             parkReason: entry.parkReason,
             context: entry.context,
             progress: entry.progress,

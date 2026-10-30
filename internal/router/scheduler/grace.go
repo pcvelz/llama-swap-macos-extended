@@ -83,6 +83,13 @@ func (s *FIFO) cooldownSnapshotWaiting(now time.Time) *swaputil.Cooldown {
 			if !ok {
 				continue
 			}
+			if now.Before(since) {
+				// Inside the decode-retention delay (idleSince is completion
+				// +retention): the idle clock has not started, so no cooldown
+				// is visible yet. Protection is unaffected - this is a
+				// published-snapshot boundary only.
+				continue
+			}
 			if s.inFlight[ev] > 0 {
 				// Busy, not cooling: the in-flight check holds this request,
 				// and the cooldown only starts when the resident drains.
@@ -142,6 +149,11 @@ func (s *FIFO) cooldownSnapshotIdle(now time.Time) *swaputil.Cooldown {
 			continue
 		}
 		if s.beingEvicted(id) {
+			continue
+		}
+		if now.Before(s.idleSince[id]) {
+			// Same decode-retention boundary as cooldownSnapshotWaiting: the
+			// delayed idle clock has not started, so nothing is cooling yet.
 			continue
 		}
 		remaining := g - now.Sub(s.idleSince[id])

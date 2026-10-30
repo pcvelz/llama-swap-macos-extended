@@ -335,6 +335,11 @@ groups:
 			},
 			Scheduler: SchedulerConfig{
 				Use: "fifo",
+				Settings: SchedulerSettings{
+					// Derived, not yaml: the loader copies the defaulted
+					// sessions.decodeRetentionSeconds (30) into it.
+					Fifo: FifoConfig{DecodeRetentionSeconds: 30},
+				},
 			},
 		},
 	}

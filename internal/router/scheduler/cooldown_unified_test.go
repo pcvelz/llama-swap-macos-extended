@@ -384,3 +384,202 @@ func TestCooldownUnified_OneSessionAtATime_cq27Shape(t *testing.T) {
 	r.req(cdSessA, cdFitA, swaputil.DefaultTier)
 	r.wantServed(2, "A's next turn parks behind B's in-flight large turn")
 }
+
+// --- decode-retention delay (2026-10-30 incident) --------------------------------
+//
+// The cooldown contract used to start at request completion. The user ruling
+// now requires BOTH cooldowns - the model idle clock and the slot cooldown -
+// to start only after the sessions.decodeRetentionSeconds display-retention
+// period, preserving the swapGraceSeconds duration after that delay:
+// deadline = completion + retention + grace. The plumbing runs through
+// config.FifoConfig (the loader copies sessions.decodeRetentionSeconds, whose
+// seeded default is 30, into it); a hand-built FifoConfig at its zero value
+// means NO delay, which is every pre-existing test in this package.
+
+// newCooldownRigRetention is newCooldownRigLarge with the decode-retention
+// delay wired through FifoConfig exactly the way the production config
+// loader wires it (sessions.decodeRetentionSeconds -> FifoConfig field).
+func newCooldownRigRetention(t *testing.T, swapGrace, retention, maxLarge int) *cooldownRig {
+	t.Helper()
+	withLargePrefillThreshold(t, 100)
+	eff := newFakeEffects()
+	eff.states["m"] = process.StateReady
+	models := map[string]config.ModelConfig{
+		"m": {ConcurrencyLimit: 2, MaxParallelLargePrefill: maxLarge, SwapGraceSeconds: swapGrace},
+	}
+	cfg := config.FifoConfig{KVPoolTokens: map[string]int{"m": cdPool}, DecodeRetentionSeconds: retention}
+	t0 := time.Unix(1_800_000_000, 0)
+	r := &cooldownRig{t: t, eff: eff, start: t0, clock: t0}
+	r.s = NewFIFO("test", logmon.NewWriter(io.Discard), &stubPlanner{}, cfg, models, eff)
+	r.s.now = func() time.Time { return r.clock }
+	return r
+}
+
+// Slot level with retention 30, grace 600: another session cannot displace
+// the cooling slot during the 30 s delay, nor during the 600 s grace that
+// follows it; it is granted at completion+630. SlotWarmUntil reports that
+// same deadline.
+func TestCooldownUnified_RetentionDelaysSlotCooldown(t *testing.T) {
+	r := newCooldownRigRetention(t, cdGrace, 30, 1)
+
+	r.req(cdSessA, cdBig, swaputil.DefaultTier)
+	r.wantServed(1, "A alone")
+	r.done(cdSessA, cdBig, false) // completion at t0
+	want := r.start.Add(630 * time.Second).Format(time.RFC3339)
+
+	r.advance(10 * time.Second)
+	r.req(cdSessB, cdOver, swaputil.DefaultTier) // t0+10: would overflow the pool beside A
+	r.wantServed(1, "B must park: granting it would displace A's cooling slot")
+	if got := r.s.SlotWarmUntil()[cdSessA]; got != want {
+		t.Fatalf("SlotWarmUntil[A]=%q want %q (completion+retention+grace)", got, want)
+	}
+
+	r.advance(619 * time.Second) // t0+629: one second before the deadline
+	r.wantServed(1, "B still parked one second before completion+retention+grace")
+	if got := r.s.SlotWarmUntil()[cdSessA]; got != want {
+		t.Fatalf("SlotWarmUntil[A]=%q want %q at t0+629", got, want)
+	}
+
+	r.advance(1 * time.Second) // t0+630
+	r.wantServed(2, "B granted at completion+retention+grace")
+}
+
+// Model level with retention 30, grace 60: the idle clock reaches
+// completion+90, so a queued model cannot swap in during the delay, and the
+// published Cooldown() countdown measures from the delayed start.
+func TestCooldownUnified_RetentionDelaysModelCooldown(t *testing.T) {
+	eff := newFakeEffects()
+	eff.states["a"] = process.StateReady
+	eff.states["b"] = process.StateStopped
+	clk := time.Unix(1000, 0)
+	models := map[string]config.ModelConfig{
+		"a": {SwapGraceSeconds: 60},
+		"b": {},
+	}
+	s := NewFIFO("test", logmon.NewWriter(io.Discard),
+		&stubPlanner{evict: map[string][]string{"b": {"a"}}},
+		config.FifoConfig{DecodeRetentionSeconds: 30}, models, eff)
+	s.now = func() time.Time { return clk }
+
+	s.OnRequest(req("a"))
+	s.OnServeDone(ServeDoneEvent{ModelID: "a"}) // completion at t=1000
+
+	clk = clk.Add(10 * time.Second)
+	s.OnRequest(reqCh("b")) // t=1010, parked behind a
+	if got := eff.startsFor("b"); got != 0 {
+		t.Fatalf("StartSwap(b)=%d want 0 during the delay+grace", got)
+	}
+
+	clk = clk.Add(60 * time.Second) // t=1070 = completion+70
+	s.OnTick()
+	if got := eff.startsFor("b"); got != 0 {
+		t.Fatalf("StartSwap(b)=%d want 0 at completion+70s: the 60s grace only starts after the 30s retention (deadline +90s)", got)
+	}
+	cd := s.Cooldown()
+	if cd == nil || cd.EvicteeModel != "a" || cd.NextModel != "b" || cd.RemainingSeconds != 20 {
+		t.Fatalf("Cooldown()=%+v want evictee=a next=b remaining=20s (deadline completion+90s)", cd)
+	}
+
+	clk = clk.Add(20 * time.Second) // t=1090 = completion+90
+	s.OnTick()
+	if got := eff.startsFor("b"); got != 1 {
+		t.Fatalf("StartSwap(b)=%d want 1 at completion+retention+grace (+90s)", got)
+	}
+}
+
+// The published cooldown is INVISIBLE until the delayed idle clock starts:
+// with retention 30 / grace 60, Cooldown() is nil at completion+10s and
+// +29s, appears at completion+30s with the full 60s remaining, and only then
+// counts down (+70s -> 20s, already pinned by
+// TestCooldownUnified_RetentionDelaysModelCooldown). Protection is unaffected
+// throughout: only the published snapshot waits for the delayed start.
+func TestCooldownUnified_RetentionHidesCooldownUntilDelayedStart(t *testing.T) {
+	eff := newFakeEffects()
+	eff.states["a"] = process.StateReady
+	eff.states["b"] = process.StateStopped
+	clk := time.Unix(1000, 0)
+	models := map[string]config.ModelConfig{
+		"a": {SwapGraceSeconds: 60},
+		"b": {},
+	}
+	s := NewFIFO("test", logmon.NewWriter(io.Discard),
+		&stubPlanner{evict: map[string][]string{"b": {"a"}}},
+		config.FifoConfig{DecodeRetentionSeconds: 30}, models, eff)
+	s.now = func() time.Time { return clk }
+
+	s.OnRequest(req("a"))
+	s.OnServeDone(ServeDoneEvent{ModelID: "a"}) // completion at t=1000
+
+	clk = clk.Add(10 * time.Second)
+	s.OnRequest(reqCh("b")) // t=1010, parked behind a
+	s.OnTick()
+	if cd := s.Cooldown(); cd != nil {
+		t.Fatalf("Cooldown()=%+v want nil at completion+10s: the idle clock starts at completion+retention", cd)
+	}
+
+	clk = clk.Add(19 * time.Second) // t=1029 = completion+29
+	s.OnTick()
+	if cd := s.Cooldown(); cd != nil {
+		t.Fatalf("Cooldown()=%+v want nil at completion+29s: the idle clock starts at completion+retention", cd)
+	}
+
+	clk = clk.Add(1 * time.Second) // t=1030 = completion+30
+	s.OnTick()
+	cd := s.Cooldown()
+	if cd == nil || cd.EvicteeModel != "a" || cd.NextModel != "b" || cd.RemainingSeconds != 60 {
+		t.Fatalf("Cooldown()=%+v want evictee=a next=b remaining=60s at completion+30s (the delayed idle clock starts, full grace ahead)", cd)
+	}
+}
+
+// retention=0 in a hand-built FifoConfig means no delay: the deadlines are
+// exactly the ones every pre-existing test in this package pins.
+func TestCooldownUnified_RetentionZeroKeepsCurrentDeadlines(t *testing.T) {
+	r := newCooldownRigRetention(t, cdGrace, 0, 1)
+
+	r.req(cdSessA, cdBig, swaputil.DefaultTier)
+	r.wantServed(1, "A alone")
+	r.done(cdSessA, cdBig, false) // completion at t0
+	want := r.start.Add(600 * time.Second).Format(time.RFC3339)
+
+	r.advance(10 * time.Second)
+	r.req(cdSessB, cdOver, swaputil.DefaultTier)
+	r.wantServed(1, "B parks inside the unchanged 600s grace")
+	if got := r.s.SlotWarmUntil()[cdSessA]; got != want {
+		t.Fatalf("SlotWarmUntil[A]=%q want %q (completion+grace, no delay)", got, want)
+	}
+
+	r.advance(590 * time.Second) // t0+600
+	r.wantServed(2, "B granted at completion+grace, unchanged by the zero retention")
+}
+
+// Looping completions must not gain the extension: the deadline still
+// measures from the last NON-looping completion, now +retention+grace, so a
+// stream of looping turns inside the delay earns nothing.
+func TestCooldownUnified_RetentionLoopingDoesNotEarnExtension(t *testing.T) {
+	r := newCooldownRigRetention(t, cdGrace, 30, 1)
+
+	r.req(cdSessA, cdBig, swaputil.DefaultTier)
+	r.done(cdSessA, cdBig, false) // the last productive completion, t0
+
+	served := 1
+	for i := 0; i < 19; i++ { // looping turns every 30s, the last ending at t0+570
+		r.advance(5 * time.Second)
+		r.req(cdSessA, cdBig, swaputil.DefaultTier)
+		served++
+		if i == 0 {
+			r.req(cdSessB, cdOver, swaputil.DefaultTier) // t0+5: overflows, parks
+		}
+		r.wantServed(served, "A's looping turn is granted, B stays parked")
+		r.advance(25 * time.Second)
+		r.done(cdSessA, cdBig, true)
+		r.wantServed(served, "B stays parked: a looping completion must not move the deadline")
+	}
+	if got := r.clock.Sub(r.start); got != 570*time.Second {
+		t.Fatalf("fixture drift: clock at t0+%s want t0+570s", got)
+	}
+
+	r.advance(59 * time.Second) // t0+629: one second before t0+630
+	r.wantServed(served, "B still parked one second before the last productive completion +retention+grace")
+	r.advance(1 * time.Second) // t0+630
+	r.wantServed(served+1, "B granted at t0+630: deadline = last non-looping completion +30s+600s")
+}

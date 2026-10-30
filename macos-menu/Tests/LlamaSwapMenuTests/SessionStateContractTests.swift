@@ -59,7 +59,7 @@ final class SessionStateContractTests: XCTestCase {
         XCTAssertEqual(row.context.used, row.context.cached + row.context.processed + row.context.decoded)
 
         XCTAssertEqual(row.displayLine,
-                       "[69699f8b] cq27 · PREFILL · 92.2k/262.1k · 90.0% · prefill 50.7 t/s · default P0",
+                       "[69699f8b] cq27 · PREFILL · 92.2k/262.1k · 90.0% · 50.7 t/s · default P0",
                        "every segment must come straight from the body: k-units, one-decimal "
                        + "percent and rate are formatting, not derivation")
     }
@@ -74,7 +74,7 @@ final class SessionStateContractTests: XCTestCase {
         XCTAssertEqual(parked.displayLine, "[a1b2c3d4] cq27 · PARKED (kv pool) · 0/262.1k · priority P10")
 
         let decode = try XCTUnwrap(rows.first { $0.phase == "DECODE" })
-        XCTAssertEqual(decode.displayLine, "[69699f8b] cq27 · DECODE · 102.6k/262.1k · decode 7.1 t/s · default P0")
+        XCTAssertEqual(decode.displayLine, "[69699f8b] cq27 · DECODE · 102.6k/262.1k · 7.1 t/s · default P0")
 
         let hot = try XCTUnwrap(rows.first { $0.phase == "HOT" })
         // HOT carries no rate and no progress: neither segment appears, and
@@ -341,5 +341,194 @@ final class SessionStateContractTests: XCTestCase {
         XCTAssertEqual(row.phase, "IDLE")
         XCTAssertTrue(row.displayLine.contains("· IDLE ·"),
                       "without display the raw phase renders, got '\(row.displayLine)'")
+    }
+
+    /// The retention readout (2026-10-30 incident): `display.phase=DECODE`
+    /// now travels with `display.contextUsed` and `display.rate` - the last
+    /// real DECODE sample - because a live observer saw the phase hold while
+    /// the raw HOT `context.used` fell to 0 and the rate went absent. The
+    /// menu renders the DISPLAY numbers verbatim: `context.window` stays the
+    /// denominator and nothing is recomputed client-side (invariant 3); the
+    /// raw fields stay raw for machine readers.
+    func testDisplayPhaseRetainedReadoutRendersVerbatim() throws {
+        let json = """
+        {"sessionId":"z","sessionShort":"zzzzzzzz","requestId":null,"model":"m","alias":"a",
+         "tier":"default","priority":0,"phase":"HOT",
+         "display":{"phase":"DECODE","contextUsed":100809,
+           "rate":{"kind":"decode","tokensPerSecond":21.4,"windowSeconds":30.0}},
+         "parkReason":null,"slot":null,
+         "context":{"used":0,"cached":0,"processed":0,"decoded":0,"promptTotal":41976,"window":262144},
+         "progress":null,"rate":{"kind":null,"tokensPerSecond":null,"windowSeconds":30.0},
+         "elapsedMs":0,"phaseSinceMs":0,"respTokens":0}
+        """.data(using: .utf8)!
+        let entry = try JSONDecoder().decode(ContractSession.self, from: json)
+        let row = SessionRow(contract: entry)
+
+        // Raw values stay raw for machine readers - the override is
+        // render-only:
+        XCTAssertEqual(row.phase, "HOT")
+        XCTAssertEqual(row.context.used, 0)
+        XCTAssertNil(row.rate.kind)
+        XCTAssertEqual(row.displayPhase, "DECODE")
+
+        // The used/rate segments render the DISPLAY readout while
+        // context.window remains the raw denominator:
+        XCTAssertEqual(row.displayLine,
+                       "[zzzzzzzz] a · DECODE · 100.8k/262.1k · 21.4 t/s · default P0",
+                       "the retained readout renders verbatim; no client-side calculation, "
+                       + "got '\(row.displayLine)'")
+    }
+
+    /// Leak case 1 (2026-10-30 incident): a retained DECODE row sitting on a
+    /// raw PREFILL must NOT print the raw prefill progress percent - the
+    /// presentation is DECODE, and DECODE rows never carry progress. The raw
+    /// fields still decode unchanged for machine readers.
+    func testDisplayPhaseRetainedDecodeHidesRawPrefillProgress() throws {
+        let json = """
+        {"sessionId":"z","sessionShort":"zzzzzzzz","requestId":"r2","model":"m","alias":"a",
+         "tier":"default","priority":0,"phase":"PREFILL",
+         "display":{"phase":"DECODE","contextUsed":100809,
+           "rate":{"kind":"decode","tokensPerSecond":21.4,"windowSeconds":30.0}},
+         "parkReason":null,"slot":0,
+         "context":{"used":10,"cached":38000,"processed":2960,"decoded":0,"promptTotal":90000,"window":262144},
+         "progress":0.4182,"rate":{"kind":"prefill","tokensPerSecond":4120.0,"windowSeconds":30.0},
+         "elapsedMs":4000,"phaseSinceMs":0,"respTokens":0}
+        """.data(using: .utf8)!
+        let entry = try JSONDecoder().decode(ContractSession.self, from: json)
+        let row = SessionRow(contract: entry)
+
+        // Raw stays raw:
+        XCTAssertEqual(row.phase, "PREFILL")
+        XCTAssertEqual(row.progress, 0.4182)
+        XCTAssertEqual(row.rate.kind, "prefill")
+
+        // The render shows DECODE with the retained readout and NO progress:
+        XCTAssertEqual(row.displayLine,
+                       "[zzzzzzzz] a · DECODE · 100.8k/262.1k · 21.4 t/s · default P0",
+                       "a retained DECODE must not leak the raw PREFILL progress, "
+                       + "got '\(row.displayLine)'")
+        XCTAssertFalse(row.displayLine.contains("41.8%"),
+                       "the raw prefill percent must not appear, got '\(row.displayLine)'")
+    }
+
+    /// The exact zero-first-PREFILL case (2026-10-30 incident, menu side):
+    /// the next turn's first poll arrives before the child has processed
+    /// anything, so the raw PREFILL carries context.used 0 and decoded 0
+    /// (its own rate not yet measured) while the retention still displays
+    /// DECODE with the last raw DECODE's readout. The raw zeros stay on the
+    /// raw fields, and NO zero leaks into the rendered row: the used segment
+    /// shows the retained 41.5k, never "0/262.1k".
+    func testDisplayPhaseRetainedDecodeCoversZeroFirstPrefill() throws {
+        let json = """
+        {"sessionId":"z","sessionShort":"zzzzzzzz","requestId":"r2","model":"m","alias":"a",
+         "tier":"default","priority":0,"phase":"PREFILL",
+         "display":{"phase":"DECODE","contextUsed":41530,
+           "rate":{"kind":"decode","tokensPerSecond":58.0,"windowSeconds":30.0}},
+         "parkReason":null,"slot":0,
+         "context":{"used":0,"cached":0,"processed":0,"decoded":0,"promptTotal":90000,"window":262144},
+         "progress":0.0,"rate":{"kind":"prefill","tokensPerSecond":null,"windowSeconds":30.0},
+         "elapsedMs":0,"phaseSinceMs":0,"respTokens":0}
+        """.data(using: .utf8)!
+        let entry = try JSONDecoder().decode(ContractSession.self, from: json)
+        let row = SessionRow(contract: entry)
+
+        // Raw stays raw for machine readers - the whole point of the case:
+        XCTAssertEqual(row.phase, "PREFILL")
+        XCTAssertEqual(row.context.used, 0)
+        XCTAssertEqual(row.context.decoded, 0)
+
+        // The rendered row shows the retained DECODE readout and no zero:
+        XCTAssertEqual(row.displayLine,
+                       "[zzzzzzzz] a · DECODE · 41.5k/262.1k · 58.0 t/s · default P0",
+                       "the retained readout must cover the zero-first PREFILL, "
+                       + "got '\(row.displayLine)'")
+        XCTAssertFalse(row.displayLine.contains("0/262.1k"),
+                       "no zero may leak into the rendered row, got '\(row.displayLine)'")
+    }
+
+    /// Leak case 2 (2026-10-30 incident): a retained DECODE row sitting on a
+    /// raw PARKED must NOT append the raw park-reason suffix - "DECODE (lane)"
+    /// would leak the phase being overridden. Without `display` the same row
+    /// keeps its raw PARKED presentation (reason included), so the gate is
+    /// the DISPLAYED phase, not the presence of parkReason.
+    func testDisplayPhaseRetainedDecodeHidesRawParkReasonSuffix() throws {
+        let json = """
+        {"sessionId":"z","sessionShort":"zzzzzzzz","requestId":"r2","model":"m","alias":"a",
+         "tier":"default","priority":0,"phase":"PARKED",
+         "display":{"phase":"DECODE","contextUsed":100809,
+           "rate":{"kind":"decode","tokensPerSecond":21.4,"windowSeconds":30.0}},
+         "parkReason":"lane","slot":null,
+         "context":{"used":0,"cached":0,"processed":0,"decoded":0,"promptTotal":0,"window":262144},
+         "progress":null,"rate":{"kind":null,"tokensPerSecond":null,"windowSeconds":30.0},
+         "elapsedMs":4000,"phaseSinceMs":0,"respTokens":0,
+         "waitingFor":{"session":"s2","until":""}}
+        """.data(using: .utf8)!
+        let entry = try JSONDecoder().decode(ContractSession.self, from: json)
+        let row = SessionRow(contract: entry)
+
+        // Raw stays raw, including the park reason:
+        XCTAssertEqual(row.phase, "PARKED")
+        XCTAssertEqual(row.parkReason, "lane")
+
+        // The render shows plain DECODE - no "(lane)" suffix:
+        XCTAssertEqual(row.displayLine,
+                       "[zzzzzzzz] a · DECODE · 100.8k/262.1k · 21.4 t/s · default P0",
+                       "a retained DECODE must not leak the raw PARKED reason, "
+                       + "got '\(row.displayLine)'")
+    }
+
+    /// Leak case 3: a retained DECODE row whose last raw DECODE never
+    /// measured a rate (kind=decode on the first sample,
+    /// tokensPerSecond still nil, so the server omits `display.rate`).
+    /// The row sits on a raw PREFILL carrying a REAL measured prefill
+    /// rate - and that raw rate must NOT render: a DECODE presentation
+    /// shows `display.rate` ONLY; absent means no rate segment at all.
+    /// `display.contextUsed` still renders.
+    func testDisplayPhaseRetainedDecodeWithoutDisplayRateShowsNoRate() throws {
+        let json = """
+        {"sessionId":"z","sessionShort":"zzzzzzzz","requestId":"r2","model":"m","alias":"a",
+         "tier":"default","priority":0,"phase":"PREFILL",
+         "display":{"phase":"DECODE","contextUsed":100809},
+         "parkReason":null,"slot":0,
+         "context":{"used":20000,"cached":0,"processed":20000,"decoded":0,"promptTotal":90000,"window":262144},
+         "progress":0.2222,"rate":{"kind":"prefill","tokensPerSecond":10000.0,"windowSeconds":30.0},
+         "elapsedMs":2000,"phaseSinceMs":0,"respTokens":0}
+        """.data(using: .utf8)!
+        let entry = try JSONDecoder().decode(ContractSession.self, from: json)
+        let row = SessionRow(contract: entry)
+
+        // Raw stays raw for machine readers:
+        XCTAssertEqual(row.phase, "PREFILL")
+        XCTAssertEqual(row.rate.kind, "prefill")
+        XCTAssertEqual(row.rate.tokensPerSecond, 10000.0)
+
+        // The render shows DECODE with the retained contextUsed and NO
+        // rate segment - the raw prefill rate must not leak into the
+        // DECODE presentation:
+        XCTAssertEqual(row.displayLine,
+                       "[zzzzzzzz] a · DECODE · 100.8k/262.1k · default P0",
+                       "a retained DECODE without display.rate must show no rate at all, "
+                       + "got '\(row.displayLine)'")
+        XCTAssertFalse(row.displayLine.contains("t/s"),
+                       "no rate may render without display.rate on a DECODE presentation, "
+                       + "got '\(row.displayLine)'")
+    }
+
+    /// Outside retained DECODE the existing raw behavior stands: a raw
+    /// PREFILL row with no display object renders its own measured rate.
+    func testRawPrefillRowWithoutDisplayKeepsRenderingItsRate() throws {
+        let json = """
+        {"sessionId":"z","sessionShort":"zzzzzzzz","requestId":"r2","model":"m","alias":"a",
+         "tier":"default","priority":0,"phase":"PREFILL",
+         "parkReason":null,"slot":0,
+         "context":{"used":20000,"cached":0,"processed":20000,"decoded":0,"promptTotal":90000,"window":262144},
+         "progress":0.2222,"rate":{"kind":"prefill","tokensPerSecond":10000.0,"windowSeconds":30.0},
+         "elapsedMs":2000,"phaseSinceMs":0,"respTokens":0}
+        """.data(using: .utf8)!
+        let entry = try JSONDecoder().decode(ContractSession.self, from: json)
+        let row = SessionRow(contract: entry)
+        XCTAssertEqual(row.displayLine,
+                       "[zzzzzzzz] a · PREFILL · 20.0k/262.1k · 22.2% · 10000.0 t/s · default P0",
+                       "a raw PREFILL row renders its own rate, got '\(row.displayLine)'")
     }
 }

@@ -782,6 +782,16 @@ type FifoConfig struct {
 	// until enough of the pool frees up. 0 or absent (the default) disables
 	// admission control for that model entirely (today's behavior, fail-open).
 	KVPoolTokens map[string]int `yaml:"kvPoolTokens"`
+	// DecodeRetentionSeconds is the scheduler's view of
+	// sessions.decodeRetentionSeconds (the display retention): on a
+	// NON-looping completion the model cooldown and the slot cooldown are
+	// delayed by this many seconds, so both real displacement deadlines are
+	// completion + retention + grace. Derived, NOT an operator-facing knob:
+	// yaml:"-" keeps it out of the schema; LoadConfigFromReader copies the
+	// already-defaulted sessions value into it after decoding. A hand-built
+	// FifoConfig at its zero value means no delay (every pre-existing
+	// scheduler test pins that).
+	DecodeRetentionSeconds int `yaml:"-"`
 }
 
 type RouterConfig struct {

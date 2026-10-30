@@ -977,3 +977,338 @@ func TestSessions_DecodeRetentionConfiguredWindow(t *testing.T) {
 		t.Fatalf("display = %+v, want none with the retention configured off", row.Display)
 	}
 }
+
+// --- decode retention readout (2026-10-30 incident) ---
+//
+// The retention is a READOUT, not just a phase sticker: a live 1 Hz observer
+// saw display.phase hold DECODE while the raw HOT context.used fell from
+// 100809 to 0 and the rate went absent (raw IDLE then also read 0). For the
+// whole configured window the display object must therefore also carry the
+// LAST DECODE sample's context.used and rate (llama-swap.sessions/v1 shape:
+// display.contextUsed plus display.rate in the top-level rate's shape). The
+// top-level raw rate/context keep reading the raw phase - machine readers
+// (lane governor, liveness monitor, health watch) are never rewritten.
+
+// decodeWithRate drives two DECODE polls of one request, one second apart,
+// so the row carries a MEASURED decode rate, and leaves the builder holding
+// its sample as the last DECODE. Every retention assertion below compares
+// against that sample: context.used = 38000 cached + 2960 processed + 570
+// decoded = 41530, rate = (570-512)/1s = 58.0 tok/s kind decode.
+func decodeWithRate(t *testing.T, b *sessionsBuilder, t0 time.Time) {
+	t.Helper()
+	running := map[string]process.ProcessState{sessModel: process.StateReady}
+	dec := func(n int) map[string][]childSlot {
+		return map[string][]childSlot{sessModel: {{ID: 0, NCtx: 262144, IsProcessing: true,
+			NPromptTokens: 90000, NPromptTokensCache: 38000, NPromptTokensProcessed: 2960, NDecoded: n}}}
+	}
+	got := b.build(sessionsInput{Now: t0, Running: running,
+		Requests: []swaputil.InflightRequestEntry{retentionReq("r1", t0.Add(-5*time.Second), nil)}, Slots: dec(512)})
+	if len(got.Sessions) != 1 || got.Sessions[0].Phase != "DECODE" {
+		t.Fatalf("setup poll 1: %+v, want one DECODE row", got.Sessions)
+	}
+	got = b.build(sessionsInput{Now: t0.Add(time.Second), Running: running,
+		Requests: []swaputil.InflightRequestEntry{retentionReq("r1", t0.Add(-5*time.Second), nil)}, Slots: dec(570)})
+	if len(got.Sessions) != 1 {
+		t.Fatalf("setup poll 2: %+v, want one row", got.Sessions)
+	}
+	row := got.Sessions[0]
+	if row.Rate.Kind == nil || *row.Rate.Kind != "decode" || row.Rate.TokensPerSecond == nil || *row.Rate.TokensPerSecond != 58.0 {
+		t.Fatalf("setup poll 2 rate = %+v, want decode 58.0 t/s", row.Rate)
+	}
+	if row.Context.Used != 41530 {
+		t.Fatalf("setup poll 2 context.used = %d, want 41530", row.Context.Used)
+	}
+}
+
+// rowWireMap is the row of one session in the body's WIRE shape (JSON keys,
+// numbers as float64) - the shape machine clients and fixtures actually see.
+func rowWireMap(t *testing.T, got sessionsBody, session string) map[string]any {
+	t.Helper()
+	m := bodyAsMap(t, got)
+	rows, ok := m["sessions"].([]any)
+	if !ok {
+		t.Fatalf("wire sessions = %v, want a row list", m["sessions"])
+	}
+	for _, r := range rows {
+		rm, ok := r.(map[string]any)
+		if !ok {
+			t.Fatalf("wire session row = %v (%T), want an object", r, r)
+		}
+		if rm["sessionId"] == session {
+			return rm
+		}
+	}
+	t.Fatalf("session %s missing from wire body: %+v", session, got.Sessions)
+	return nil
+}
+
+// retainedDisplay pins the readout contract on the wire body: inside the
+// retention window a non-DECODE row's display object carries phase DECODE,
+// the LAST DECODE sample's contextUsed and that sample's rate (same shape as
+// the top-level rate). It returns the raw row map for raw-truthfulness
+// assertions by the caller.
+func retainedDisplay(t *testing.T, got sessionsBody, session string, wantUsed, wantTPS float64) map[string]any {
+	t.Helper()
+	row := rowWireMap(t, got, session)
+	disp, ok := row["display"].(map[string]any)
+	if !ok {
+		t.Fatalf("%s: display = %v, want the retained readout {phase, contextUsed, rate}", session, row["display"])
+	}
+	if disp["phase"] != "DECODE" {
+		t.Fatalf("%s: display.phase = %v, want DECODE", session, disp["phase"])
+	}
+	if v := disp["contextUsed"]; v != wantUsed {
+		t.Fatalf("%s: display.contextUsed = %v, want %v (the last DECODE context.used)", session, v, wantUsed)
+	}
+	drate, ok := disp["rate"].(map[string]any)
+	if !ok {
+		t.Fatalf("%s: display.rate = %v, want the last DECODE rate in the top-level rate's shape {kind, tokensPerSecond, windowSeconds}", session, disp["rate"])
+	}
+	if drate["kind"] != "decode" || drate["tokensPerSecond"] != wantTPS {
+		t.Fatalf("%s: display.rate = %v, want {kind:decode, tokensPerSecond:%v}", session, drate, wantTPS)
+	}
+	return row
+}
+
+// noDisplay pins the other side: no retention, no display key at all.
+func noDisplay(t *testing.T, got sessionsBody, session string) map[string]any {
+	t.Helper()
+	row := rowWireMap(t, got, session)
+	if _, ok := row["display"]; ok {
+		t.Fatalf("%s: display = %v, want no display override", session, row["display"])
+	}
+	return row
+}
+
+func rawUsed(t *testing.T, row map[string]any) any {
+	t.Helper()
+	ctx, ok := row["context"].(map[string]any)
+	if !ok {
+		t.Fatalf("wire context = %v, want an object", row["context"])
+	}
+	return ctx["used"]
+}
+
+func rawRateKind(t *testing.T, row map[string]any) any {
+	t.Helper()
+	rate, ok := row["rate"].(map[string]any)
+	if !ok {
+		t.Fatalf("wire rate = %v, want an object", row["rate"])
+	}
+	return rate["kind"]
+}
+
+// IDLE then PREFILL inside the window expose the retained contextUsed and
+// decode rate; the raw row reads its own phase truthfully; a session that
+// never decoded gets no display at all; past the window the display is gone.
+func TestSessions_DecodeRetentionRetainsRateAndContextUsed(t *testing.T) {
+	b := newSessionsBuilder(sessionsTestConfig())
+	t0 := time.Date(2026, 9, 18, 12, 0, 0, 0, time.UTC)
+	running := map[string]process.ProcessState{sessModel: process.StateReady}
+	decodeWithRate(t, b, t0) // last DECODE at t0+1s: used 41530, decode 58.0 t/s
+
+	// +2 s: the request finished. Raw IDLE reads used 0 with no rate kind;
+	// the display keeps DECODE with the retained readout.
+	got := b.build(sessionsInput{Now: t0.Add(2 * time.Second), Running: running})
+	row := retainedDisplay(t, got, "s1", 41530, 58.0)
+	if v := rawRateKind(t, row); v != nil {
+		t.Fatalf("raw rate.kind = %v, want nil on the IDLE row (the display override must never rewrite the raw fields)", v)
+	}
+	if v := rawUsed(t, row); v != float64(0) {
+		t.Fatalf("raw context.used = %v, want 0 while display.contextUsed holds the retained 41530", v)
+	}
+	assertSessionsInvariants(t, got)
+
+	// +4 s: s1's next turn is in PREFILL beside s2, which never decoded.
+	prefill := map[string][]childSlot{sessModel: {{ID: 0, NCtx: 262144, IsProcessing: true, NPromptTokens: 90000, NPromptTokensProcessed: 10}}}
+	mk := func(id, sess string, at time.Time) swaputil.InflightRequestEntry {
+		return swaputil.InflightRequestEntry{ID: id, Model: sessModel, Timestamp: at,
+			Metadata: map[string]string{"session_id": sess, "slot_granted": "1", "slot_id": "0"}}
+	}
+	got = b.build(sessionsInput{Now: t0.Add(4 * time.Second), Running: running,
+		Requests: []swaputil.InflightRequestEntry{mk("r2", "s1", t0.Add(4*time.Second)), mk("r3", "s2", t0.Add(4*time.Second))}, Slots: prefill})
+	row = retainedDisplay(t, got, "s1", 41530, 58.0)
+	if v := rawUsed(t, row); v != float64(10) {
+		t.Fatalf("s1 raw context.used = %v, want 10 (the young PREFILL's own counters)", v)
+	}
+	if v := rawRateKind(t, row); v != "prefill" {
+		t.Fatalf("s1 raw rate.kind = %v, want prefill while display.rate holds the retained decode rate", v)
+	}
+	s2row := noDisplay(t, got, "s2")
+	if v := rawUsed(t, s2row); v != float64(10) {
+		t.Fatalf("s2 raw context.used = %v, want 10", v)
+	}
+	assertSessionsInvariants(t, got)
+
+	// +34 s: past the 30 s window the overrides are gone; both rows are bare
+	// IDLE rows reading their raw (zero) counters.
+	got = b.build(sessionsInput{Now: t0.Add(34 * time.Second), Running: running})
+	noDisplay(t, got, "s1")
+	s2row = noDisplay(t, got, "s2")
+	if v := rawUsed(t, s2row); v != float64(0) {
+		t.Fatalf("s2 raw context.used = %v, want 0", v)
+	}
+	assertSessionsInvariants(t, got)
+}
+
+// The exact zero-first-PREFILL case: the next turn's FIRST poll lands before
+// the child has processed anything, so the raw PREFILL row reads
+// context.used 0 and decoded 0 (its own rate still unmeasured). Inside the
+// window the display must still hold the last DECODE's readout (used 41530,
+// 58.0 t/s) - the raw zeros stay on the raw fields and no zero leaks into
+// the retained readout.
+func TestSessions_DecodeRetentionCoversZeroFirstPrefill(t *testing.T) {
+	b := newSessionsBuilder(sessionsTestConfig())
+	t0 := time.Date(2026, 9, 18, 12, 0, 0, 0, time.UTC)
+	running := map[string]process.ProcessState{sessModel: process.StateReady}
+	decodeWithRate(t, b, t0) // last DECODE at t0+1s: used 41530, decode 58.0 t/s
+
+	// +3 s (2 s after the last DECODE, inside the 30 s window): the slot is
+	// processing the new prompt but has processed NOTHING yet - every raw
+	// counter is zero.
+	zeroPrefill := map[string][]childSlot{sessModel: {{ID: 0, NCtx: 262144, IsProcessing: true,
+		NPromptTokens: 90000, NPromptTokensProcessed: 0, NDecoded: 0}}}
+	got := b.build(sessionsInput{Now: t0.Add(3 * time.Second), Running: running,
+		Requests: []swaputil.InflightRequestEntry{retentionReq("r2", t0.Add(3*time.Second), nil)}, Slots: zeroPrefill})
+	if len(got.Sessions) != 1 || got.Sessions[0].Phase != "PREFILL" {
+		t.Fatalf("poll = %+v, want one raw PREFILL row", got.Sessions)
+	}
+	row := retainedDisplay(t, got, "s1", 41530, 58.0)
+	if v := rawUsed(t, row); v != float64(0) {
+		t.Fatalf("raw context.used = %v, want 0 (the zero-first PREFILL's own counters stay raw)", v)
+	}
+	ctx := row["context"].(map[string]any)
+	if v := ctx["decoded"]; v != float64(0) {
+		t.Fatalf("raw context.decoded = %v, want 0", v)
+	}
+	assertSessionsInvariants(t, got)
+}
+
+// PARKED and HOT rows inside the window carry the same retained readout - HOT
+// being exactly the witnessed case: the slot binds the lane but the child no
+// longer reports the prompt, so the raw context.used has fallen to 0 while
+// the display must keep the last DECODE's 41530 / 58.0 t/s. Raw context.window
+// stays the denominator throughout.
+func TestSessions_DecodeRetentionRetainsReadoutAcrossParkedAndHot(t *testing.T) {
+	b := newSessionsBuilder(sessionsTestConfig())
+	t0 := time.Date(2026, 9, 18, 12, 0, 0, 0, time.UTC)
+	running := map[string]process.ProcessState{sessModel: process.StateReady}
+	decodeWithRate(t, b, t0) // last DECODE at t0+1s
+
+	// +4 s: the next turn is PARKED behind another session on the lane.
+	got := b.build(sessionsInput{Now: t0.Add(4 * time.Second), Running: running,
+		Requests: []swaputil.InflightRequestEntry{
+			retentionReq("r2", t0.Add(4*time.Second), map[string]string{"park_reason": "lane", "waiting_for_session": "s2"})}})
+	row := retainedDisplay(t, got, "s1", 41530, 58.0)
+	if v := rawUsed(t, row); v != float64(0) {
+		t.Fatalf("PARKED raw context.used = %v, want 0 (a parked row carries no slot counters)", v)
+	}
+	wf, ok := row["waitingFor"].(map[string]any)
+	if !ok || wf["session"] != "s2" {
+		t.Fatalf("waitingFor = %v, want the park's own {session:s2} kept intact", row["waitingFor"])
+	}
+	assertSessionsInvariants(t, got)
+
+	// +8 s (7 s after the last DECODE): HOT - the slot still binds the lane
+	// but the child reports an empty prompt: the witnessed shape.
+	hotSlots := map[string][]childSlot{sessModel: {{ID: 0, NCtx: 262144}}}
+	got = b.build(sessionsInput{Now: t0.Add(8 * time.Second), Running: running,
+		Hot: map[string][]swaputil.HotSlot{sessModel: {{Slot: 0, SessionID: "s1", IdleSeconds: 7}}}, Slots: hotSlots})
+	row = retainedDisplay(t, got, "s1", 41530, 58.0)
+	if v := rawUsed(t, row); v != float64(0) {
+		t.Fatalf("HOT raw context.used = %v, want 0 (the witnessed drop; the display readout must cover it)", v)
+	}
+	ctx := row["context"].(map[string]any)
+	if v := ctx["window"]; v != float64(262144) {
+		t.Fatalf("HOT raw context.window = %v, want 262144 (the denominator stays raw)", v)
+	}
+	assertSessionsInvariants(t, got)
+
+	// +35 s: past the window the HOT row shows itself with no override.
+	got = b.build(sessionsInput{Now: t0.Add(35 * time.Second), Running: running,
+		Hot: map[string][]swaputil.HotSlot{sessModel: {{Slot: 0, SessionID: "s1", IdleSeconds: 34}}}, Slots: hotSlots})
+	noDisplay(t, got, "s1")
+	assertSessionsInvariants(t, got)
+}
+
+// The uncovered edge: stampRate sets kind=decode on the FIRST DECODE sample
+// while tokensPerSecond is still nil (two samples are needed to measure). A
+// retained row downstream must not expose that incomplete rate as
+// display.rate - the kind is real but the number was never measured - nor may
+// the raw PREFILL's own rate render through a fallback. display.contextUsed
+// still persists; the raw fields stay raw.
+func TestSessions_DecodeRetentionOmitsRateWhenLastDecodeUnmeasured(t *testing.T) {
+	b := newSessionsBuilder(sessionsTestConfig())
+	t0 := time.Date(2026, 9, 18, 12, 0, 0, 0, time.UTC)
+	running := map[string]process.ProcessState{sessModel: process.StateReady}
+
+	// One DECODE poll: kind=decode is set but tokensPerSecond stays nil -
+	// the sample is the only one in the window's history.
+	decodeSlots := map[string][]childSlot{sessModel: {{ID: 0, NCtx: 262144, IsProcessing: true,
+		NPromptTokens: 90000, NPromptTokensCache: 38000, NPromptTokensProcessed: 2960, NDecoded: 570}}}
+	got := b.build(sessionsInput{Now: t0, Running: running,
+		Requests: []swaputil.InflightRequestEntry{retentionReq("r1", t0.Add(-5*time.Second), nil)}, Slots: decodeSlots})
+	if len(got.Sessions) != 1 || got.Sessions[0].Rate.Kind == nil || *got.Sessions[0].Rate.Kind != "decode" || got.Sessions[0].Rate.TokensPerSecond != nil {
+		t.Fatalf("setup poll: rate = %+v, want kind=decode with tokensPerSecond nil (first sample, not measured)", got.Sessions[0].Rate)
+	}
+	if got.Sessions[0].Context.Used != 41530 {
+		t.Fatalf("setup poll context.used = %d, want 41530", got.Sessions[0].Context.Used)
+	}
+
+	// Next turn: PREFILL. Two polls one second apart measure a real prefill
+	// rate; both are inside the retention window of the lone DECODE.
+	mk := func(id, sess string, at time.Time) swaputil.InflightRequestEntry {
+		return swaputil.InflightRequestEntry{ID: id, Model: sessModel, Timestamp: at,
+			Metadata: map[string]string{"session_id": sess, "slot_granted": "1", "slot_id": "0"}}
+	}
+	prefillSlots := func(processed int) map[string][]childSlot {
+		return map[string][]childSlot{sessModel: {{ID: 0, NCtx: 262144, IsProcessing: true,
+			NPromptTokens: 90000, NPromptTokensProcessed: processed}}}
+	}
+	got = b.build(sessionsInput{Now: t0.Add(time.Second), Running: running,
+		Requests: []swaputil.InflightRequestEntry{mk("r2", "s1", t0.Add(time.Second))}, Slots: prefillSlots(10000)})
+	got = b.build(sessionsInput{Now: t0.Add(2 * time.Second), Running: running,
+		Requests: []swaputil.InflightRequestEntry{mk("r2", "s1", t0.Add(time.Second))}, Slots: prefillSlots(20000)})
+
+	row := rowWireMap(t, got, "s1")
+	disp, ok := row["display"].(map[string]any)
+	if !ok {
+		t.Fatalf("s1: display = %v, want the retained DECODE display", row["display"])
+	}
+	if disp["phase"] != "DECODE" {
+		t.Fatalf("s1: display.phase = %v, want DECODE", disp["phase"])
+	}
+	if v := disp["contextUsed"]; v != float64(41530) {
+		t.Fatalf("s1: display.contextUsed = %v, want 41530 (retained even without a measured rate)", v)
+	}
+	if _, ok := disp["rate"]; ok {
+		t.Fatalf("s1: display.rate = %v, want NO rate object (the last DECODE never measured one; "+
+			"a kind without tokensPerSecond must not be exposed)", disp["rate"])
+	}
+	raw, ok := row["rate"].(map[string]any)
+	if !ok {
+		t.Fatalf("s1: wire rate = %v, want an object", row["rate"])
+	}
+	if raw["kind"] != "prefill" || raw["tokensPerSecond"] != float64(10000) {
+		t.Fatalf("s1: raw rate = %v, want {kind:prefill, tokensPerSecond:10000} unchanged by the retention", raw)
+	}
+	assertSessionsInvariants(t, got)
+}
+
+// retention=0 turns the whole override off: not just the phase sticker, the
+// readout too - the wire row carries no display key at all.
+func TestSessions_DecodeRetentionZeroOmitsReadout(t *testing.T) {
+	cfg := sessionsTestConfig()
+	cfg.Sessions.DecodeRetentionSeconds = 0
+	b := newSessionsBuilder(cfg)
+	t0 := time.Date(2026, 9, 18, 12, 0, 0, 0, time.UTC)
+	running := map[string]process.ProcessState{sessModel: process.StateReady}
+	decodeWithRate(t, b, t0)
+
+	got := b.build(sessionsInput{Now: t0.Add(2 * time.Second), Running: running})
+	row := noDisplay(t, got, "s1")
+	if v := rawRateKind(t, row); v != nil {
+		t.Fatalf("raw rate.kind = %v, want nil (retention=0 must not touch the raw fields either)", v)
+	}
+	assertSessionsInvariants(t, got)
+}

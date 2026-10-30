@@ -54,12 +54,6 @@ public struct MenuState: Encodable {
     /// nil when nothing is held.
     public var cooldown: CooldownRow? = nil
 
-    /// Seconds since the cooldown last RESTARTED (a completed turn of the
-    /// resident restarts its grace; between two screenshots on 2026-09-10 the
-    /// countdown went 8:52 -> 9:41). Set by BackendClient when a swapGrace
-    /// event's remaining goes UP; nil until that has happened once.
-    public var cooldownRestartedAt: Date? = nil
-
     /// The memory brake's state from the session-state contract's
     /// `memoryBrake`, copied by BackendClient.applySessionsSnapshot.
     public var memoryBrake: MemoryBrakeInfo? = nil
@@ -78,27 +72,20 @@ public struct MenuState: Encodable {
         return "Memory brake: loads held until file-backed < \(level) GB (now \(String(format: "%.1f", now)) GB)"
     }
 
-    /// A restart is a countdown that went up: the resident finished a turn
-    /// inside its own grace. A one-second wobble from tick alignment is not.
-    public static func cooldownRestarted(previous: Int?, current: Int) -> Bool {
-        guard let previous else { return false }
-        return current > previous + 1
-    }
-
     /// The resident's own row while it cools down - the cooldown is a state
     /// of the loaded model, so it is rendered ON that model's line, not as a
-    /// separate section: "cooldown 9:41 for [17426df4], then cq35 · 5 waiting",
-    /// with "(restarted 0:31 ago)" after the countdown once a turn of the
-    /// resident has restarted it. Never "X waiting for <loaded model>".
+    /// separate section: "cooldown 9:41 for [17426df4], then cq35 · 5 waiting"
+    /// - remaining time plus the existing owner/next/waiting suffixes only,
+    /// never a "(restarted x:xx ago)" note. Never "X waiting for <loaded
+    /// model>".
     ///
     /// A no-waiter cooldown (2026-09-18: the resident is idle inside its own
     /// grace with nothing cross-model queued behind it - CooldownRow.nextModel
     /// empty) omits the ", then <next> · N waiting" suffix entirely: there is
     /// no swap pending, so naming one and counting zero waiters would read as
     /// a real wait that isn't happening.
-    public static func cooldownLabel(_ cd: CooldownRow, next: String, restartedAgo: Int? = nil) -> String {
+    public static func cooldownLabel(_ cd: CooldownRow, next: String) -> String {
         var s = "cooldown \(CompactFormatter.countdown(cd.remainingSeconds))"
-        if let restartedAgo { s += " (restarted \(CompactFormatter.countdown(restartedAgo)) ago)" }
         let owners = hotSlots(cd).map { "[\(String($0.sessionId.prefix(8)))]" }
         if !owners.isEmpty { s += " for " + owners.joined(separator: " ") }
         if !cd.nextModel.isEmpty {
@@ -239,7 +226,7 @@ public struct HotSlotRow: Identifiable, Codable, Equatable {
 /// (docs/intent/session-state-contract.md, llama-cm), rendered as-is: every
 /// field below is copied from the wire body by `SessionRow.init(contract:)`
 /// (SessionStateContract.swift) and `displayLine` only formats them (k-units,
-/// a percent sign, "kind N.n t/s") - it never derives a number the body does
+/// a percent sign, "N.n t/s") - it never derives a number the body does
 /// not already contain (invariant 3).
 public struct SessionRow: Identifiable, Encodable, Equatable {
     public let id: String
@@ -274,6 +261,14 @@ public struct SessionRow: Identifiable, Encodable, Equatable {
     /// `display` object or no `display.phase` - the renderer then falls back
     /// to the raw phase. Never mutated by anything but the row's init.
     public let displayPhase: String?
+    /// The retained readout's `context.used` (`display.contextUsed`) - the
+    /// last raw DECODE's number, rendered in place of `context.used` while
+    /// the retention holds. nil on rows without a `display` readout.
+    public let displayContextUsed: Int?
+    /// The retained readout's rate (`display.rate`) - the last raw DECODE's
+    /// rate, rendered in place of `rate` while the retention holds. nil when
+    /// the server sent none (including servers that predate the readout).
+    public let displayRate: ContractRate?
     /// Set only while `phase == "PARKED"`. Same verbatim rule as `phase`.
     public let parkReason: String?
     public let context: ContractContext
@@ -287,7 +282,8 @@ public struct SessionRow: Identifiable, Encodable, Equatable {
     public let penalty: PenaltyInfo?
 
     public init(id: String, sessionId: String = "", sessionShort: String, parentSessionShort: String? = nil, model: String, alias: String, tier: String,
-                priority: Int, phase: String, displayPhase: String? = nil, parkReason: String? = nil,
+                priority: Int, phase: String, displayPhase: String? = nil, displayContextUsed: Int? = nil, displayRate: ContractRate? = nil,
+                parkReason: String? = nil,
                 context: ContractContext, progress: Double? = nil, rate: ContractRate,
                 penalty: PenaltyInfo? = nil) {
         self.id = id
@@ -300,6 +296,8 @@ public struct SessionRow: Identifiable, Encodable, Equatable {
         self.priority = priority
         self.phase = phase
         self.displayPhase = displayPhase
+        self.displayContextUsed = displayContextUsed
+        self.displayRate = displayRate
         self.parkReason = parkReason
         self.context = context
         self.progress = progress
@@ -327,19 +325,41 @@ public struct SessionRow: Identifiable, Encodable, Equatable {
         }
     }
 
+    /// The phase the renderer presents: the server's `display.phase` when it
+    /// sent one (the decode retention), else the raw `phase`. EVERY
+    /// presentation gate below (progress, park-reason suffix) keys off this,
+    /// never the raw phase: a retained DECODE row must not leak the raw
+    /// PREFILL's progress percent or the raw PARKED's reason suffix. Machine
+    /// logic elsewhere keeps reading the raw `phase`.
+    private var shownPhase: String { displayPhase ?? phase }
+
     /// PREFILL's progress as a percent, one decimal - nil for every other
     /// phase (the contract only fills `progress` for PREFILL) or when the
-    /// body carries none yet.
+    /// body carries none yet. Gated on the SHOWN phase: a retained DECODE
+    /// row sitting on a raw PREFILL must not print the raw progress.
     private var progressText: String? {
-        guard phase == "PREFILL", let progress else { return nil }
+        guard shownPhase == "PREFILL", let progress else { return nil }
         return String(format: "%.1f%%", progress * 100)
     }
 
-    /// "kind N.n t/s", e.g. "prefill 50.7 t/s" / "decode 7.1 t/s"; nil until
-    /// the contract has two samples (rate.kind/tokensPerSecond both nil).
+    /// "N.n t/s" whenever a rate exists, regardless of phase (user ruling
+    /// 2026-10-30: the phase kind is redundant - the phase segment already
+    /// says PREFILL/DECODE, so "PREFILL · prefill 50.7 t/s" printed the word
+    /// twice); nil until the contract has two samples
+    /// (rate.kind/tokensPerSecond both nil). A DECODE readout (raw or
+    /// retained) uses `display.rate` ONLY - it is the last real DECODE's
+    /// rate, copied verbatim; when the server omitted it (the last DECODE
+    /// never measured one) no rate renders at all, never this row's raw
+    /// PREFILL rate leaking into a DECODE line. Every other phase renders
+    /// the raw rate as before.
     private var rateText: String? {
-        guard let kind = rate.kind, let tokensPerSecond = rate.tokensPerSecond else { return nil }
-        return "\(kind) \(String(format: "%.1f", tokensPerSecond)) t/s"
+        if shownPhase == "DECODE" {
+            let r = displayPhase == "DECODE" ? displayRate : rate
+            guard let r, let tokensPerSecond = r.tokensPerSecond else { return nil }
+            return "\(String(format: "%.1f", tokensPerSecond)) t/s"
+        }
+        guard let tokensPerSecond = rate.tokensPerSecond else { return nil }
+        return "\(String(format: "%.1f", tokensPerSecond)) t/s"
     }
 
     /// "<tier> P<priority>", e.g. "default P0" / "priority P10" /
@@ -357,7 +377,7 @@ public struct SessionRow: Identifiable, Encodable, Equatable {
     /// order the contract documents them:
     ///
     ///   `[<sessionShort>] <alias> · <PHASE[ (reason)]> · <used>/<window> ·
-    ///   [<progress>%] · [<rate kind> <N.n> t/s] · <tier> P<priority>`
+    ///   [<progress>%] · [<N.n> t/s] · <tier> P<priority>`
     ///
     /// A segment the body did not supply (no progress, no rate yet) is
     /// dropped rather than shown empty; the tier/priority segment is never
@@ -394,11 +414,18 @@ public struct SessionRow: Identifiable, Encodable, Equatable {
         // display.phase when present, else the raw phase. Every non-render
         // use of `phase` (queue filter, progress gate, unpenalize restore)
         // stays on the raw value.
-        var phaseSegment = displayPhase ?? phase
-        if let phrase = SessionRow.parkPhrase(parkReason) { phaseSegment += " (\(phrase))" }
+        var phaseSegment = shownPhase
+        // The park-reason suffix belongs to a PARKED presentation only: a
+        // retained DECODE row sitting on a raw PARKED must not read
+        // "DECODE (lane)" - the suffix would leak the phase being overridden.
+        if shownPhase == "PARKED", let phrase = SessionRow.parkPhrase(parkReason) {
+            phaseSegment += " (\(phrase))"
+        }
         segments.append(phaseSegment)
 
-        segments.append("\(CompactFormatter.tokens(context.used))/\(CompactFormatter.tokens(context.window))")
+        // The used segment renders the retained readout's contextUsed when
+        // present; context.window stays the raw denominator throughout.
+        segments.append("\(CompactFormatter.tokens(displayContextUsed ?? context.used))/\(CompactFormatter.tokens(context.window))")
         if let progressText { segments.append(progressText) }
         if let rateText { segments.append(rateText) }
         segments.append(tierText)

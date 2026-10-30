@@ -19,7 +19,7 @@ final class ParentSessionTests: XCTestCase {
             priority: 0, phase: "DECODE",
             context: ContractContext(used: 50_000, cached: 40_000, processed: 10_000, decoded: 1200, promptTotal: 100_000, window: 262_144),
             rate: ContractRate(kind: "decode", tokensPerSecond: 45.2, windowSeconds: 30))
-        XCTAssertEqual(row.displayLine, "[aaaaaaaa] cq35 · DECODE · 50.0k/262.1k · decode 45.2 t/s · default P0")
+        XCTAssertEqual(row.displayLine, "[aaaaaaaa] cq35 · DECODE · 50.0k/262.1k · 45.2 t/s · default P0")
     }
 
     func testDispatchedRowBracketWithParent() {

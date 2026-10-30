@@ -133,8 +133,7 @@ public struct MenuView: View {
                     Label {
                         Text(bullet(for: model) + model.displayLabel + " · "
                              + MenuState.cooldownLabel(cd,
-                                                       next: modelLabel(for: cd.nextModel, in: state.models),
-                                                       restartedAgo: state.cooldownRestartedAt.map { Int(Date().timeIntervalSince($0)) }))
+                                                       next: modelLabel(for: cd.nextModel, in: state.models)))
                     } icon: {
                         Image(systemName: ModelIcon.sfSymbolName(capabilities: model.capabilities))
                     }

@@ -123,14 +123,27 @@ type sessionRate struct {
 }
 
 // sessionDisplay carries what a MENU should show for this row, kept apart
-// from the machine fields above. Today it holds only Phase - the decode
-// retention's display value (see sessionsDecodeRetention). Machine readers
+// from the machine fields above. It holds the decode retention's display
+// value (see sessionsDecodeRetention): Phase, plus the readout snapshot taken
+// at the last raw DECODE - ContextUsed and the complete Rate measured on that
+// row (same shape as the top-level rate; absent when the last DECODE carried
+// no measured rate, so a renderer never invents 0 t/s). Machine readers
 // (lane governor, liveness monitor, health watch) must keep reading `phase`;
-// renderers show `display.phase` when present, else `phase`. Additive to
+// renderers show `display.*` when present, else the raw fields. Additive to
 // llama-swap.sessions/v1, omitted entirely when there is nothing to override
-// (2026-10-25 PF-C amendment; MS-1 builds the rest of display around it).
+// (2026-10-25 PF-C amendment; readout added 2026-10-30 after the witnessed
+// case of a retained DECODE row whose raw HOT counters had fallen to 0).
 type sessionDisplay struct {
 	Phase string `json:"phase"`
+	// ContextUsed is present on EVERY retained row, including numeric zero
+	// when that was the real last-decode value (a decode can legitimately
+	// start at used=0).
+	ContextUsed *int `json:"contextUsed"`
+	// Rate is the last raw DECODE's rate, omitted whenever that DECODE had no
+	// MEASURED rate: stampRate sets kind on the first sample while
+	// tokensPerSecond stays nil until the second, and either missing means
+	// rendering a number would fabricate one the child never reported.
+	Rate *sessionRate `json:"rate,omitempty"`
 }
 
 type sessionEntry struct {
@@ -310,6 +323,16 @@ type idleMark struct {
 	entry sessionEntry
 }
 
+// decodeReadout is the snapshot taken at a session's last raw DECODE row:
+// the context.used and the complete rate stampRate had just measured on that
+// row. Retained rows (HOT/IDLE/PARKED/PREFILL inside the window) expose it in
+// display so the menu keeps showing the last real decode numbers while the
+// raw counters have already fallen to 0 or switched to prefill.
+type decodeReadout struct {
+	used int
+	rate sessionRate
+}
+
 // sessionsBuilder holds the cross-tick memory a single snapshot cannot carry:
 // when each row entered its phase, the rate samples, and the known sessions
 // for IDLE retention. Not safe for concurrent use; sessionsHub serializes.
@@ -321,17 +344,23 @@ type sessionsBuilder struct {
 	idle          map[string]idleMark
 	slotWarmUntil map[string]string // keyed by session ID, RFC3339
 	lastDecode    map[string]time.Time
+	// lastDecodeReadout is the readout snapshot paired with each lastDecode
+	// entry: both are written together on every raw DECODE row (after
+	// stampRate) and deleted together in lastDecode's cleanup, so the display
+	// retention can never reference a readout whose timing has been dropped.
+	lastDecodeReadout map[string]decodeReadout
 }
 
 func newSessionsBuilder(cfg config.Config) *sessionsBuilder {
 	return &sessionsBuilder{
-		cfg:           cfg,
-		phases:        map[string]phaseMark{},
-		rates:         map[string][]rateSample{},
-		known:         map[string]sessionEntry{},
-		idle:          map[string]idleMark{},
-		slotWarmUntil: map[string]string{},
-		lastDecode:    map[string]time.Time{},
+		cfg:               cfg,
+		phases:            map[string]phaseMark{},
+		rates:             map[string][]rateSample{},
+		known:             map[string]sessionEntry{},
+		idle:              map[string]idleMark{},
+		slotWarmUntil:     map[string]string{},
+		lastDecode:        map[string]time.Time{},
+		lastDecodeReadout: map[string]decodeReadout{},
 	}
 }
 
@@ -529,6 +558,7 @@ func (b *sessionsBuilder) build(in sessionsInput) sessionsBody {
 		b.applyLoopState(in, &row, held)
 		b.stampPhaseSince(key, &row, now, r.Timestamp)
 		b.stampRate(key, &row, now, in, r)
+		b.stampDecodeReadout(key, &row)
 		b.stampSlotWarmUntil(&row)
 		b.stampDecodeDisplay(key, &row, now)
 		present[key] = true
@@ -628,6 +658,7 @@ func (b *sessionsBuilder) build(in sessionsInput) sessionsBody {
 	for key, at := range b.lastDecode {
 		if !bodyHas[key] || window <= 0 || now.Sub(at) >= window+sessionsIdleRetention {
 			delete(b.lastDecode, key)
+			delete(b.lastDecodeReadout, key)
 		}
 	}
 
@@ -911,6 +942,22 @@ func (b *sessionsBuilder) stampPhaseSince(key string, row *sessionEntry, now, ar
 	}
 }
 
+// stampDecodeReadout snapshots the last raw DECODE row's readout - the
+// context.used stampRate has just folded and the complete current rate -
+// keyed by the same key and clock as lastDecode (stampPhaseSince writes the
+// timestamp just before). Runs on EVERY raw DECODE row, whether or not the
+// row is itself retained (DECODE rows are never overridden), so the next
+// retained HOT/IDLE/PARKED/PREFILL row has the freshest numbers to show.
+// A DECODE row whose rate is not measured yet (fewer than two samples)
+// still snapshots: contextUsed must be retained regardless, and the rate
+// travels with whatever stampRate set, including a nil kind.
+func (b *sessionsBuilder) stampDecodeReadout(key string, row *sessionEntry) {
+	if row.SessionID == "" || row.Phase != phaseDecode {
+		return
+	}
+	b.lastDecodeReadout[key] = decodeReadout{used: row.Context.Used, rate: row.Rate}
+}
+
 // stampDecodeDisplay is the decode retention, display-only. While a session
 // chains tool turns its row flickers DECODE -> HOT/IDLE/PARKED/PREFILL -> DECODE
 // at the 1 Hz poll; within the window (decodeWindow, measured from the LAST
@@ -951,7 +998,25 @@ func (b *sessionsBuilder) stampDecodeDisplay(key string, row *sessionEntry, now 
 	if !ok || now.Sub(last) >= window {
 		return
 	}
-	row.Display = &sessionDisplay{Phase: phaseDecode}
+	snap, ok := b.lastDecodeReadout[key]
+	if !ok {
+		// Unreachable while the two maps are written and deleted together;
+		// guarded so a retained row can never emit a display without its
+		// readout.
+		return
+	}
+	used := snap.used
+	disp := &sessionDisplay{Phase: phaseDecode, ContextUsed: &used}
+	if snap.rate.Kind != nil && snap.rate.TokensPerSecond != nil {
+		// The last DECODE carried a MEASURED rate (kind AND tokensPerSecond -
+		// stampRate sets kind on the first sample while tokensPerSecond stays
+		// nil until the second): expose it verbatim. Anything less is omitted
+		// entirely - a kind without a number is not a rate, and no renderer
+		// may fall back to this row's raw (e.g. PREFILL) rate.
+		rate := snap.rate
+		disp.Rate = &rate
+	}
+	row.Display = disp
 }
 
 // stampRate measures PREFILL on processed and DECODE on decoded, over the

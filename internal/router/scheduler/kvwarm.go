@@ -279,7 +279,13 @@ func (s *FIFO) kvWarmOnDone(ev ServeDoneEvent) {
 	// protection by repeating itself (same rule as the model level), so its
 	// cooldown runs down from the last productive completion.
 	if !ev.Looping {
-		r.warmUntil = now.Add(g)
+		// WHY + retention (2026-10-30 incident): the slot cooldown now ends
+		// at completion + retention + grace, matching the model level: the
+		// warmUntil deadline is a real displacement hold (a request that
+		// would overflow the pool parks until it), not a cosmetic countdown,
+		// so the display-retention period delays it just the same. Zero
+		// retention adds nothing and preserves every pre-existing deadline.
+		r.warmUntil = now.Add(s.cooldownDelay() + g)
 	}
 }
 

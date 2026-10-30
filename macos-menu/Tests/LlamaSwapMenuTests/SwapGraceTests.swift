@@ -45,10 +45,11 @@ final class SwapGraceTests: XCTestCase {
         let cd = CooldownRow(evicteeModel: "cq27", nextModel: "cq35", waiting: 5, remainingSeconds: 581,
                              slots: [HotSlotRow(slot: 0, sessionId: "17426df4-aaaa", idleSeconds: 31),
                                      HotSlotRow(slot: 1, sessionId: "", idleSeconds: 0)])
-        XCTAssertEqual(MenuState.cooldownLabel(cd, next: "cq35"),
+        let label = MenuState.cooldownLabel(cd, next: "cq35")
+        XCTAssertEqual(label,
                        "cooldown 9:41 for [17426df4], then cq35 · 5 waiting")
-        XCTAssertEqual(MenuState.cooldownLabel(cd, next: "cq35", restartedAgo: 31),
-                       "cooldown 9:41 (restarted 0:31 ago) for [17426df4], then cq35 · 5 waiting")
+        XCTAssertFalse(label.contains("restarted"),
+                       "the label shows remaining time only, never a restart suffix, got '\(label)'")
         let nobody = CooldownRow(evicteeModel: "cq35", nextModel: "cq27", waiting: 1, remainingSeconds: 9, slots: [])
         XCTAssertEqual(MenuState.cooldownLabel(nobody, next: "cq27"),
                        "cooldown 0:09, then cq27 · 1 waiting")
@@ -60,10 +61,10 @@ final class SwapGraceTests: XCTestCase {
     func testCooldownLabelOmitsSuffixWithNoWaiter() {
         let cd = CooldownRow(evicteeModel: "cq27", nextModel: "", waiting: 0, remainingSeconds: 240,
                              slots: [HotSlotRow(slot: 0, sessionId: "17426df4-aaaa", idleSeconds: 5)])
-        XCTAssertEqual(MenuState.cooldownLabel(cd, next: ""),
-                       "cooldown 4:00 for [17426df4]")
-        XCTAssertEqual(MenuState.cooldownLabel(cd, next: "", restartedAgo: 12),
-                       "cooldown 4:00 (restarted 0:12 ago) for [17426df4]")
+        let label = MenuState.cooldownLabel(cd, next: "")
+        XCTAssertEqual(label, "cooldown 4:00 for [17426df4]")
+        XCTAssertFalse(label.contains("restarted"),
+                       "the label shows remaining time only, never a restart suffix, got '\(label)'")
     }
 
     func testOnlyOwnedSlotsAreListedUnderTheCooldown() {
@@ -75,15 +76,6 @@ final class SwapGraceTests: XCTestCase {
         let hot = MenuState.hotSlots(cd)
         XCTAssertEqual(hot.map(\.slot), [0])
         XCTAssertEqual(MenuState.hotSlotLabel(hot[0]), "  slot 0 · [17426df4] · hot, idle 0:31")
-    }
-
-    func testRestartIsACountdownThatWentUp() {
-        // 8:52 -> 9:41 between two screenshots: the resident finished a turn
-        // inside its grace. A one-second wobble is not a restart.
-        XCTAssertTrue(MenuState.cooldownRestarted(previous: 532, current: 581))
-        XCTAssertFalse(MenuState.cooldownRestarted(previous: 532, current: 531))
-        XCTAssertFalse(MenuState.cooldownRestarted(previous: 532, current: 533))
-        XCTAssertFalse(MenuState.cooldownRestarted(previous: nil, current: 600))
     }
 
     func testCountdownFormatsMinutesAndSeconds() {

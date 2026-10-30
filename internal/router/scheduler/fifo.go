@@ -647,7 +647,20 @@ func (s *FIFO) OnServeDone(ev ServeDoneEvent) {
 		// idle reference is treated as evictable by withinGrace, which would
 		// drop the protection entirely rather than merely freeze it.
 		_, hasIdle := s.idleSince[ev.ModelID]
-		if !ev.Looping || !hasIdle {
+		switch {
+		case !ev.Looping:
+			// WHY + retention (2026-10-30 incident): the idle reference is
+			// the grace's start line, and the user ruling requires the
+			// swap-grace window to run only AFTER the
+			// sessions.decodeRetentionSeconds display-retention period:
+			// deadline = completion + retention + grace. This is a real
+			// displacement delay - a queued model cannot displace during
+			// the retention, except the documented FinishCooldown and
+			// higher-priority early exits (see the idleSince struct
+			// comment) - not a cosmetic countdown. Zero retention adds
+			// nothing, so every pre-existing test is unchanged.
+			s.idleSince[ev.ModelID] = s.now().Add(s.cooldownDelay())
+		case !hasIdle:
 			s.idleSince[ev.ModelID] = s.now()
 		}
 	}
@@ -827,6 +840,14 @@ func (s *FIFO) withinGrace(evict []string) bool {
 		}
 	}
 	return false
+}
+
+// cooldownDelay is sessions.decodeRetentionSeconds as a duration: the real
+// displacement delay both cooldowns add to a non-looping completion before
+// the swap grace starts (deadline = completion + retention + grace). Zero
+// for every hand-built FifoConfig, which is the pre-incident shape.
+func (s *FIFO) cooldownDelay() time.Duration {
+	return time.Duration(s.cfg.DecodeRetentionSeconds) * time.Second
 }
 
 // deferredByGrace is the single call site both OnRequest and drainQueue use
