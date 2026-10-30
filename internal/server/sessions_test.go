@@ -38,10 +38,9 @@ func sessionsTestConfig() config.Config {
 			"priority":   {Listen: "127.0.0.1:8002", Rank: 10},
 			"background": {Listen: "127.0.0.1:8003", Rank: -10},
 		},
-		// What LoadConfigFromReader seeds when the sessions block is absent
-		// (config.DefaultSessionsConfig), so the retention tests exercise the
-		// window a real box runs.
-		Sessions: config.DefaultSessionsConfig(),
+		// Exercise a 30 s window explicitly; the production default is 10 s
+		// and is pinned separately in internal/config.
+		Sessions: config.SessionsConfig{DecodeRetentionSeconds: 30},
 	}
 }
 
@@ -791,7 +790,8 @@ func TestSessions_DecodeRetentionEndsAtWindowDuringLongPrefill(t *testing.T) {
 // session) plus PREFILL, and that whole gap routinely outlasts 8 s. The
 // retention therefore measures from the LAST RAW DECODE (not from the start
 // of the current phase), covers PARKED as well as IDLE and PREFILL, and the
-// window is configuration: sessions.decodeRetentionSeconds, default 30 s,
+// window is configuration: sessions.decodeRetentionSeconds, explicitly 30 s
+// in these tests (production default 10 s, pinned in internal/config),
 // with the 8 s constant as the fallback when the config leaves it unset.
 // Raw phase, counters, PhaseSinceMs and the queue tallies stay untouched
 // throughout; a session that never decoded, a LOADING row and any penalized

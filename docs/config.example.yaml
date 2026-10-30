@@ -169,7 +169,7 @@ loopGuard:
 #   shows its raw phase and cooldowns start at completion); negative fails
 #   the load
 sessions:
-  decodeRetentionSeconds: 30
+  decodeRetentionSeconds: 10
 
 # ui.activity.session_id: ordered request headers used to identify sessions in
 # the Activity page's in-flight request table.

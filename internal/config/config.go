@@ -554,18 +554,17 @@ type SessionsConfig struct {
 	// queued behind the other session (PARKED) plus its prefill, and it
 	// routinely outlasts the 8 s the display originally held; the window is
 	// measured from the last DECODE, not from the start of the current phase.
-	// Default 30; 0 turns the retention off (every row shows its raw phase).
+	// Default 10; 0 turns the retention off (every row shows its raw phase).
 	// A session that never decoded, a LOADING row and any penalized row are
 	// never retained.
 	DecodeRetentionSeconds int `yaml:"decodeRetentionSeconds"`
 }
 
 // DefaultSessionsConfig is the seeded value when the block is absent. The
-// window is the one that covers a real two-session lane gap (measured
-// 2026-10-27: IDLE ~5 s + PARKED + PREFILL, commonly 15-25 s); the builder
-// falls back to its own 8 s constant if the config leaves this unset.
+// user chose a 10 s cosmetic hold on 2026-10-30; the builder falls back to its
+// own 8 s constant if a hand-built config leaves this unset.
 func DefaultSessionsConfig() SessionsConfig {
-	return SessionsConfig{DecodeRetentionSeconds: 30}
+	return SessionsConfig{DecodeRetentionSeconds: 10}
 }
 
 // UnmarshalYAML sets default values for SessionsConfig

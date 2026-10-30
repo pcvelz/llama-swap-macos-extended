@@ -50,7 +50,7 @@ const sessionsIdleRetention = 60 * time.Second
 // PREFILL - the gap between two chained turns of one dispatch, where the row
 // would otherwise flicker DECODE -> IDLE/PARKED/PREFILL -> DECODE at the 1 Hz
 // poll. Configuration owns the live value: sessions.decodeRetentionSeconds
-// (default 30 s, 0 = off); this constant is what a builder uses when the
+// (default 10 s, 0 = off); this constant is what a builder uses when the
 // config leaves it unset. The window is measured from the LAST RAW DECODE,
 // not from the start of the current phase, because with two sessions sharing
 // one lane the gap is the tool call (IDLE) plus the next turn queued behind
