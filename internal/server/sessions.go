@@ -626,8 +626,48 @@ func (b *sessionsBuilder) build(in sessionsInput) sessionsBody {
 			}
 			md["slot_id"] = strconv.Itoa(in.Slots[r.Model][0].ID)
 			r.Metadata = md
+			chosen[key] = r
 		}
-		row := b.requestRow(in, r)
+	}
+
+	// Within one snapshot, a child slot's counters belong to at most ONE
+	// row. A Splash child reports ONE /slots row (id 0) while two sessions'
+	// requests are bound to slot 0; letting both rows read the same counters
+	// shows one session's numbers on the other's row (one Splash slot
+	// reported for two lanes: incident 2026-09-16 follow-up 3). Attribution
+	// is UNAMBIGUOUS only when exactly one admitted (non-parked) request is
+	// bound to a slot id - the sole-admitted one-lane binding stamped above
+	// counts as a binding. With two or more admitted requests on one slot
+	// the server cannot know whose numbers the reported row carries, so NO
+	// bound row reads it. The map is keyed "<model>/<slot id>" -> the key of
+	// the sole admitted request bound there; an empty value means two or
+	// more are bound (ambiguous: nobody reads it).
+	slotOwner := map[string]string{}
+	for _, key := range order {
+		r := chosen[key]
+		if requestRank(r.Metadata) != 0 || in.Running[r.Model] != process.StateReady {
+			continue
+		}
+		slotStr := r.Metadata["slot_id"]
+		if slotStr == "" {
+			slotStr = r.Metadata[slotAffinityMetadataKey]
+		}
+		if _, err := strconv.Atoi(slotStr); err != nil {
+			continue
+		}
+		ms := r.Model + "/" + slotStr
+		if prev, seen := slotOwner[ms]; seen {
+			if prev != "" {
+				slotOwner[ms] = "" // a second claimant makes it ambiguous
+			}
+			continue
+		}
+		slotOwner[ms] = key
+	}
+
+	for _, key := range order {
+		r := chosen[key]
+		row := b.requestRow(in, r, slotOwner)
 		// Before stampPhaseSince, so a held row's phase clock measures the
 		// PENALIZED phase rather than the phase it was displaced from.
 		b.applyLoopState(in, &row, held)
@@ -647,7 +687,18 @@ func (b *sessionsBuilder) build(in sessionsInput) sessionsBody {
 			if h.SessionID == "" || present[h.SessionID] {
 				continue
 			}
-			row := b.hotRow(in, model, h)
+			// A HOT row never copies a slot that an in-flight admitted
+			// request is bound to in this snapshot: the slot's counters
+			// belong to that request's row, and copying them onto a HOT
+			// row of another session shows one session's numbers on two
+			// rows (one Splash slot reported for two lanes: incident
+			// 2026-09-16 follow-up 3).
+			hotOwner := true
+			slotStr := strconv.Itoa(h.Slot)
+			if _, bound := slotOwner[model+"/"+slotStr]; bound {
+				hotOwner = false
+			}
+			row := b.hotRow(in, model, h, hotOwner)
 			b.applyLoopState(in, &row, held)
 			present[h.SessionID] = true
 			delete(b.phases, h.SessionID)
@@ -913,7 +964,12 @@ func (b *sessionsBuilder) baseRow(model, sessionID, tier string) sessionEntry {
 	}
 }
 
-func (b *sessionsBuilder) requestRow(in sessionsInput, r swaputil.InflightRequestEntry) sessionEntry {
+// requestRow builds a row for one in-flight request. slotOwner (keyed
+// "<model>/<slot id>" -> owning request key, built by build) decides who may
+// read a slot's counters: a request bound to a slot that ANOTHER request
+// owns in this snapshot reads no counters from it - one Splash slot reported
+// for two lanes: incident 2026-09-16 follow-up 3.
+func (b *sessionsBuilder) requestRow(in sessionsInput, r swaputil.InflightRequestEntry, slotOwner map[string]string) sessionEntry {
 	m := r.Metadata
 	row := b.baseRow(r.Model, m["session_id"], m["tier"])
 	row.RequestID = strPtr(r.ID)
@@ -957,17 +1013,30 @@ func (b *sessionsBuilder) requestRow(in sessionsInput, r swaputil.InflightReques
 	}
 	if n, err := strconv.Atoi(slotStr); err == nil {
 		row.Slot = &n
-		if sl, ok := findSlot(in.Slots[r.Model], n); ok {
-			if sl.NCtx > 0 {
-				row.Context.Window = sl.NCtx
-			}
-			// A slot not processing still shows its PREVIOUS request's
-			// counters: they do not belong to this request yet.
-			if sl.IsProcessing {
-				row.Context.Cached = sl.NPromptTokensCache
-				row.Context.Processed = sl.NPromptTokensProcessed
-				row.Context.Decoded = sl.NDecoded
-				row.Context.PromptTotal = sl.NPromptTokens
+		// A request bound to a slot that ANOTHER admitted request also
+		// claims reads no counters from it: with two admitted requests on
+		// one reported slot the numbers are ambiguous, and showing them on
+		// both rows attributes one slot's counters to two sessions (one
+		// Splash slot reported for two lanes: incident 2026-09-16
+		// follow-up 3).
+		ms := r.Model + "/" + slotStr
+		ownKey := m["session_id"]
+		if ownKey == "" {
+			ownKey = "req:" + r.ID
+		}
+		if owner, bound := slotOwner[ms]; !bound || owner == ownKey {
+			if sl, ok := findSlot(in.Slots[r.Model], n); ok {
+				if sl.NCtx > 0 {
+					row.Context.Window = sl.NCtx
+				}
+				// A slot not processing still shows its PREVIOUS request's
+				// counters: they do not belong to this request yet.
+				if sl.IsProcessing {
+					row.Context.Cached = sl.NPromptTokensCache
+					row.Context.Processed = sl.NPromptTokensProcessed
+					row.Context.Decoded = sl.NDecoded
+					row.Context.PromptTotal = sl.NPromptTokens
+				}
 			}
 		}
 	}
@@ -994,7 +1063,10 @@ func (b *sessionsBuilder) requestRow(in sessionsInput, r swaputil.InflightReques
 
 // hotRow: the slot's KV cache holds the session's last prompt, so the whole
 // prompt reads as cached (contract fixture decode-parked-hot.json).
-func (b *sessionsBuilder) hotRow(in sessionsInput, model string, h swaputil.HotSlot) sessionEntry {
+// copyPrompt tells whether the slot's prompt counters may be copied here:
+// false when another session's request owns that slot in this snapshot - one
+// Splash slot reported for two lanes: incident 2026-09-16 follow-up 3.
+func (b *sessionsBuilder) hotRow(in sessionsInput, model string, h swaputil.HotSlot, copyPrompt bool) sessionEntry {
 	tier := ""
 	prev, known := b.known[h.SessionID]
 	if known {
@@ -1015,9 +1087,11 @@ func (b *sessionsBuilder) hotRow(in sessionsInput, model string, h swaputil.HotS
 		if sl.NCtx > 0 {
 			row.Context.Window = sl.NCtx
 		}
-		row.Context.Cached = sl.NPromptTokens
-		row.Context.PromptTotal = sl.NPromptTokens
-		row.Context.Used = sl.NPromptTokens
+		if copyPrompt {
+			row.Context.Cached = sl.NPromptTokens
+			row.Context.PromptTotal = sl.NPromptTokens
+			row.Context.Used = sl.NPromptTokens
+		}
 	}
 	return row
 }

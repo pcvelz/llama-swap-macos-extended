@@ -1137,16 +1137,19 @@ func TestSessions_DecodeRetentionRetainsRateAndContextUsed(t *testing.T) {
 	}
 	got = b.build(sessionsInput{Now: t0.Add(4 * time.Second), Running: running,
 		Requests: []swaputil.InflightRequestEntry{mk("r2", "s1", t0.Add(4*time.Second)), mk("r3", "s2", t0.Add(4*time.Second))}, Slots: prefill})
+	// Two admitted requests on one reported slot are ambiguous: no
+	// attribution (incident 2026-09-16 follow-up 3). Neither row takes the
+	// slot's counters; the retained display still carries s1's own readout.
 	row = retainedDisplay(t, got, "s1", 41530, 58.0)
-	if v := rawUsed(t, row); v != float64(10) {
-		t.Fatalf("s1 raw context.used = %v, want 10 (the young PREFILL's own counters)", v)
+	if v := rawUsed(t, row); v != float64(0) {
+		t.Fatalf("s1 raw context.used = %v, want 0 - two admitted requests bound to slot 0, the slot's counters belong to neither", v)
 	}
-	if v := rawRateKind(t, row); v != "prefill" {
-		t.Fatalf("s1 raw rate.kind = %v, want prefill while display.rate holds the retained decode rate", v)
+	if v := rawRateKind(t, row); v != nil {
+		t.Fatalf("s1 raw rate.kind = %v, want nil - with no slot counters attributed there is no prefill progress to rate", v)
 	}
 	s2row := rawWord(t, got, "s2")
-	if v := rawUsed(t, s2row); v != float64(10) {
-		t.Fatalf("s2 raw context.used = %v, want 10", v)
+	if v := rawUsed(t, s2row); v != float64(0) {
+		t.Fatalf("s2 raw context.used = %v, want 0 (ambiguous slot: no attribution)", v)
 	}
 	assertSessionsInvariants(t, got)
 
