@@ -66,6 +66,21 @@ func CreateFilterMiddleware(cfg config.Config) chain.Middleware {
 				}
 			}
 
+			// Sampling headers (X-Temperature and friends) fold into the body
+			// for opted-in models only, on the three completion endpoints.
+			// Runs BEFORE the configured filters: a static default spelled
+			// "key?" (set-if-undefined) in setParams then fills only what the
+			// header and the client left out, so a per-request header wins
+			// over the static default. A header never fails a request: an
+			// unparsable or out-of-range value is ignored here.
+			if samplingEndpoints[r.URL.Path] {
+				body, err = applySamplingHeadersForModel(cfg, data.Model, r.Header, body)
+				if err != nil {
+					swaputil.SendResponse(w, r, http.StatusInternalServerError, err.Error())
+					return
+				}
+			}
+
 			body, err = applyFilters(body, data.Model, useModelName, filters)
 			if err != nil {
 				swaputil.SendResponse(w, r, http.StatusInternalServerError, err.Error())
@@ -73,21 +88,6 @@ func CreateFilterMiddleware(cfg config.Config) chain.Middleware {
 			}
 			if textOnly {
 				body, err = replaceImageBlocks(body, data.Model)
-				if err != nil {
-					swaputil.SendResponse(w, r, http.StatusInternalServerError, err.Error())
-					return
-				}
-			}
-
-			// Sampling headers (X-Temperature and friends) fold into the body
-			// for opted-in models only, on the three completion endpoints.
-			// Runs after the configured filters so a per-request header wins
-			// over a static setParams default, and before the body is
-			// re-attached so Content-Length follows the final bytes. A header
-			// never fails a request: an unparsable or out-of-range value is
-			// ignored here.
-			if samplingEndpoints[r.URL.Path] {
-				body, err = applySamplingHeadersForModel(cfg, data.Model, r.Header, body)
 				if err != nil {
 					swaputil.SendResponse(w, r, http.StatusInternalServerError, err.Error())
 					return

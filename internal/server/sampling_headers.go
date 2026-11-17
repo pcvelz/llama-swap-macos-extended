@@ -5,6 +5,7 @@ import (
 	"math"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/mostlygeek/llama-swap/internal/config"
 	"github.com/tidwall/gjson"
@@ -20,26 +21,36 @@ import (
 //
 //   - X-Temperature:        0 < v <= 2    -> "temperature"      (overrides a body value)
 //   - X-Presence-Penalty:   -2 <= v <= 2  -> "presence_penalty" (fill-only)
-//   - X-Repetition-Penalty: 0 < v <= 3    -> "repeat_penalty"   (fill-only)
+//   - X-Repetition-Penalty: 0 < v <= 3    -> the engine's own name (fill-only):
+//     "repeat_penalty" for llama.cpp, "repetition_penalty" for Splash, both for `both`
 //
 // A header that is unparsable, NaN, or outside its range is ignored; a header
 // NEVER fails a request. Only JSON POST bodies on the three completion
 // endpoints are touched - everything else passes through.
 //
-// Engine scope: the body fields named above are llama.cpp's. The fork carries
-// no general engine marker (a Splash child is only ever marked by its cmd), so
-// the gate is the per-model opt-in key `samplingHeaders: true`, read here via
-// modelWantsSamplingHeaders. It is enabled in no shipped config yet; a model
+// Engine scope: the repetition field is spelled differently per engine and the
+// fork carries no general engine marker (a Splash child is only ever marked by
+// its cmd), so the gate is the per-model opt-in key `samplingHeaders`, read via
+// samplingModeOf: `true` or `llamacpp` -> llama.cpp's "repeat_penalty";
+// `splash` -> Splash's "repetition_penalty" (Splaude 1.8.0 reads sampling from
+// the Messages request body and has no header options of its own, so this
+// translation is the only place the headers become sampling); `both` writes
+// the two (a model whose engine is switched at runtime, e.g. cq27). A model
 // that does not set the key is never rewritten.
+//
+// Order in the filter middleware: the headers fold in BEFORE the configured
+// filters. A static default in `setParams` spelled `key?` (set-if-undefined)
+// then fills only what the header and the client left out, so the header wins
+// over the static default and the fill-only penalties keep a client's own value.
 const (
 	samplingTemperatureHeader   = "X-Temperature"
 	samplingPresenceHeader      = "X-Presence-Penalty"
 	samplingRepetitionHeader    = "X-Repetition-Penalty"
 	samplingHeadersConfigKey    = "samplingHeaders"
-	samplingHeadersMinExclusive = 0.0 // temperature and repeat_penalty must be strictly above this
+	samplingHeadersMinExclusive = 0.0 // temperature and repetition penalty must be strictly above this
 )
 
-// samplingEndpoints are the endpoints whose JSON request bodies carry llama.cpp
+// samplingEndpoints are the endpoints whose JSON request bodies carry
 // sampling parameters. Other endpoints (embeddings, rerank, responses,
 // count_tokens, ...) are left untouched.
 var samplingEndpoints = map[string]bool{
@@ -48,31 +59,65 @@ var samplingEndpoints = map[string]bool{
 	"/v1/messages":         true,
 }
 
-// modelWantsSamplingHeaders reports whether the resolved model opted in. The
-// fork has no engine marker to consult, so the opt-in is the per-model config
-// key `samplingHeaders: true` (see the header comment), read through the
-// existing per-model Metadata bag (config.ModelConfig.Metadata, #264):
+// samplingMode is the engine dialect a model's sampling headers are written in.
+type samplingMode int
+
+const (
+	samplingOff      samplingMode = iota
+	samplingLlamaCpp              // repeat_penalty
+	samplingSplash                // repetition_penalty
+	samplingBoth                  // repeat_penalty and repetition_penalty
+)
+
+// samplingModeOf reads the per-model opt-in through the existing per-model
+// Metadata bag (config.ModelConfig.Metadata, #264):
 //
 //	models:
 //	  my-model:
 //	    metadata:
-//	      samplingHeaders: true
+//	      samplingHeaders: splash    # or true / llamacpp / both
 //
-// Absent or non-true = false: nothing is rewritten until a model asks.
-func modelWantsSamplingHeaders(mc config.ModelConfig) bool {
-	v, ok := mc.Metadata[samplingHeadersConfigKey]
-	if !ok {
-		return false
+// Absent, false or unknown = samplingOff: nothing is rewritten until a model asks.
+func samplingModeOf(mc config.ModelConfig) samplingMode {
+	switch v := mc.Metadata[samplingHeadersConfigKey].(type) {
+	case bool:
+		if v {
+			return samplingLlamaCpp
+		}
+	case string:
+		switch strings.ToLower(strings.TrimSpace(v)) {
+		case "true", "llamacpp", "llama.cpp":
+			return samplingLlamaCpp
+		case "splash":
+			return samplingSplash
+		case "both":
+			return samplingBoth
+		}
 	}
-	b, ok := v.(bool)
-	return ok && b
+	return samplingOff
+}
+
+// modelWantsSamplingHeaders reports whether the resolved model opted in at all.
+func modelWantsSamplingHeaders(mc config.ModelConfig) bool {
+	return samplingModeOf(mc) != samplingOff
+}
+
+// repetitionKeys is the body field(s) the repetition header lands in per mode.
+func repetitionKeys(m samplingMode) []string {
+	switch m {
+	case samplingSplash:
+		return []string{"repetition_penalty"}
+	case samplingBoth:
+		return []string{"repeat_penalty", "repetition_penalty"}
+	default:
+		return []string{"repeat_penalty"}
+	}
 }
 
 // parseSamplingHeaderValue parses one header value: a plain float, finite,
-// inside (minExclusive, max] when minExclusive is the open bound, or
-// [min, max] when min == minInclusiveAny. ok is false for anything else
-// (empty, garbage, NaN, Inf, out of range) - the caller ignores the header and
-// the request proceeds unchanged.
+// inside (min, max] when minInclusive is false, or [min, max] when true. ok is
+// false for anything else (empty, garbage, NaN, Inf, out of range) - the
+// caller ignores the header and the request proceeds unchanged.
 func parseSamplingHeaderValue(h http.Header, name string, min, max float64, minInclusive bool) (float64, bool) {
 	raw := h.Get(name)
 	if raw == "" {
@@ -112,7 +157,8 @@ func applySamplingHeadersForModel(cfg config.Config, requested string, h http.He
 		return body, nil
 	}
 	mc, ok := cfg.Models[realName]
-	if !ok || !modelWantsSamplingHeaders(mc) {
+	mode := samplingModeOf(mc)
+	if !ok || mode == samplingOff {
 		return body, nil
 	}
 	if !gjson.ValidBytes(body) {
@@ -134,9 +180,12 @@ func applySamplingHeadersForModel(cfg config.Config, requested string, h http.He
 		}
 	}
 	if v, ok := parseSamplingHeaderValue(h, samplingRepetitionHeader, samplingHeadersMinExclusive, 3, false); ok {
-		if !gjson.GetBytes(body, "repeat_penalty").Exists() {
-			if body, err = sjson.SetBytes(body, "repeat_penalty", v); err != nil {
-				return nil, fmt.Errorf("error setting repeat_penalty from %s: %w", samplingRepetitionHeader, err)
+		for _, key := range repetitionKeys(mode) {
+			if gjson.GetBytes(body, key).Exists() {
+				continue
+			}
+			if body, err = sjson.SetBytes(body, key, v); err != nil {
+				return nil, fmt.Errorf("error setting %s from %s: %w", key, samplingRepetitionHeader, err)
 			}
 		}
 	}
